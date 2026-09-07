@@ -4,6 +4,15 @@
 #include <stdint.h>
 #include <d3dkmthk.h>
 
+/* Optional guest-allocated BO capability. Old KMDs reject this escape. */
+#define VIRTIO_WDDM_ESCAPE_GUEST_ALLOC_CAPS_TAG 5782977369871697238ull
+typedef struct VIRTIO_WDDM_GuestAllocCaps {
+   uint64_t tag;
+   uint32_t supported;
+   uint32_t alignment;
+} VIRTIO_WDDM_GuestAllocCaps;
+#define VIRTIO_WDDM_BLOB_FLAG_CREATE_GUEST_HANDLE 8u
+
 #define VIRTIO_WDDM_PCI_VENDOR_ID 6900
 
 #define VIRTIO_WDDM_PCI_DEVICE_ID 26985

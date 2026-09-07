@@ -39,7 +39,7 @@ virtio_wddm_present() {
 */
 
 static HRESULT virtio_wddm_sync_with_present_context(VIRTIO_WDDM_Device *device) {
-    uint64_t value = atomic_fetch_add_explicit((volatile uint64_t *) &device->base.presentFenceValue, 1, memory_order_acq_rel);
+    uint64_t value = atomic_fetch_add_explicit((volatile _Atomic uint64_t *) &device->base.presentFenceValue, 1, memory_order_acq_rel);
 
     ID3D11DeviceContext4_Signal(device->base.pCtx4, device->base.pPresentFence, value);
     ID3D11DeviceContext1_Flush(device->base.pCtx1);

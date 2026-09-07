@@ -1,4 +1,4 @@
-PREFIX?=x86_64-w64-mingw32
+PREFIX?=aarch64-w64-mingw32
 
 CC=$(PREFIX)-gcc
 CXX=$(PREFIX)-g++
@@ -10,7 +10,7 @@ STRIP=$(PREFIX)-strip
 INCLUDES=build include/winddk include
 DEFINES=VK_USE_PLATFORM_WIN32_KHR
 LIBS=vulkan-1 version gdi32
-CFLAGS=-O2 -fpic -ffunction-sections -fdata-sections -g -MMD -MP -flto -ffile-prefix-map=$(PWD)=./
+CFLAGS=-std=gnu23 -O2 -fpic -ffunction-sections -fdata-sections -g -MMD -MP -flto -ffile-prefix-map=$(PWD)=./
 CXXFLAGS=-std=gnu++17
 LDFLAGS=-g -static-libgcc -static-libstdc++ -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -Wl,--gc-sections
 CFLAGS+=$(addprefix -I,$(INCLUDES)) $(addprefix -D,$(DEFINES))
