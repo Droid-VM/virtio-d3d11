@@ -41,29 +41,28 @@ virtio_wddm_present() {
 static HRESULT virtio_wddm_sync_with_present_context(VIRTIO_WDDM_Device *device) {
     uint64_t value = atomic_fetch_add_explicit((volatile _Atomic uint64_t *) &device->base.presentFenceValue, 1, memory_order_acq_rel);
 
-    ID3D11DeviceContext4_Signal(device->base.pCtx4, device->base.pPresentFence, value);
-    ID3D11DeviceContext1_Flush(device->base.pCtx1);
-
-#if 0
-    HANDLE event = CreateEventA(NULL, true, false, NULL);
-    ID3D11Fence_SetEventOnCompletion(device->base.pPresentFence, value, event);
-    WaitForSingleObject(event, INFINITE);
-#else
-    // NOTE: the following requires DXVK to submit synchronously in ID3D11DeviceContext1_Flush
-    // because pfnPresentCb waits for pfnSignalSychronizationObjectFromGpu to be submitted to
-    // kernel with the internal dxgkrnl lock is taken
-    D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMGPU wait = {
-        .hContext = device->present.context,
-        .ObjectCount = 1,
-        .ObjectHandleArray = &device->present.fence,
-        .MonitoredFenceValueArray = &value,
-    };
-    HRESULT hr = device->base.KTCallbacks.pfnWaitForSynchronizationObjectFromGpuCb(device->base.hRTDevice.handle, &wait);
+    HRESULT hr = ID3D11DeviceContext4_Signal(device->base.pCtx4, device->base.pPresentFence, value);
     if (FAILED(hr)) {
-        ERROR("%s: Failed to wait from gpu: 0x%08lx", __FUNCTION__, hr);
+        ERROR("%s: Failed to signal D3D11 fence: 0x%08lx", __FUNCTION__, hr);
         return hr;
     }
-#endif
+    ID3D11DeviceContext1_Flush(device->base.pCtx1);
+
+    HANDLE event = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!event)
+        return HRESULT_FROM_WIN32(GetLastError());
+    hr = ID3D11Fence_SetEventOnCompletion(device->base.pPresentFence, value, event);
+    if (FAILED(hr)) {
+        CloseHandle(event);
+        ERROR("%s: Failed to arm D3D11 fence event: 0x%08lx", __FUNCTION__, hr);
+        return hr;
+    }
+    DWORD wait = WaitForSingleObject(event, 10000);
+    CloseHandle(event);
+    if (wait != WAIT_OBJECT_0) {
+        ERROR("%s: Timed out waiting for D3D11 fence: %lu", __FUNCTION__, wait);
+        return E_FAIL;
+    }
     return S_OK;
 }
 

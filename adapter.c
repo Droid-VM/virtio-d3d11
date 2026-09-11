@@ -19,7 +19,7 @@
 #include "adapter.h"
 #include "device.h"
 
-#define NO_DEBUG
+/* Keep UMD diagnostics enabled during bring-up. */
 
 #ifdef NO_DEBUG
 extern void triton_log_raw(const char *line) {
@@ -32,7 +32,14 @@ extern int __cdecl DXVK_umd_log_output(const char *line) {
 }
 #else
 extern void print_log_raw(const char *line) {
-    OutputDebugStringA(line);
+    char tagged[4608];
+    int len = snprintf(tagged, sizeof(tagged), "[umd pid=%lu tid=%lu] %s",
+                       GetCurrentProcessId(), GetCurrentThreadId(), line);
+    if (len < 0)
+        return;
+    tagged[sizeof(tagged) - 1] = '\0';
+
+    OutputDebugStringA(tagged);
 
     static FILE *out = NULL;
     if (out == NULL) {
@@ -40,7 +47,7 @@ extern void print_log_raw(const char *line) {
     }
 
     if (out != NULL) {
-        fwrite(line, strlen(line), 1, out);
+        fwrite(tagged, strlen(tagged), 1, out);
         fflush(out);
     }
 }
@@ -72,6 +79,7 @@ void virtio_wddm_log(const char *file, int line, const char *label, const char *
 
 extern int __cdecl DXVK_umd_log_output(const char *line) {
     print_log_raw(line);
+    return 0;
 }
 
 extern void triton_log_raw(const char *line) {
@@ -127,6 +135,8 @@ static void dump_capsets(char *buf, size_t len, VIRTIO_WDDM_CapsetMask mask) {
 
 __attribute__((visibility("default"))) HRESULT APIENTRY OpenAdapter10_2(D3D10DDIARG_OPENADAPTER* pArgs) {
     TRACE();
+    INFO("%s: enter interface=0x%x version=0x%x", __FUNCTION__,
+         pArgs->Interface, pArgs->Version);
     VIRTIO_WDDM_AdapterInfo adapter_info_priv = { 0 };
     D3DDDICB_QUERYADAPTERINFO query_adapter_info = {
         .pPrivateDriverData = &adapter_info_priv,
@@ -171,6 +181,10 @@ __attribute__((visibility("default"))) HRESULT APIENTRY OpenAdapter10_2(D3D10DDI
     // TODO: we could create a temporary DXVK device from LUID and query caps from it.
     // NOTE: this device MUST NOT be used for anything else.
     pArgs->pAdapterFuncs_2->pfnGetCaps               = tritonGetCaps;
+
+    INFO("%s: adapter callbacks installed calc=%p create=%p", __FUNCTION__,
+         (void *)pArgs->pAdapterFuncs_2->pfnCalcPrivateDeviceSize,
+         (void *)pArgs->pAdapterFuncs_2->pfnCreateDevice);
 
     return S_OK;
 }

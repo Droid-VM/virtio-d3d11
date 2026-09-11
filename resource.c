@@ -345,6 +345,14 @@ static HRESULT create_shared_vk_image(VIRTIO_WDDM_Device *device, D3D11_TEXTURE2
     }
 
     if (alloc != NULL) {
+        if (!device->vk_GetMemoryWin32HandleKHR) {
+            ERROR("%s: Vulkan Win32 memory export is unavailable", __FUNCTION__);
+            device->vk_DestroyImage(device->vk, *image, NULL);
+            device->vk_FreeMemory(device->vk, *memory, NULL);
+            *image = VK_NULL_HANDLE;
+            *memory = VK_NULL_HANDLE;
+            return E_NOTIMPL;
+        }
         VkMemoryGetWin32HandleInfoKHR get_handle_info = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR,
             .memory = *memory,
@@ -564,7 +572,12 @@ static HRESULT create_shared_3d_resource(VIRTIO_WDDM_Device *device, D3D11_TEXTU
             .depth = 1,
             .array_size = desc->ArraySize,
             .last_level = desc->MipLevels - 1,
-            .nr_samples = desc->SampleDesc.Count,
+            /* In the virgl protocol, zero denotes a normal texture and a
+             * positive value denotes an MSAA texture.  D3D's non-MSAA
+             * SampleDesc.Count is one, so forwarding it would incorrectly
+             * request a one-sample multisample texture.  That also prevents
+             * the host GBM path from allocating exportable shared storage. */
+            .nr_samples = desc->SampleDesc.Count > 1 ? desc->SampleDesc.Count : 0,
             .flags = 0,
             .size = desc->Width * desc->Height * dxgi_format_bytes_per_pixel(desc->Format),
         },
@@ -591,18 +604,47 @@ static HRESULT create_shared_3d_resource(VIRTIO_WDDM_Device *device, D3D11_TEXTU
         .pAllocationInfo2 = &alloc_info,
     };
 
+    INFO("%s: pfnAllocateCb begin rtdev=%p rtres=%p primary=%u res_tag=0x%016llx res_size=%u alloc_tag=0x%016llx alloc_size=%u target=%u format=%u bind=0x%08x dims=%ux%ux%u array=%u last=%u samples=%u bytes=%llu",
+         __FUNCTION__, device->base.hRTDevice.handle, hRTResource, primary,
+         res_priv.tag, (unsigned)sizeof(res_priv), alloc_priv.tag,
+         (unsigned)sizeof(alloc_priv), alloc_priv._3d.target,
+         alloc_priv._3d.format, alloc_priv._3d.bind, alloc_priv._3d.width,
+         alloc_priv._3d.height, alloc_priv._3d.depth, alloc_priv._3d.array_size,
+         alloc_priv._3d.last_level, alloc_priv._3d.nr_samples,
+         alloc_priv._3d.size);
+    SetLastError(ERROR_SUCCESS);
     HRESULT hr = device->base.KTCallbacks.pfnAllocateCb(device->base.hRTDevice.handle, &allocate);
+    DWORD last_error = GetLastError();
+    INFO("%s: pfnAllocateCb end hr=0x%08lx last_error=%lu kmres=0x%08x allocation=0x%08x gpuva=0x%016llx",
+         __FUNCTION__, hr, last_error, allocate.hKMResource,
+         alloc_info.hAllocation, alloc_info.GpuVirtualAddress);
     if (FAILED(hr)) {
         ERROR("%s: Failed to allocate: 0x%08lx", __FUNCTION__, hr);
         return hr;
     }
 
     *hKMResource = allocate.hKMResource;
+    *alloc = alloc_info;
 
     VIRTIO_WDDM_AllocationInfo res_info;
     hr = query_resource_info(device, alloc_info.hAllocation, id, &res_info);
     if (FAILED(hr)) {
         ERROR("%s: Failed to query resource info: 0x%08lx", __FUNCTION__, hr);
+        /* AllocateCb already succeeded. No image exists yet, so retire the
+         * runtime resource here instead of waiting for a failed CreateResource
+         * to receive DestroyResource (which is not guaranteed). Preserve the
+         * handle for that callback if deallocation itself fails. */
+        D3DDDICB_DEALLOCATE deallocate = {
+            .hResource = hRTResource, .NumAllocations = 0, .HandleList = NULL,
+        };
+        HRESULT cleanup_hr = device->base.KTCallbacks.pfnDeallocateCb(
+            device->base.hRTDevice.handle, &deallocate);
+        INFO("r60 layout failure cleanup allocation=0x%08x query=0x%08lx deallocate=0x%08lx",
+             alloc_info.hAllocation, hr, cleanup_hr);
+        if (SUCCEEDED(cleanup_hr)) {
+            *hKMResource = 0;
+            memset(alloc, 0, sizeof(*alloc));
+        }
         return hr;
     }
     ASSERT(res_info.tag == VIRTIO_WDDM_ALLOCATE_3D_TAG);
@@ -709,7 +751,7 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
 
     bool allocate_3d = is_present || is_primary || (is_shared && dxgi_to_virgl_format(resource->base.Format) != VIRGL_FORMAT_NONE);
 
-    INFO("%s: creating %s: %ux%u, format %u, bind %u (%u), misc %u (%u), map %u (%u), usage %u, primary desc %p, 3d %u => %p", __FUNCTION__, resource_type_name(pArgs->ResourceDimension), resource->base.Width, resource->base.Height, pArgs->Format, pArgs->BindFlags, bind, pArgs->MiscFlags, misc, pArgs->MapFlags, cpu_access, pArgs->Usage, pArgs->pPrimaryDesc, allocate_3d, resource);
+    INFO("%s: creating %s: %ux%u, format %u, bind %u (%u), misc %u (%u), map %u (%u), usage %u, primary desc %p, 3d %u, init %p => dev %p rt %p res %p", __FUNCTION__, resource_type_name(pArgs->ResourceDimension), resource->base.Width, resource->base.Height, pArgs->Format, pArgs->BindFlags, bind, pArgs->MiscFlags, misc, pArgs->MapFlags, cpu_access, pArgs->Usage, pArgs->pPrimaryDesc, allocate_3d, subresource_data, device, hRTResource.handle, resource);
 
     if (allocate_3d) {
         ASSERT(pArgs->ResourceDimension == D3D10DDIRESOURCE_TEXTURE2D);
@@ -729,15 +771,15 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
         };
 
         uint32_t id;
-        D3DDDI_ALLOCATIONINFO2 alloc;
+        D3DDDI_ALLOCATIONINFO2 alloc = {0};
         VIRTIO_WDDM_Allocate3dFull alloc_info;
         hr = create_shared_3d_resource(device, &desc, is_primary, hRTResource.handle, &resource->base.hKMResource, &alloc, &id, &alloc_info);
+        resource->base.hKMAllocation = alloc.hAllocation;
         if (FAILED(hr)) {
             ERROR("%s: failed to create shared 3d texture", __FUNCTION__);
             tritonSetError(&device->base, hr);
             return;
         }
-        resource->base.hKMAllocation = alloc.hAllocation;
 
         //INFO("%s: type: %s, w %u, h %u shared %u, primary %u, id %u", __FUNCTION__, resource_type_name(pArgs->ResourceDimension), resource->base.Width, resource->base.Height, is_shared, is_primary, id);
 
@@ -876,7 +918,9 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
             };
 
             ID3D11Texture2D *tex = NULL;
+            INFO("%s: calling internal CreateTexture2D res=%p init=%p", __FUNCTION__, resource, subresource_data);
             hr = ID3D11Device1_CreateTexture2D(device->base.pDev1, &desc, subresource_data, &tex);
+            INFO("%s: internal CreateTexture2D returned hr=0x%08lx object=%p res=%p", __FUNCTION__, hr, tex, resource);
             if (FAILED(hr)) break;
 
             ASSERT(tex != NULL);
@@ -895,7 +939,9 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
             };
 
             ID3D11Buffer *buf = NULL;
+            INFO("%s: calling internal CreateBuffer res=%p bytes=%u usage=%u cpu=%u bind=%u init=%p sysmem=%p", __FUNCTION__, resource, desc.ByteWidth, desc.Usage, desc.CPUAccessFlags, desc.BindFlags, subresource_data, subresource_data ? subresource_data->pSysMem : NULL);
             hr = ID3D11Device1_CreateBuffer(device->base.pDev1, &desc, subresource_data, &buf);
+            INFO("%s: internal CreateBuffer returned hr=0x%08lx object=%p res=%p", __FUNCTION__, hr, buf, resource);
             if (FAILED(hr)) break;
 
             ASSERT(buf != NULL);
@@ -980,6 +1026,8 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
     if (subresource_data) {
         free(subresource_data);
     }
+    INFO("%s: complete dim=%u res=%p object=%p", __FUNCTION__, pArgs->ResourceDimension,
+         resource, resource->base.pResource);
 }
 
 void APIENTRY virtio_wddm_open_resource(D3D10DDI_HDEVICE hDevice, const D3D10DDIARG_OPENRESOURCE *pArgs, D3D10DDI_HRESOURCE hResource, D3D10DDI_HRTRESOURCE hRTResource) {

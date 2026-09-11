@@ -16,9 +16,9 @@
     X(CreateImage) \
     X(DestroyImage) \
     X(BindImageMemory2) \
-    X(GetImageMemoryRequirements2) \
-    X(GetImageDrmFormatModifierPropertiesEXT) \
-    X(GetSemaphoreWin32HandleKHR) \
+    X(GetImageMemoryRequirements2)
+
+#define VK_OPTIONAL_DEVICE_FUNCTION_LIST \
     X(GetMemoryWin32HandleKHR)
 
 typedef struct {
@@ -38,8 +38,6 @@ typedef struct {
 
     struct {
         HANDLE context;
-        VkSemaphore semaphore;
-        D3DKMT_HANDLE fence;
     } present;
 
     VkInstance vk_inst;
@@ -48,6 +46,7 @@ typedef struct {
 #define X(name) PFN_vk##name vk_##name;
     VK_INSTANCE_FUNCTION_LIST
     VK_DEVICE_FUNCTION_LIST
+    VK_OPTIONAL_DEVICE_FUNCTION_LIST
 #undef X
 } VIRTIO_WDDM_Device;
 
