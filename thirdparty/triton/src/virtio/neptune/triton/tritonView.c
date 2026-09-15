@@ -353,7 +353,19 @@ tritonCreateSRV(D3D10DDI_HDEVICE hDevice,
     v->pResource = r;
     v->pSRV      = NULL;
 
-    TR_LOG("%s: resource=%p, %ux%u, format %u, bind %u, misc %u", __FUNCTION__, r, r->Width, r->Height, r->Format, r->BindFlags, r->MiscFlags);
+    TR_LOG_VERBOSE("%s: resource=%p, %ux%u, format %u, bind %u, misc %u", __FUNCTION__, r, r->Width, r->Height, r->Format, r->BindFlags, r->MiscFlags);
+    if (pArgs->ResourceDimension == D3D10DDIRESOURCE_TEXTURE2D) {
+        TR_LOG_VERBOSE("CreateSRV args: format=%u dimension=%u mip=%u levels=%u array=%u",
+               pArgs->Format, pArgs->ResourceDimension, pArgs->Tex2D.MostDetailedMip,
+               pArgs->Tex2D.MipLevels, pArgs->Tex2D.ArraySize);
+    } else if (pArgs->ResourceDimension == D3D10DDIRESOURCE_TEXTURE1D) {
+        TR_LOG_VERBOSE("CreateSRV args: format=%u dimension=%u mip=%u levels=%u array=%u",
+               pArgs->Format, pArgs->ResourceDimension, pArgs->Tex1D.MostDetailedMip,
+               pArgs->Tex1D.MipLevels, pArgs->Tex1D.ArraySize);
+    } else {
+        TR_LOG_VERBOSE("CreateSRV args: format=%u dimension=%u", pArgs->Format,
+               pArgs->ResourceDimension);
+    }
 
     D3D11_SHADER_RESOURCE_VIEW_DESC d = {};
     d.Format = pArgs->Format;

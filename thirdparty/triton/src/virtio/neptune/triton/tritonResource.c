@@ -227,7 +227,7 @@ tritonRegisterSharedBlob(PTRITON_DEVICE pD, PTRITON_RESOURCE r,
      * a residency request that present is rejected and hangs the device.
      * No-op on WDDM 1.3 (see tritonPresentRequestResidency). */
     tritonPresentRequestResidency(pD, ai.hAllocation);
-    TR_LOG("shared: exporter blob_id=0x%llx alloc=0x%x %ux%u primary=%d "
+    TR_LOG_VERBOSE("shared: exporter blob_id=0x%llx alloc=0x%x %ux%u primary=%d "
            "pitch=%llu", o->blob_id, ai.hAllocation, r->Width, r->Height,
            primary, o->planes[0].pitch);
     return TRUE;
@@ -667,7 +667,7 @@ tritonOpenResource(D3D10DDI_HDEVICE hDevice, const D3D10DDIARG_OPENRESOURCE *pAr
         return;
     }
     r->pResource = (ID3D11Resource *)imported;
-    TR_LOG("shared: consumer opened res_id=%u %ux%u", res_id,
+    TR_LOG_VERBOSE("shared: consumer opened res_id=%u %ux%u", res_id,
            r->Width, r->Height);
 }
 #endif
@@ -699,9 +699,13 @@ tritonResourceMap(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource,
         tritonSetError(pD, DXGI_DDI_ERR_WASSTILLDRAWING);
         pMapped->pData = NULL;
         pMapped->RowPitch = pMapped->DepthPitch = 0;
+        TR_LOG_VERBOSE("ResourceMap busy res=%p %ux%u sub=%u map=%u flags=0x%x hr=0x%08lx",
+               r, r->Width, r->Height, Subresource, DDIMap, Flags, hr);
         return;
     }
     if (FAILED(hr)) {
+        TR_LOG_LIMITED("ResourceMap failed res=%p %ux%u sub=%u map=%u flags=0x%x hr=0x%08lx",
+               r, r->Width, r->Height, Subresource, DDIMap, Flags, hr);
         tritonSetError(pD, hr);
         pMapped->pData = NULL;
         pMapped->RowPitch = pMapped->DepthPitch = 0;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <triton.h>
+#include <triton_log.h>
 
 typedef struct {
     TRITON_ADAPTER base;
@@ -12,6 +13,7 @@ typedef struct {
 #define UNREACHABLE(...) do { virtio_wddm_log(__FILE__, __LINE__, "UNREACHABLE", __VA_ARGS__); abort(); } while (0)
 #define ERROR(...) virtio_wddm_log(__FILE__, __LINE__, "ERROR", __VA_ARGS__)
 #define INFO(...) virtio_wddm_log(__FILE__, __LINE__, "INFO", __VA_ARGS__)
+#define VERBOSE(...) do { if (tritonVerboseLogEnabled()) INFO(__VA_ARGS__); } while (0)
 #define ASSERT(expr) if (!(expr)) { UNREACHABLE("Assertion failed: %s", #expr); }
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(*(x)))
 
@@ -28,13 +30,15 @@ typedef struct {
 } __Scope_Trace;
 
 static inline __Scope_Trace __trace_scope_begin(const char *file, int line, const char *func) {
-    virtio_wddm_log(file, line, "TRACE", "BEGIN: %s", func);
+    if (tritonVerboseLogEnabled())
+        virtio_wddm_log(file, line, "TRACE", "BEGIN: %s", func);
     return (__Scope_Trace) { func, file, line };
 }
 
 static inline void __trace_scope_end(void *p) {
     __Scope_Trace *trace = p;
-    virtio_wddm_log(trace->file, trace->line, "TRACE", "END: %s", trace->func);
+    if (tritonVerboseLogEnabled())
+        virtio_wddm_log(trace->file, trace->line, "TRACE", "END: %s", trace->func);
 }
 
 #define TRACE() __Scope_Trace __scope_trace__ __attribute__((cleanup(__trace_scope_end), unused)) = __trace_scope_begin(__FILE__, __LINE__, __FUNCTION__)

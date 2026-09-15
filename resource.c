@@ -426,6 +426,7 @@ static inline unsigned dxgi_to_virgl_format(DXGI_FORMAT format) {
 
 static inline DXGI_FORMAT virgl_to_dxgi_format(unsigned format) {
     switch (format) {
+        case VIRGL_FORMAT_R32G32B32A32_FLOAT: return DXGI_FORMAT_R32G32B32A32_FLOAT;
         case VIRGL_FORMAT_R16G16B16A16_FLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
         case VIRGL_FORMAT_R16G16B16A16_UNORM: return DXGI_FORMAT_R16G16B16A16_UNORM;
 
@@ -556,7 +557,39 @@ static HRESULT query_resource_info(VIRTIO_WDDM_Device *device, D3DKMT_HANDLE all
     return S_OK;
 }
 
-static HRESULT create_shared_3d_resource(VIRTIO_WDDM_Device *device, D3D11_TEXTURE2D_DESC1 *desc, bool primary, HANDLE hRTResource, D3DKMT_HANDLE *hKMResource, D3DDDI_ALLOCATIONINFO2 *alloc, uint32_t *id, VIRTIO_WDDM_Allocate3dFull *info) {
+static HRESULT make_resource_resident(VIRTIO_WDDM_Device *device, D3DKMT_HANDLE allocation) {
+    D3DDDI_MAKERESIDENT make_resident = {
+        .hPagingQueue = device->paging.queue,
+        .NumAllocations = 1,
+        .AllocationList = &allocation,
+        .PriorityList = NULL,
+        .Flags = {
+            .CantTrimFurther = 1,
+            .MustSucceed = 1,
+        },
+    };
+    HRESULT hr = device->base.KTCallbacks.pfnMakeResidentCb(
+        device->base.hRTDevice.handle, &make_resident);
+    VERBOSE("%s: allocation=0x%08x hr=0x%08lx fence=%llu", __FUNCTION__,
+         allocation, hr, (unsigned long long)make_resident.PagingFenceValue);
+
+    if (hr == E_PENDING) {
+        D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait = {
+            .ObjectCount = 1,
+            .ObjectHandleArray = &device->paging.sync_object,
+            .FenceValueArray = &make_resident.PagingFenceValue,
+        };
+        hr = device->base.KTCallbacks.pfnWaitForSynchronizationObjectFromCpuCb(
+            device->base.hRTDevice.handle, &wait);
+    }
+    if (FAILED(hr)) {
+        ERROR("%s: Failed to make allocation resident: 0x%08lx", __FUNCTION__, hr);
+    }
+    return hr;
+}
+
+static HRESULT create_shared_3d_resource(VIRTIO_WDDM_Device *device, D3D11_TEXTURE2D_DESC1 *desc, const DXGI_DDI_PRIMARY_DESC *primary_desc, HANDLE hRTResource, D3DKMT_HANDLE *hKMResource, D3DDDI_ALLOCATIONINFO2 *alloc, uint32_t *id, VIRTIO_WDDM_Allocate3dFull *info) {
+    bool primary = primary_desc != NULL;
     VIRTIO_WDDM_CreateResource res_priv = {
         .tag = VIRTIO_WDDM_CREATE_RESOURCE_TAG,
     };
@@ -566,7 +599,7 @@ static HRESULT create_shared_3d_resource(VIRTIO_WDDM_Device *device, D3D11_TEXTU
             .tag = VIRTIO_WDDM_ALLOCATE_3D_TAG,
             .target = 2,
             .format = dxgi_to_virgl_format(desc->Format),
-            .bind = VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_DISPLAY_TARGET | VIRGL_BIND_SAMPLER_VIEW | VIRGL_BIND_SCANOUT | VIRGL_BIND_SHARED,
+            .bind = VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_DISPLAY_TARGET | VIRGL_BIND_SAMPLER_VIEW | VIRGL_BIND_SCANOUT,
             .width = desc->Width,
             .height = desc->Height,
             .depth = 1,
@@ -588,9 +621,19 @@ static HRESULT create_shared_3d_resource(VIRTIO_WDDM_Device *device, D3D11_TEXTU
         return E_OUTOFMEMORY;
     }
 
+    VIRTIO_WDDM_PrimaryAllocation primary_info = {0};
+    if (primary_desc) {
+        primary_info.base.allocation = alloc_priv;
+        primary_info.base.reuse_tag = VIRTIO_WDDM_REUSE_BLOB_TAG;
+        primary_info.primary_tag = VIRTIO_WDDM_PRIMARY_ALLOCATION_TAG;
+        primary_info.refresh_numerator = primary_desc->ModeDesc.RefreshRate.Numerator;
+        primary_info.refresh_denominator = primary_desc->ModeDesc.RefreshRate.Denominator;
+        primary_info.vidpn_source = primary_desc->VidPnSourceId;
+    }
+
     D3DDDI_ALLOCATIONINFO2 alloc_info = {
-        .pPrivateDriverData = &alloc_priv,
-        .PrivateDriverDataSize = sizeof(alloc_priv),
+        .pPrivateDriverData = primary ? (void *)&primary_info : (void *)&alloc_priv,
+        .PrivateDriverDataSize = primary ? sizeof(primary_info) : sizeof(alloc_priv),
         .Flags = {
             .Primary = primary,
         },
@@ -604,7 +647,7 @@ static HRESULT create_shared_3d_resource(VIRTIO_WDDM_Device *device, D3D11_TEXTU
         .pAllocationInfo2 = &alloc_info,
     };
 
-    INFO("%s: pfnAllocateCb begin rtdev=%p rtres=%p primary=%u res_tag=0x%016llx res_size=%u alloc_tag=0x%016llx alloc_size=%u target=%u format=%u bind=0x%08x dims=%ux%ux%u array=%u last=%u samples=%u bytes=%llu",
+    VERBOSE("%s: pfnAllocateCb begin rtdev=%p rtres=%p primary=%u res_tag=0x%016llx res_size=%u alloc_tag=0x%016llx alloc_size=%u target=%u format=%u bind=0x%08x dims=%ux%ux%u array=%u last=%u samples=%u bytes=%llu",
          __FUNCTION__, device->base.hRTDevice.handle, hRTResource, primary,
          res_priv.tag, (unsigned)sizeof(res_priv), alloc_priv.tag,
          (unsigned)sizeof(alloc_priv), alloc_priv._3d.target,
@@ -615,7 +658,7 @@ static HRESULT create_shared_3d_resource(VIRTIO_WDDM_Device *device, D3D11_TEXTU
     SetLastError(ERROR_SUCCESS);
     HRESULT hr = device->base.KTCallbacks.pfnAllocateCb(device->base.hRTDevice.handle, &allocate);
     DWORD last_error = GetLastError();
-    INFO("%s: pfnAllocateCb end hr=0x%08lx last_error=%lu kmres=0x%08x allocation=0x%08x gpuva=0x%016llx",
+    VERBOSE("%s: pfnAllocateCb end hr=0x%08lx last_error=%lu kmres=0x%08x allocation=0x%08x gpuva=0x%016llx",
          __FUNCTION__, hr, last_error, allocate.hKMResource,
          alloc_info.hAllocation, alloc_info.GpuVirtualAddress);
     if (FAILED(hr)) {
@@ -658,39 +701,9 @@ static HRESULT create_shared_3d_resource(VIRTIO_WDDM_Device *device, D3D11_TEXTU
     //    ERROR("%s: failed to open resource: hr=0x%08lx", __FUNCTION__, hr);
     //}
 
-    // FIXME: nope /* Paging is done by ICD on import */
-
-    D3DDDI_MAKERESIDENT make_resident = {
-        .hPagingQueue = device->paging.queue,
-        .NumAllocations = 1,
-        .AllocationList = &alloc_info.hAllocation,
-        .PriorityList = NULL,
-        .Flags = {
-            .CantTrimFurther = 1,
-            .MustSucceed = 1,
-        },
-    };
-    hr = device->base.KTCallbacks.pfnMakeResidentCb(device->base.hRTDevice.handle, &make_resident);
-
-    if (hr == E_PENDING) {
-        D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait = {
-            .ObjectCount = 1,
-            .ObjectHandleArray = &device->paging.sync_object,
-            .FenceValueArray = &make_resident.PagingFenceValue,
-        };
-
-        hr = device->base.KTCallbacks.pfnWaitForSynchronizationObjectFromCpuCb(device->base.hRTDevice.handle, &wait);
-        if (FAILED(hr)) {
-            ERROR("%s: Failed to wait for residency: 0x%08lx", __FUNCTION__, hr);
-            return hr;
-        }
-    } else if (FAILED(hr)) {
-        ERROR("%s: Failed to make resident (ms+ctf): 0x%08lx", __FUNCTION__, hr);
-        return hr;
-    }
-
-    return S_OK;
+    return make_resource_resident(device, alloc_info.hAllocation);
 }
+
 
 void update_subresource(VIRTIO_WDDM_Device *device, ID3D11Resource *resource, D3D11_SUBRESOURCE_DATA *subresource_data, size_t count) {
     for (size_t i = 0; i < count; i++) {
@@ -721,7 +734,7 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
     resource->base.ByteStride    = pArgs->ByteStride;
 
     bool bind_present = !!(pArgs->BindFlags & D3D10_DDI_BIND_PRESENT);
-    /* Primary and presentable surfaces has to be allocated as 3d resources, but shared resources could be also blobs instead */
+    /* The primary flag also has to reach the runtime allocation callback. */
     bool is_primary = bind_present && pArgs->pPrimaryDesc != NULL;
     bool is_present = bind_present && !is_primary;
     bool is_shared = !!(pArgs->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED);
@@ -749,9 +762,15 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
     D3D11_SUBRESOURCE_DATA *subresource_data = tritonBuildInitData(pArgs);
     HRESULT hr = E_FAIL;
 
-    bool allocate_3d = is_present || is_primary || (is_shared && dxgi_to_virgl_format(resource->base.Format) != VIRGL_FORMAT_NONE);
+    /* Native-context memory cannot import a host GL texture. Present buffers
+     * use guest-backed linear images so the display side can consume the same
+     * pixels; ordinary shared images retain their optimal layout. */
+    VIRTIO_WDDM_Adapter *adapter = (void *)device->base.pAdapter;
+    bool linear_present = bind_present &&
+        (adapter->supported_capsets & VIRTIO_WDDM_CAPSET_MASK_DRM);
+    bool allocate_3d = (is_primary || is_present) && !linear_present;
 
-    INFO("%s: creating %s: %ux%u, format %u, bind %u (%u), misc %u (%u), map %u (%u), usage %u, primary desc %p, 3d %u, init %p => dev %p rt %p res %p", __FUNCTION__, resource_type_name(pArgs->ResourceDimension), resource->base.Width, resource->base.Height, pArgs->Format, pArgs->BindFlags, bind, pArgs->MiscFlags, misc, pArgs->MapFlags, cpu_access, pArgs->Usage, pArgs->pPrimaryDesc, allocate_3d, subresource_data, device, hRTResource.handle, resource);
+    VERBOSE("%s: creating %s: %ux%u, format %u, bind %u (%u), misc %u (%u), map %u (%u), usage %u, primary desc %p, 3d %u, init %p => dev %p rt %p res %p", __FUNCTION__, resource_type_name(pArgs->ResourceDimension), resource->base.Width, resource->base.Height, pArgs->Format, pArgs->BindFlags, bind, pArgs->MiscFlags, misc, pArgs->MapFlags, cpu_access, pArgs->Usage, pArgs->pPrimaryDesc, allocate_3d, subresource_data, device, hRTResource.handle, resource);
 
     if (allocate_3d) {
         ASSERT(pArgs->ResourceDimension == D3D10DDIRESOURCE_TEXTURE2D);
@@ -773,7 +792,7 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
         uint32_t id;
         D3DDDI_ALLOCATIONINFO2 alloc = {0};
         VIRTIO_WDDM_Allocate3dFull alloc_info;
-        hr = create_shared_3d_resource(device, &desc, is_primary, hRTResource.handle, &resource->base.hKMResource, &alloc, &id, &alloc_info);
+        hr = create_shared_3d_resource(device, &desc, is_primary ? pArgs->pPrimaryDesc : NULL, hRTResource.handle, &resource->base.hKMResource, &alloc, &id, &alloc_info);
         resource->base.hKMAllocation = alloc.hAllocation;
         if (FAILED(hr)) {
             ERROR("%s: failed to create shared 3d texture", __FUNCTION__);
@@ -859,8 +878,14 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
         }
 
         return;
-    } else if (is_shared) {
+    } else if (is_shared || linear_present) {
         ASSERT(pArgs->ResourceDimension == D3D10DDIRESOURCE_TEXTURE2D);
+
+        if (linear_present && (pArgs->MipLevels != 1 || pArgs->ArraySize != 1 ||
+                               pArgs->SampleDesc.Count != 1)) {
+            tritonSetError(&device->base, E_INVALIDARG);
+            return;
+        }
 
         D3D11_TEXTURE2D_DESC1 desc = {
             .Width          = resource->base.Width,
@@ -881,7 +906,103 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
             .hRTResource = hRTResource.handle,
             .pCreateResource11 = pArgs,
         };
-        hr = create_shared_vk_image(device, &desc, VK_IMAGE_TILING_OPTIMAL, NULL, &d3d_create, &resource->memory, &resource->image, &resource->base.hKMAllocation);
+
+        /* Clear first: the check below only trusts a record this call produced,
+         * and a stale one from an earlier resource on this thread must not be
+         * mistaken for it. */
+        memset(&virtio_wddm_last_runtime_alloc, 0, sizeof(virtio_wddm_last_runtime_alloc));
+
+        /* No alloc-out parameter: exporting the handle from the VkDeviceMemory
+         * needs vkGetMemoryWin32HandleKHR, which turnip does not implement. The
+         * runtime allocator hook already knows the handle, so take it from there. */
+        VIRTIO_WDDM_RuntimeAllocScope previous_scope = virtio_wddm_runtime_alloc_scope;
+        virtio_wddm_runtime_alloc_scope = (VIRTIO_WDDM_RuntimeAllocScope) {
+            .hRTResource = hRTResource.handle,
+            .primary = is_primary,
+        };
+        if (is_primary)
+            virtio_wddm_runtime_alloc_scope.primary_desc = *pArgs->pPrimaryDesc;
+        hr = create_shared_vk_image(device, &desc,
+            linear_present ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL,
+            NULL, &d3d_create, &resource->memory, &resource->image, NULL);
+        virtio_wddm_runtime_alloc_scope = previous_scope;
+        if (FAILED(hr)) {
+            ERROR("%s: failed to create shared blob texture: 0x%08lx", __FUNCTION__, hr);
+            tritonSetError(&device->base, hr);
+            return;
+        }
+
+        /* The allocation must have come from our own hook for this resource.
+         * Anything else means the ICD allocated privately, which would give each
+         * process unrelated pixels -- fail instead of shipping that. */
+        if (virtio_wddm_last_runtime_alloc.hAllocation == 0 ||
+            virtio_wddm_last_runtime_alloc.hRTResource != hRTResource.handle) {
+            ERROR("%s: shared texture was not runtime-allocated (alloc=0x%08x rtres=%p want %p)",
+                  __FUNCTION__, virtio_wddm_last_runtime_alloc.hAllocation,
+                  virtio_wddm_last_runtime_alloc.hRTResource, hRTResource.handle);
+            tritonSetError(&device->base, E_FAIL);
+            return;
+        }
+
+        resource->base.hKMAllocation = virtio_wddm_last_runtime_alloc.hAllocation;
+        resource->base.hKMResource = virtio_wddm_last_runtime_alloc.hKMResource;
+
+        /* Present references the runtime allocation through VidMm. The ICD's
+         * mapping of the same blob does not establish residency for this
+         * allocation; otherwise WDDM rejects the present DMA buffer before it
+         * reaches the KMD and marks the device hung. */
+        if (linear_present) {
+            hr = make_resource_resident(device, resource->base.hKMAllocation);
+            if (FAILED(hr)) {
+                tritonSetError(&device->base, hr);
+                return;
+            }
+        }
+
+        /* Publish the layout consumed by OpenResource and scanout. Optimal
+         * tiling is recreated by the same ICD; linear pitch comes from Vulkan. */
+        VIRTIO_WDDM_BlobInfoSet blob_desc = {
+            .tag = VIRTIO_WDDM_ESCAPE_BLOB_INFO_SET_TAG,
+            .handle = resource->base.hKMAllocation,
+            .blob_info = {
+                .width = desc.Width, .height = desc.Height,
+                .format = desc.Format == DXGI_FORMAT_R32G32B32A32_FLOAT
+                    ? VIRGL_FORMAT_R32G32B32A32_FLOAT : dxgi_to_virgl_format(desc.Format),
+                .modifier = UINT64_C(0x00FFFFFFFFFFFFFF),
+            },
+        };
+        if (linear_present) {
+            VkImageSubresource subresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            };
+            VkSubresourceLayout layout;
+            device->vk_GetImageSubresourceLayout(device->vk, resource->image,
+                                                 &subresource, &layout);
+            if (!layout.rowPitch || layout.rowPitch > UINT32_MAX ||
+                layout.offset > UINT32_MAX) {
+                tritonSetError(&device->base, E_INVALIDARG);
+                return;
+            }
+            blob_desc.blob_info.modifier = 0;
+            blob_desc.blob_info.strides[0] = layout.rowPitch;
+            blob_desc.blob_info.offsets[0] = layout.offset;
+            blob_desc.blob_info.bind = VIRGL_BIND_RENDER_TARGET |
+                VIRGL_BIND_SAMPLER_VIEW | VIRGL_BIND_DISPLAY_TARGET | VIRGL_BIND_SCANOUT;
+            VERBOSE("linear present blob: allocation=0x%08x primary=%u dims=%ux%u format=%u stride=%llu offset=%llu",
+                 resource->base.hKMAllocation, is_primary, desc.Width, desc.Height, desc.Format,
+                 (unsigned long long)layout.rowPitch, (unsigned long long)layout.offset);
+        }
+        D3DDDICB_ESCAPE desc_escape = {
+            .hDevice = device->base.hRTDevice.handle,
+            .pPrivateDriverData = &blob_desc,
+            .PrivateDriverDataSize = sizeof(blob_desc),
+        };
+        hr = device->base.KTCallbacks.pfnEscapeCb(device->base.pAdapter->hRTAdapter.handle, &desc_escape);
+        if (FAILED(hr)) { tritonSetError(&device->base, hr); return; }
+
+
+        VERBOSE("%s: shared blob texture allocated=0x%08x kmres=0x%08x", __FUNCTION__,
+             resource->base.hKMAllocation, resource->base.hKMResource);
 
         ID3D11Texture2D *tex = NULL;
         hr = DXVK_IDXGIVkInteropDevice1_CreateTexture2DFromVkImage(device->base.pDev1, &desc, resource->image, &tex);
@@ -918,9 +1039,9 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
             };
 
             ID3D11Texture2D *tex = NULL;
-            INFO("%s: calling internal CreateTexture2D res=%p init=%p", __FUNCTION__, resource, subresource_data);
+            VERBOSE("%s: calling internal CreateTexture2D res=%p init=%p", __FUNCTION__, resource, subresource_data);
             hr = ID3D11Device1_CreateTexture2D(device->base.pDev1, &desc, subresource_data, &tex);
-            INFO("%s: internal CreateTexture2D returned hr=0x%08lx object=%p res=%p", __FUNCTION__, hr, tex, resource);
+            VERBOSE("%s: internal CreateTexture2D returned hr=0x%08lx object=%p res=%p", __FUNCTION__, hr, tex, resource);
             if (FAILED(hr)) break;
 
             ASSERT(tex != NULL);
@@ -939,9 +1060,9 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
             };
 
             ID3D11Buffer *buf = NULL;
-            INFO("%s: calling internal CreateBuffer res=%p bytes=%u usage=%u cpu=%u bind=%u init=%p sysmem=%p", __FUNCTION__, resource, desc.ByteWidth, desc.Usage, desc.CPUAccessFlags, desc.BindFlags, subresource_data, subresource_data ? subresource_data->pSysMem : NULL);
+            VERBOSE("%s: calling internal CreateBuffer res=%p bytes=%u usage=%u cpu=%u bind=%u init=%p sysmem=%p", __FUNCTION__, resource, desc.ByteWidth, desc.Usage, desc.CPUAccessFlags, desc.BindFlags, subresource_data, subresource_data ? subresource_data->pSysMem : NULL);
             hr = ID3D11Device1_CreateBuffer(device->base.pDev1, &desc, subresource_data, &buf);
-            INFO("%s: internal CreateBuffer returned hr=0x%08lx object=%p res=%p", __FUNCTION__, hr, buf, resource);
+            VERBOSE("%s: internal CreateBuffer returned hr=0x%08lx object=%p res=%p", __FUNCTION__, hr, buf, resource);
             if (FAILED(hr)) break;
 
             ASSERT(buf != NULL);
@@ -1026,7 +1147,7 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
     if (subresource_data) {
         free(subresource_data);
     }
-    INFO("%s: complete dim=%u res=%p object=%p", __FUNCTION__, pArgs->ResourceDimension,
+    VERBOSE("%s: complete dim=%u res=%p object=%p", __FUNCTION__, pArgs->ResourceDimension,
          resource, resource->base.pResource);
 }
 
@@ -1075,7 +1196,7 @@ void APIENTRY virtio_wddm_open_resource(D3D10DDI_HDEVICE hDevice, const D3D10DDI
             .Quality = 0,
         };
 
-        INFO("%s: opening 2d: %ux%u, format %u => %p", __FUNCTION__, resource->base.Width, resource->base.Height, resource->base.Format, resource);
+        VERBOSE("%s: opening 2d: %ux%u, format %u => %p", __FUNCTION__, resource->base.Width, resource->base.Height, resource->base.Format, resource);
 
         D3D11_TEXTURE2D_DESC1 desc = {
             .Width          = resource->base.Width,
@@ -1139,8 +1260,10 @@ void APIENTRY virtio_wddm_open_resource(D3D10DDI_HDEVICE hDevice, const D3D10DDI
         ASSERT(tex != NULL);
         resource->base.pResource = (ID3D11Resource *)tex;
     } else if (alloc_info.tag == VIRTIO_WDDM_ALLOCATE_BLOB_TAG) {
-        ASSERT(alloc_info.blob.info_valid);
-        ASSERT(alloc_info.blob.created);
+        if (!alloc_info.blob.info_valid || !alloc_info.blob.created) {
+            tritonSetError(&device->base, E_INVALIDARG);
+            return;
+        }
 
         resource->base.Format    = virgl_to_dxgi_format(alloc_info.blob.info.format);
         resource->base.Width     = alloc_info.blob.info.width;
@@ -1153,7 +1276,7 @@ void APIENTRY virtio_wddm_open_resource(D3D10DDI_HDEVICE hDevice, const D3D10DDI
             .Quality = 0,
         };
 
-        INFO("%s: opening 2d: %ux%u, format %u => %p", __FUNCTION__, resource->base.Width, resource->base.Height, resource->base.Format, resource);
+        VERBOSE("%s: opening 2d: %ux%u, format %u => %p", __FUNCTION__, resource->base.Width, resource->base.Height, resource->base.Format, resource);
 
         D3D11_TEXTURE2D_DESC1 desc = {
             .Width          = resource->base.Width,
@@ -1230,7 +1353,7 @@ void APIENTRY virtio_wddm_destroy_resource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HR
 
     VIRTIO_WDDM_Device *device = hDevice.pDrvPrivate;
     VIRTIO_WDDM_Resource *resource = hResource.pDrvPrivate;
-    INFO("%s: resource=%p", __FUNCTION__, resource);
+    VERBOSE("%s: resource=%p", __FUNCTION__, resource);
 
     if (resource->base.pResource) {
         ID3D11Resource_Release(resource->base.pResource);

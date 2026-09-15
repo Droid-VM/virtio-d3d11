@@ -58,8 +58,19 @@ tritonCreateBlendState(D3D10DDI_HDEVICE hDevice,
         dst->BlendOpAlpha          = tritonBlendOp(src->BlendOpAlpha);
         dst->LogicOp               = (D3D11_LOGIC_OP)src->LogicOp;
         dst->RenderTargetWriteMask = src->RenderTargetWriteMask;
+        if (i == 0) {
+            TR_LOG_VERBOSE("BlendState rt0: enable=%u src=%u dst=%u op=%u srcA=%u dstA=%u opA=%u mask=0x%x",
+                   src->BlendEnable, src->SrcBlend, src->DestBlend, src->BlendOp,
+                   src->SrcBlendAlpha, src->DestBlendAlpha, src->BlendOpAlpha,
+                   src->RenderTargetWriteMask);
+        }
     }
     HRESULT hr = ID3D11Device1_CreateBlendState1(pD->pDev1, &d, &s->pState);
+    TR_SHADER_DIAG("BlendCreate state=%p blend=%u/%u/%u alpha=%u/%u/%u enabled=%u mask=%x",
+        s, d.RenderTarget[0].SrcBlend, d.RenderTarget[0].DestBlend, d.RenderTarget[0].BlendOp,
+        d.RenderTarget[0].SrcBlendAlpha, d.RenderTarget[0].DestBlendAlpha,
+        d.RenderTarget[0].BlendOpAlpha, d.RenderTarget[0].BlendEnable,
+        d.RenderTarget[0].RenderTargetWriteMask);
     if (FAILED(hr)) {
         TR_LOG("CreateBlendState: failed 0x%08lx", hr);
         s->pState = NULL;
@@ -124,6 +135,7 @@ tritonSetBlendState(D3D10DDI_HDEVICE hDevice,
     PTRITON_DEVICE pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     if (!pD) return;
     PTRITON_BLENDSTATE s = (PTRITON_BLENDSTATE)(hState.pDrvPrivate);
+    TR_SHADER_DIAG("BlendSet dev=%p state=%p", pD, s);
     ID3D11DeviceContext1_OMSetBlendState(
         pD->pCtx1, s ? (ID3D11BlendState *)s->pState : NULL, BlendFactor, SampleMask);
 }
@@ -401,6 +413,9 @@ tritonCreateSampler(D3D10DDI_HDEVICE hDevice,
     for (int i = 0; i < 4; ++i) d.BorderColor[i] = pArgs->BorderColor[i];
     d.MinLOD         = pArgs->MinLOD;
     d.MaxLOD         = pArgs->MaxLOD;
+    TR_LOG_VERBOSE("Sampler: filter=%u addr=%u/%u/%u cmp=%u lod=%f..%f aniso=%u",
+           pArgs->Filter, pArgs->AddressU, pArgs->AddressV, pArgs->AddressW,
+           pArgs->ComparisonFunc, pArgs->MinLOD, pArgs->MaxLOD, d.MaxAnisotropy);
     HRESULT hr = ID3D11Device1_CreateSamplerState(pD->pDev1, &d, &s->pState);
     if (FAILED(hr)) {
         TR_LOG("CreateSampler: failed 0x%08lx", hr);
@@ -647,6 +662,7 @@ tritonDraw(D3D10DDI_HDEVICE hDevice, UINT VertexCount, UINT StartVertexLocation)
     TR_TRACE();
     PTRITON_DEVICE pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     if (!pD) return;
+    TR_SHADER_DIAG("Draw dev=%p count=%u start=%u", pD, VertexCount, StartVertexLocation);
     ID3D11DeviceContext1_Draw(pD->pCtx1, VertexCount, StartVertexLocation);
 }
 
@@ -657,6 +673,8 @@ tritonDrawIndexed(D3D10DDI_HDEVICE hDevice, UINT IndexCount,
     TR_TRACE();
     PTRITON_DEVICE pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     if (!pD) return;
+    TR_SHADER_DIAG("DrawIndexed dev=%p count=%u start=%u base=%d", pD,
+        IndexCount, StartIndexLocation, BaseVertexLocation);
     ID3D11DeviceContext1_DrawIndexed(pD->pCtx1, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -668,6 +686,8 @@ tritonDrawInstanced(D3D10DDI_HDEVICE hDevice, UINT VertexCountPerInstance,
     TR_TRACE();
     PTRITON_DEVICE pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     if (!pD) return;
+    TR_SHADER_DIAG("DrawInstanced dev=%p count=%u instances=%u start=%u instanceStart=%u", pD,
+        VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
     ID3D11DeviceContext1_DrawInstanced(pD->pCtx1, VertexCountPerInstance, InstanceCount,
                                        StartVertexLocation, StartInstanceLocation);
 }
@@ -680,6 +700,8 @@ tritonDrawIndexedInstanced(D3D10DDI_HDEVICE hDevice, UINT IndexCountPerInstance,
     TR_TRACE();
     PTRITON_DEVICE pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     if (!pD) return;
+    TR_SHADER_DIAG("DrawIndexedInstanced dev=%p count=%u instances=%u start=%u base=%d instanceStart=%u", pD,
+        IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
     ID3D11DeviceContext1_DrawIndexedInstanced(pD->pCtx1, IndexCountPerInstance, InstanceCount,
                                               StartIndexLocation, BaseVertexLocation,
                                               StartInstanceLocation);

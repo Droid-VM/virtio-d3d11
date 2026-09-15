@@ -35,6 +35,31 @@ static inline void triton_log_raw(const char *line)
     } while (0)
 
 
+static inline BOOL tritonVerboseLogEnabled(void)
+{
+    static volatile LONG cached;
+    LONG value = InterlockedCompareExchange(&cached, 0, 0);
+    if (!value) {
+        char setting[2] = {0};
+        DWORD length = GetEnvironmentVariableA("VIRTIO_WDDM_VERBOSE", setting, sizeof(setting));
+        value = length == 1 && setting[0] == '1' ? 2 : 1;
+        InterlockedCompareExchange(&cached, value, 0);
+    }
+    return value == 2;
+}
+
+#define TR_LOG_VERBOSE(fmt, ...) do { \
+    if (tritonVerboseLogEnabled()) TR_LOG(fmt, ##__VA_ARGS__); \
+} while (0)
+
+/* Keep the first errors and exponential samples without flooding the log. */
+#define TR_LOG_LIMITED(fmt, ...) do { \
+    static volatile LONG count; \
+    ULONG n = (ULONG)InterlockedIncrement(&count); \
+    if (n <= 16 || !(n & (n - 1)) || tritonVerboseLogEnabled()) \
+        TR_LOG(fmt, ##__VA_ARGS__); \
+} while (0)
+
 /* Per-DDI-call trace: compiled OUT by default.  OutputDebugStringA is a
  * RaiseException + global DBWIN handshake per call; at draw/list rates it
  * dominates real work: a loading thread can spend minutes parked
@@ -53,6 +78,23 @@ static inline void triton_log_raw(const char *line)
     } while (0)
 
 #define TR_TRACE() TR_LOG_HOT("%s", __FUNCTION__)
+
+/* Opt-in capture for the standalone D2D reproduction. No global DWM trace. */
+static inline BOOL tritonShaderDiagEnabled(void)
+{
+    static volatile LONG cached;
+    LONG value = InterlockedCompareExchange(&cached, 0, 0);
+    if (!value) {
+        char dir[2];
+        value = GetEnvironmentVariableA("VIRTIO_WDDM_SHADER_DIAG", dir, sizeof(dir)) ? 2 : 1;
+        InterlockedCompareExchange(&cached, value, 0);
+    }
+    return value == 2;
+}
+
+#define TR_SHADER_DIAG(fmt, ...) do { \
+    if (tritonShaderDiagEnabled()) TR_LOG("SHDIAG " fmt, ##__VA_ARGS__); \
+} while (0)
 
 #ifdef __cplusplus
 }

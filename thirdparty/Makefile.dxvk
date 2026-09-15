@@ -26,7 +26,7 @@ DXVK_INCLUDES := \
 
 CFLAGS+=$(addprefix -I,$(DXVK_INCLUDES)) $(addprefix -D,$(DXVK_DEFINES))
 
-DXVK_GIT_VERSION=$(shell git -C $(DXVK_PATH) describe --dirty=+)
+PYTHON ?= python3
 DXVK_TARGET=$(PREFIX)
 DXVK_COMPILER=$(CC)
 DXVK_COMPILER_VERSION=$(shell $(CC) --version | head -1)
@@ -303,8 +303,13 @@ build/%.h: $(DXVK_PATH)/%.geom | build
 	@mkdir -p $(dir $@)
 	$(GLSLANG) $(GLSL_ARGS) -V --vn "$(basename $(notdir $<))" --depfile "build/$(basename $(notdir $<)).d" $< -o $@
 
-build/version.h: $(DXVK_PATH)/version.h.in | build
-	sed "s#@VCS_TAG@#$(DXVK_GIT_VERSION)#" $< > $@
+.PHONY: dxvk-version-force
+dxvk-version-force:
+
+# The persistent IR cache must change even for edits inside a dirty submodule.
+# The generator preserves the header timestamp when all inputs are unchanged.
+build/version.h: $(DXVK_PATH)/version.h.in thirdparty/gen_dxvk_version.py dxvk-version-force | build
+	$(PYTHON) thirdparty/gen_dxvk_version.py --root $(DXVK_PATH) --output $@ --target "$(DXVK_TARGET)" --compiler "$(DXVK_COMPILER_VERSION)" --flags "$(CFLAGS) $(CXXFLAGS) $(GLSL_ARGS)"
 
 build/buildenv.h: $(DXVK_PATH)/buildenv.h.in | build
 	sed "s#@BUILD_TARGET@#$(DXVK_TARGET)#; s#@BUILD_COMPILER@#$(DXVK_COMPILER)#; s#@BUILD_COMPILER_VERSION@#$(DXVK_COMPILER_VERSION)#;" $< > $@

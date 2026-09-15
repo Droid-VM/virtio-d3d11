@@ -19,8 +19,6 @@
 #include "adapter.h"
 #include "device.h"
 
-/* Keep UMD diagnostics enabled during bring-up. */
-
 #ifdef NO_DEBUG
 extern void triton_log_raw(const char *line) {
 }
@@ -29,6 +27,7 @@ void virtio_wddm_log(const char *file, int line, const char *label, const char *
 }
 
 extern int __cdecl DXVK_umd_log_output(const char *line) {
+    return 0;
 }
 #else
 extern void print_log_raw(const char *line) {
@@ -39,7 +38,8 @@ extern void print_log_raw(const char *line) {
         return;
     tagged[sizeof(tagged) - 1] = '\0';
 
-    OutputDebugStringA(tagged);
+    if (tritonVerboseLogEnabled())
+        OutputDebugStringA(tagged);
 
     static FILE *out = NULL;
     if (out == NULL) {
@@ -53,14 +53,6 @@ extern void print_log_raw(const char *line) {
 }
 
 void virtio_wddm_log(const char *file, int line, const char *label, const char *format, ...) {
-#if 0
-    fprintf(stderr, "%s:%d: %s: ", file, line, label);
-    va_list args;
-    va_start(args, format);
-    vfprintf(stderr, format, args);
-    va_end(args);
-    fprintf(stderr, "\n");
-#else
     char buf[4096];
     va_list args;
     va_start(args, format);
@@ -74,7 +66,6 @@ void virtio_wddm_log(const char *file, int line, const char *label, const char *
     }
     va_end(args);
     print_log_raw(buf);
-#endif
 }
 
 extern int __cdecl DXVK_umd_log_output(const char *line) {

@@ -170,6 +170,33 @@ static void tritonCreateShaderCommon(D3D10DDI_HDEVICE hDevice, TRITON_SHADER_KIN
     s->pBytecode  = pDxbc;
     s->cbBytecode = cbDxbc;
 
+    if (tritonShaderDiagEnabled()) {
+        char dir[MAX_PATH], path[MAX_PATH + 128];
+        DWORD len = GetEnvironmentVariableA("VIRTIO_WDDM_SHADER_DIAG", dir, sizeof(dir));
+        if (len && len < sizeof(dir)) {
+            snprintf(path, sizeof(path), "%s\\pid%lu-dev%p-sh%llu-kind%u.dxbc",
+                dir, GetCurrentProcessId(), pD, (unsigned long long)s->cookie, (UINT)kind);
+            FILE *file = fopen(path, "wb");
+            BOOL saved = FALSE;
+            if (file) {
+                saved = fwrite(pDxbc, cbDxbc, 1, file) == 1;
+                if (fclose(file)) saved = FALSE;
+            }
+            TR_SHADER_DIAG("CreateShader dev=%p shader=%p cookie=%llu kind=%u saved=%u file=%s",
+                pD, s, (unsigned long long)s->cookie, (UINT)kind, saved, path);
+            const void *entries[] = {sigs.pIn, sigs.pOut, sigs.pPatch};
+            UINT counts[] = {sigs.cIn, sigs.cOut, sigs.cPatch};
+            UINT stride = tritonSigStride(pD);
+            for (UINT group = 0; group < 3; ++group)
+                for (UINT i = 0; entries[group] && i < counts[group]; ++i) {
+                    const UINT *e = (const UINT *)((const BYTE *)entries[group] + i * stride);
+                    TR_SHADER_DIAG("Signature cookie=%llu group=%u entry=%u stride=%u sys=%u reg=%u mask=%x type=%u precision=%u",
+                        (unsigned long long)s->cookie, group, i, stride, e[0], e[1],
+                        e[2] & 255, stride >= 20 ? e[3] : 0, stride >= 20 ? e[4] : 0);
+                }
+        }
+    }
+
     HRESULT hr = tritonShaderCreateNative(pD, kind, s->pBytecode, s->cbBytecode,
                                           &s->u.pDeviceChild);
     if (FAILED(hr)) {
@@ -255,6 +282,8 @@ tritonVsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
     ID3D11DeviceContext1_VSSetShader(pD->pCtx1, vs, NULL, 0);
     pD->pBoundReconVS = NULL;
     pD->pCurrentVS = s;
+    TR_SHADER_DIAG("VS dev=%p shader=%p cookie=%llu", pD, s,
+        s ? (unsigned long long)s->cookie : 0);
     tritonResolveInputLayout(pD);
 }
 
@@ -267,6 +296,8 @@ tritonPsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
     if (!pD) return;
     ID3D11PixelShader *ps = (s && s->u.pPS) ? s->u.pPS : NULL;
     ID3D11DeviceContext1_PSSetShader(pD->pCtx1, ps, NULL, 0);
+    TR_SHADER_DIAG("PS dev=%p shader=%p cookie=%llu", pD, s,
+        s ? (unsigned long long)s->cookie : 0);
 }
 
 void APIENTRY
@@ -747,6 +778,10 @@ void tritonResolveInputLayout(PTRITON_DEVICE pD)
         dst->AlignedByteOffset    = src->AlignedByteOffset;
         dst->InputSlotClass       = (D3D11_INPUT_CLASSIFICATION)src->InputSlotClass;
         dst->InstanceDataStepRate = src->InstanceDataStepRate;
+        TR_SHADER_DIAG("Layout dev=%p layout=%p vs=%llu entry=%u reg=%u semantic=%s%u format=%u slot=%u offset=%u class=%u step=%u",
+            pD, e, (unsigned long long)vs->cookie, i, src->InputRegister,
+            dst->SemanticName, dst->SemanticIndex, dst->Format, dst->InputSlot,
+            dst->AlignedByteOffset, dst->InputSlotClass, dst->InstanceDataStepRate);
 
         if (sig) {
             sigNames[cMatched]  = sig->Name;

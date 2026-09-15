@@ -13,6 +13,58 @@ typedef struct VIRTIO_WDDM_GuestAllocCaps {
 } VIRTIO_WDDM_GuestAllocCaps;
 #define VIRTIO_WDDM_BLOB_FLAG_CREATE_GUEST_HANDLE 8u
 
+/* ------------------------------------------------------------------------
+ * Runtime-allocated blob hook (D3D11 shared resources)
+ *
+ * A blob the vdrm transport creates itself (raw D3DKMTCreateAllocation2 on the
+ * transport's own device) can never become a D3D11 shared resource: the kernel
+ * resource handle an application needs for IDXGIResource::GetSharedHandle is
+ * minted by the Direct3D runtime inside pfnAllocateCb, on the runtime's device.
+ * So for shared textures the allocation has to come from the UMD's callback,
+ * while the blob's identity (blob_id) and size must still come from the ICD --
+ * it is the only side that knows the image's memory requirements, and the host
+ * requires GEM_NEW and RESOURCE_CREATE_BLOB to agree exactly on size.
+ *
+ * The hook inverts the usual direction so both constraints hold at once: the
+ * ICD decides what to allocate, the UMD performs the allocation. Only plain C
+ * types cross the boundary -- the d3dumddi.h callback types stay in the UMD,
+ * which is the only side that can include that header.
+ * ------------------------------------------------------------------------ */
+
+typedef struct VIRTIO_WDDM_RuntimeAllocRequest {
+    /* Chosen by the ICD; must match the later RESOURCE_CREATE_BLOB exactly. */
+    uint64_t blob_id;
+    uint64_t size;
+    uint32_t mem;               /* VIRTIO_WDDM_BlobMem */
+    uint32_t flags;             /* VIRTIO_WDDM_BlobFlag */
+    /* D3D11 runtime resource this allocation belongs to, i.e. the hRTResource
+     * the UMD received in CreateResource. Passing it back is what lets the
+     * runtime associate the allocation with the resource and return a kernel
+     * resource handle. NULL means "no D3D resource": the UMD must then not set
+     * hResource, and hKMResource comes back 0. */
+    void *hRTResource;
+    D3DKMT_HANDLE sourceAllocation; /* Existing blob on the ICD device. */
+} VIRTIO_WDDM_RuntimeAllocRequest;
+
+typedef struct VIRTIO_WDDM_RuntimeAllocResult {
+    D3DKMT_HANDLE hAllocation;
+    D3DKMT_HANDLE hKMResource;  /* 0 when hRTResource was NULL */
+} VIRTIO_WDDM_RuntimeAllocResult;
+
+/* Both return 0 on success and a negative errno on failure. The free hook takes
+ * the same handles the alloc hook produced; it must tolerate hKMResource == 0. */
+typedef int (*VIRTIO_WDDM_RuntimeAllocFn)(void *ctx,
+                                          const VIRTIO_WDDM_RuntimeAllocRequest *req,
+                                          VIRTIO_WDDM_RuntimeAllocResult *out);
+typedef int (*VIRTIO_WDDM_RuntimeFreeFn)(void *ctx,
+                                         const VIRTIO_WDDM_RuntimeAllocResult *alloc);
+
+typedef struct VIRTIO_WDDM_RuntimeAllocator {
+    void *ctx;
+    VIRTIO_WDDM_RuntimeAllocFn alloc;
+    VIRTIO_WDDM_RuntimeFreeFn free;
+} VIRTIO_WDDM_RuntimeAllocator;
+
 #define VIRTIO_WDDM_PCI_VENDOR_ID 6900
 
 #define VIRTIO_WDDM_PCI_DEVICE_ID 26985
@@ -137,6 +189,23 @@ typedef union __attribute__((packed)) {
     VIRTIO_WDDM_Allocate3d _3d;
     VIRTIO_WDDM_AllocateBlob blob;
 } VIRTIO_WDDM_CreateAllocation;
+
+#define VIRTIO_WDDM_REUSE_BLOB_TAG UINT64_C(0x3145535545524242)
+typedef struct __attribute__((packed)) {
+    VIRTIO_WDDM_CreateAllocation allocation;
+    uint64_t reuse_tag;
+    D3DKMT_HANDLE source;
+} VIRTIO_WDDM_ReuseBlobAllocation;
+
+#define VIRTIO_WDDM_PRIMARY_ALLOCATION_TAG UINT64_C(0x315952414d495250)
+typedef struct __attribute__((packed)) {
+    VIRTIO_WDDM_ReuseBlobAllocation base;
+    uint64_t primary_tag;
+    uint32_t refresh_numerator;
+    uint32_t refresh_denominator;
+    uint32_t vidpn_source;
+} VIRTIO_WDDM_PrimaryAllocation;
+
 
 typedef struct __attribute__((packed)) {
     uint64_t tag;

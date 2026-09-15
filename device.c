@@ -15,6 +15,149 @@
 
 #include "dxvk.h"
 
+__thread VIRTIO_WDDM_RuntimeAllocRecord virtio_wddm_last_runtime_alloc;
+__thread VIRTIO_WDDM_RuntimeAllocScope virtio_wddm_runtime_alloc_scope;
+
+/* Perform an allocation the ICD asked for, on the runtime's device.
+ *
+ * The ICD picks blob_id and size (only it knows the image's memory
+ * requirements, and the host requires GEM_NEW and RESOURCE_CREATE_BLOB to agree
+ * exactly); we only supply pfnAllocateCb, which is the sole way to obtain the
+ * kernel resource handle an application needs for GetSharedHandle.
+ *
+ * Called from inside vkAllocateMemory, i.e. nested in the CreateResource whose
+ * hRTResource is being passed back -- same thread, and the runtime resource is
+ * live for the whole call. */
+int virtio_wddm_runtime_alloc(void *ctx, const VIRTIO_WDDM_RuntimeAllocRequest *req,
+                             VIRTIO_WDDM_RuntimeAllocResult *out) {
+    VIRTIO_WDDM_Device *device = ctx;
+
+    if (!device || !req || !out) {
+        return -EINVAL;
+    }
+
+    /* Mirrors what the vdrm WDDM backend would have put in a plain
+     * CreateAllocation, so the KMD sees an identical blob request either way. */
+    VIRTIO_WDDM_CreateResource res_priv = {
+        .tag = VIRTIO_WDDM_CREATE_RESOURCE_TAG,
+    };
+    VIRTIO_WDDM_CreateAllocation alloc_priv = {
+        .blob = {
+            .tag   = VIRTIO_WDDM_ALLOCATE_BLOB_TAG,
+            .id    = req->blob_id,
+            .mem   = req->mem,
+            .flags = req->flags,
+            .size  = req->size,
+        },
+    };
+
+    VIRTIO_WDDM_ReuseBlobAllocation reuse = {
+        .allocation = alloc_priv,
+        .reuse_tag = VIRTIO_WDDM_REUSE_BLOB_TAG,
+        .source = req->sourceAllocation,
+    };
+
+    D3DDDI_ALLOCATIONINFO2 alloc_info = {
+        .pPrivateDriverData    = req->sourceAllocation ? (void *)&reuse : (void *)&alloc_priv,
+        .PrivateDriverDataSize = req->sourceAllocation ? sizeof(reuse) : sizeof(alloc_priv),
+        .Flags.Primary = req->hRTResource &&
+            virtio_wddm_runtime_alloc_scope.hRTResource == req->hRTResource &&
+            virtio_wddm_runtime_alloc_scope.primary,
+    };
+
+    VIRTIO_WDDM_PrimaryAllocation primary = {
+        .base = reuse,
+        .primary_tag = VIRTIO_WDDM_PRIMARY_ALLOCATION_TAG,
+        .refresh_numerator = virtio_wddm_runtime_alloc_scope.primary_desc.ModeDesc.RefreshRate.Numerator,
+        .refresh_denominator = virtio_wddm_runtime_alloc_scope.primary_desc.ModeDesc.RefreshRate.Denominator,
+        .vidpn_source = virtio_wddm_runtime_alloc_scope.primary_desc.VidPnSourceId,
+    };
+    if (alloc_info.Flags.Primary) {
+        alloc_info.pPrivateDriverData = &primary;
+        alloc_info.PrivateDriverDataSize = sizeof(primary);
+    }
+
+    D3DDDICB_ALLOCATE allocate = {
+        .pPrivateDriverData    = &res_priv,
+        .PrivateDriverDataSize = sizeof(res_priv),
+        /* This is what makes the runtime mint hKMResource. NULL is legal and
+         * simply yields no resource handle. */
+        .hResource             = req->hRTResource,
+        .NumAllocations        = 1,
+        .pAllocationInfo2      = &alloc_info,
+    };
+
+    VERBOSE("%s: pfnAllocateCb begin rtdev=%p rtres=%p blob=%llu size=%llu mem=0x%x flags=0x%x",
+         __FUNCTION__, device->base.hRTDevice.handle, req->hRTResource,
+         (unsigned long long)req->blob_id, (unsigned long long)req->size,
+         req->mem, req->flags);
+
+    SetLastError(ERROR_SUCCESS);
+    HRESULT hr = device->base.KTCallbacks.pfnAllocateCb(device->base.hRTDevice.handle, &allocate);
+    DWORD last_error = GetLastError();
+
+    VERBOSE("%s: pfnAllocateCb end hr=0x%08lx last_error=%lu kmres=0x%08x allocation=0x%08x",
+         __FUNCTION__, hr, last_error, allocate.hKMResource, alloc_info.hAllocation);
+
+    if (FAILED(hr) || alloc_info.hAllocation == 0) {
+        ERROR("%s: pfnAllocateCb failed: 0x%08lx", __FUNCTION__, hr);
+        return -EIO;
+    }
+
+    out->hAllocation = alloc_info.hAllocation;
+    out->hKMResource = allocate.hKMResource;
+
+    /* Hand the handles to the CreateResource further up this stack: it cannot
+     * get hAllocation any other way (exporting it from the VkDeviceMemory needs
+     * vkGetMemoryWin32HandleKHR, which turnip does not implement). */
+    virtio_wddm_last_runtime_alloc = (VIRTIO_WDDM_RuntimeAllocRecord) {
+        .hRTResource = req->hRTResource,
+        .hAllocation = alloc_info.hAllocation,
+        .hKMResource = allocate.hKMResource,
+    };
+
+    return 0;
+}
+
+/* Release an allocation the alloc hook produced.
+ *
+ * Allocation-level (HandleList) on purpose: retiring the runtime resource is
+ * DestroyResource's job, and it runs after this -- vk_FreeMemory is what closes
+ * the ICD's BO. Freeing by hResource here would retire the resource while the
+ * UMD still holds it. */
+int virtio_wddm_runtime_free(void *ctx, const VIRTIO_WDDM_RuntimeAllocResult *alloc) {
+    VIRTIO_WDDM_Device *device = ctx;
+
+    if (!device || !alloc) {
+        return -EINVAL;
+    }
+    if (alloc->hAllocation == 0) {
+        return 0;
+    }
+
+    D3DKMT_HANDLE handles[1] = { alloc->hAllocation };
+    D3DDDICB_DEALLOCATE deallocate = {
+        .hResource      = NULL,
+        .NumAllocations = 1,
+        .HandleList     = handles,
+    };
+
+    HRESULT hr = device->base.KTCallbacks.pfnDeallocateCb(device->base.hRTDevice.handle, &deallocate);
+    VERBOSE("%s: pfnDeallocateCb allocation=0x%08x kmres=0x%08x hr=0x%08lx", __FUNCTION__,
+         alloc->hAllocation, alloc->hKMResource, hr);
+
+    if (virtio_wddm_last_runtime_alloc.hAllocation == alloc->hAllocation) {
+        memset(&virtio_wddm_last_runtime_alloc, 0, sizeof(virtio_wddm_last_runtime_alloc));
+    }
+
+    if (FAILED(hr)) {
+        ERROR("%s: pfnDeallocateCb failed: 0x%08lx", __FUNCTION__, hr);
+        return -EIO;
+    }
+
+    return 0;
+}
+
 SIZE_T APIENTRY virtio_wddm_calc_device_size(D3D10DDI_HADAPTER hAdapter, const D3D10DDIARG_CALCPRIVATEDEVICESIZE *pArgs) {
     /* Keep the private block comfortably above the runtime's alignment and
      * bookkeeping granularity while isolating the CalcPrivateDeviceSize ABI.
@@ -451,8 +594,20 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
         return E_FAIL;
     }
 
+    /* Chained off `callbacks` below. Both hooks or neither: the ICD ignores a
+     * half-installed allocator, and an allocation made without the matching free
+     * would leak the runtime's resource association. */
+    device->runtime_allocator = (VkD3DDDIRuntimeAllocator) {
+        .sType = VK_STRUCTURE_TYPE_D3DDDI_RUNTIME_ALLOCATOR,
+        .pNext = NULL,
+        .ctx   = device,
+        .alloc = (void *) virtio_wddm_runtime_alloc,
+        .free  = (void *) virtio_wddm_runtime_free,
+    };
+
     device->callbacks = (VkD3DDDICallbacks) {
         .sType = VK_STRUCTURE_TYPE_D3DDDI_CALLBACKS,
+        .pNext = &device->runtime_allocator,
         .AdapterLuid = adapter->luid,
         .hRTAdapter = adapter->base.hRTAdapter.handle,
         .hRTDevice = device->base.hRTDevice.handle,
