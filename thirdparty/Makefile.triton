@@ -14,11 +14,11 @@ TRITON_SRC := \
     tritonState.c \
     tritonView.c \
 
-TRITON_OBJS := $(addprefix build/triton/,$(addsuffix .o,$(basename $(TRITON_SRC))))
+TRITON_OBJS := $(addprefix $(BUILD_DIR)/triton/,$(addsuffix .o,$(basename $(TRITON_SRC))))
 
-build/triton.a: $(TRITON_OBJS)
+$(BUILD_DIR)/triton.a: $(TRITON_OBJS)
 	$(AR) rcs $@ $^
 
-build/triton/%.o: $(TRITON_PATH)/%.c | build
+$(BUILD_DIR)/triton/%.o: $(TRITON_PATH)/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<

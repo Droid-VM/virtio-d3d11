@@ -1,1 +1,4 @@
 build
+build-arm64ec/
+build-arm64ec-native-obj/
+build-arm64x-native/

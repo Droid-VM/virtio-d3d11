@@ -561,12 +561,13 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
          __FUNCTION__, GetCurrentProcessId(), GetCurrentThreadId(),
          pArgs->Interface, pArgs->Version, pArgs->Flags);
 
-    device->vulkan = LoadLibraryA("vulkan-1.dll");
+    /* Keep the loader in the signed package and in the same ABI as the ICD. */
+    device->vulkan = load_icd(L"droidvm_vulkan.dll");
     if (!device->vulkan) {
         ERROR("%s: Vulkan loader unavailable: %lu", __FUNCTION__, GetLastError());
         return E_FAIL;
     }
-    INFO("%s: loaded vulkan-1.dll=%p", __FUNCTION__, device->vulkan);
+    INFO("%s: loaded droidvm_vulkan.dll=%p", __FUNCTION__, device->vulkan);
 
     if (adapter->supported_capsets & VIRTIO_WDDM_CAPSET_MASK_DRM) {
         uint32_t drm_context_type = 0;

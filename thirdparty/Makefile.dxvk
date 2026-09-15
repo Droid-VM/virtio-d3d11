@@ -19,9 +19,9 @@ DXVK_INCLUDES := \
     $(DXVK_PATH)/src/dxvk \
     $(DXVK_PATH)/src/vulkan \
     $(DXVK_PATH)/src/util \
-    build/src/dxvk/shaders \
-    build/src/dxvk/hud/shaders \
-    build/src/d3d11/shaders \
+    $(BUILD_DIR)/src/dxvk/shaders \
+    $(BUILD_DIR)/src/dxvk/hud/shaders \
+    $(BUILD_DIR)/src/d3d11/shaders \
     $(DXVK_PATH)/subprojects/dxbc-spirv
 
 CFLAGS+=$(addprefix -I,$(DXVK_INCLUDES)) $(addprefix -D,$(DXVK_DEFINES))
@@ -264,52 +264,52 @@ D3D11_SHADERS = \
     src/d3d11/shaders/d3d11_composition_frag.frag \
     src/d3d11/shaders/d3d11_composition_vert.vert
 
-DXVK_SHADER_HEADERS := $(addprefix build/,$(addsuffix .h,$(basename $(DXVK_SHADERS) $(D3D11_SHADERS))))
+DXVK_SHADER_HEADERS := $(addprefix $(BUILD_DIR)/,$(addsuffix .h,$(basename $(DXVK_SHADERS) $(D3D11_SHADERS))))
 
-DXGI_OBJS := $(addprefix build/,$(addsuffix .o,$(basename $(DXGI_SRC))))
-DXVK_OBJS := $(addprefix build/,$(addsuffix .o,$(basename $(UTIL_SRC) $(DXBC_SRC) $(DXVK_SRC) $(VK_COMMON_SRC) $(SPIRV_SRC))))
-D3D11_OBJS := $(addprefix build/,$(addsuffix .o,$(basename $(D3D11_SRC) $(D3D10_SRC))))
+DXGI_OBJS := $(addprefix $(BUILD_DIR)/,$(addsuffix .o,$(basename $(DXGI_SRC))))
+DXVK_OBJS := $(addprefix $(BUILD_DIR)/,$(addsuffix .o,$(basename $(UTIL_SRC) $(DXBC_SRC) $(DXVK_SRC) $(VK_COMMON_SRC) $(SPIRV_SRC))))
+D3D11_OBJS := $(addprefix $(BUILD_DIR)/,$(addsuffix .o,$(basename $(D3D11_SRC) $(D3D10_SRC))))
 
-build/dxvk.a: $(DXVK_OBJS)
+$(BUILD_DIR)/dxvk.a: $(DXVK_OBJS)
 	$(AR) rcs $@ $^
 
-build/dxvk-d3d11.a: $(D3D11_OBJS)
+$(BUILD_DIR)/dxvk-d3d11.a: $(D3D11_OBJS)
 	$(AR) rcs $@ $^
 
-build/dxvk-dxgi.a: $(DXGI_OBJS)
+$(BUILD_DIR)/dxvk-dxgi.a: $(DXGI_OBJS)
 	$(AR) rcs $@ $^
 
-build/%.o: $(DXVK_PATH)/%.cpp $(DXVK_SHADER_HEADERS) build/version.h build/buildenv.h | build
+$(BUILD_DIR)/%.o: $(DXVK_PATH)/%.cpp $(DXVK_SHADER_HEADERS) $(BUILD_DIR)/version.h $(BUILD_DIR)/buildenv.h | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CFLAGS) $(CXXFLAGS) -c -o $@ $<
 
-build/%.o: $(DXVK_PATH)/%.c $(DXVK_SHADER_HEADERS) build/version.h build/buildenv.h | build
+$(BUILD_DIR)/%.o: $(DXVK_PATH)/%.c $(DXVK_SHADER_HEADERS) $(BUILD_DIR)/version.h $(BUILD_DIR)/buildenv.h | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-build/%.h: $(DXVK_PATH)/%.comp | build
+$(BUILD_DIR)/%.h: $(DXVK_PATH)/%.comp | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
-	$(GLSLANG) $(GLSL_ARGS) -V --vn "$(basename $(notdir $<))" --depfile "build/$(basename $(notdir $<)).d" $< -o $@
+	$(GLSLANG) $(GLSL_ARGS) -V --vn "$(basename $(notdir $<))" --depfile "$(BUILD_DIR)/$(basename $(notdir $<)).d" $< -o $@
 
-build/%.h: $(DXVK_PATH)/%.vert | build
+$(BUILD_DIR)/%.h: $(DXVK_PATH)/%.vert | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
-	$(GLSLANG) $(GLSL_ARGS) -V --vn "$(basename $(notdir $<))" --depfile "build/$(basename $(notdir $<)).d" $< -o $@
+	$(GLSLANG) $(GLSL_ARGS) -V --vn "$(basename $(notdir $<))" --depfile "$(BUILD_DIR)/$(basename $(notdir $<)).d" $< -o $@
 
-build/%.h: $(DXVK_PATH)/%.frag | build
+$(BUILD_DIR)/%.h: $(DXVK_PATH)/%.frag | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
-	$(GLSLANG) $(GLSL_ARGS) -V --vn "$(basename $(notdir $<))" --depfile "build/$(basename $(notdir $<)).d" $< -o $@
+	$(GLSLANG) $(GLSL_ARGS) -V --vn "$(basename $(notdir $<))" --depfile "$(BUILD_DIR)/$(basename $(notdir $<)).d" $< -o $@
 
-build/%.h: $(DXVK_PATH)/%.geom | build
+$(BUILD_DIR)/%.h: $(DXVK_PATH)/%.geom | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
-	$(GLSLANG) $(GLSL_ARGS) -V --vn "$(basename $(notdir $<))" --depfile "build/$(basename $(notdir $<)).d" $< -o $@
+	$(GLSLANG) $(GLSL_ARGS) -V --vn "$(basename $(notdir $<))" --depfile "$(BUILD_DIR)/$(basename $(notdir $<)).d" $< -o $@
 
 .PHONY: dxvk-version-force
 dxvk-version-force:
 
 # The persistent IR cache must change even for edits inside a dirty submodule.
 # The generator preserves the header timestamp when all inputs are unchanged.
-build/version.h: $(DXVK_PATH)/version.h.in thirdparty/gen_dxvk_version.py dxvk-version-force | build
+$(BUILD_DIR)/version.h: $(DXVK_PATH)/version.h.in thirdparty/gen_dxvk_version.py dxvk-version-force | $(BUILD_DIR)
 	$(PYTHON) thirdparty/gen_dxvk_version.py --root $(DXVK_PATH) --output $@ --target "$(DXVK_TARGET)" --compiler "$(DXVK_COMPILER_VERSION)" --flags "$(CFLAGS) $(CXXFLAGS) $(GLSL_ARGS)"
 
-build/buildenv.h: $(DXVK_PATH)/buildenv.h.in | build
+$(BUILD_DIR)/buildenv.h: $(DXVK_PATH)/buildenv.h.in | $(BUILD_DIR)
 	sed "s#@BUILD_TARGET@#$(DXVK_TARGET)#; s#@BUILD_COMPILER@#$(DXVK_COMPILER)#; s#@BUILD_COMPILER_VERSION@#$(DXVK_COMPILER_VERSION)#;" $< > $@
