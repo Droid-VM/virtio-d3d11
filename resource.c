@@ -969,6 +969,7 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
                 .format = desc.Format == DXGI_FORMAT_R32G32B32A32_FLOAT
                     ? VIRGL_FORMAT_R32G32B32A32_FLOAT : dxgi_to_virgl_format(desc.Format),
                 .modifier = UINT64_C(0x00FFFFFFFFFFFFFF),
+                .dxgi_format = desc.Format,
             },
         };
         if (linear_present) {
@@ -1265,7 +1266,9 @@ void APIENTRY virtio_wddm_open_resource(D3D10DDI_HDEVICE hDevice, const D3D10DDI
             return;
         }
 
-        resource->base.Format    = virgl_to_dxgi_format(alloc_info.blob.info.format);
+        resource->base.Format    = alloc_info.blob.info.dxgi_format != DXGI_FORMAT_UNKNOWN
+            ? (DXGI_FORMAT)alloc_info.blob.info.dxgi_format
+            : virgl_to_dxgi_format(alloc_info.blob.info.format);
         resource->base.Width     = alloc_info.blob.info.width;
         resource->base.Height    = alloc_info.blob.info.height;
         resource->base.Depth     = 1;

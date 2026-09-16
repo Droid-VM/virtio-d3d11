@@ -243,6 +243,7 @@ typedef struct __attribute__((packed)) {
     uint64_t modifier;
     uint32_t strides[4];
     uint32_t offsets[4];
+    uint32_t dxgi_format; /* Exact DXGI_FORMAT used to recreate shared images. */
 } VIRTIO_WDDM_BlobInfo;
 
 typedef struct __attribute__((packed)) {
