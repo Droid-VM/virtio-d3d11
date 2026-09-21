@@ -30,7 +30,36 @@ extern int __cdecl DXVK_umd_log_output(const char *line) {
     return 0;
 }
 #else
+/* File logging is opt-in: set VIRTIO_WDDM_LOG_FILE to a writable path
+ * ("1" = C:\dx11um_log.txt).  Off by default: every line is fflush()ed on
+ * the caller's thread, and DWM + app appends to one NTFS file have stalled
+ * Present for tens of ms.  OutputDebugStringA remains tied to
+ * VIRTIO_WDDM_VERBOSE as before. */
 extern void print_log_raw(const char *line) {
+    static volatile LONG state;   /* 0 = pending, 1 = no file, 2 = file enabled */
+    static FILE *out = NULL;
+
+    LONG value = InterlockedCompareExchange(&state, 0, 0);
+    if (!value) {
+        char path[MAX_PATH] = {0};
+        DWORD len = GetEnvironmentVariableA("VIRTIO_WDDM_LOG_FILE", path, sizeof(path));
+        FILE *f = NULL;
+        if (len > 0 && len < sizeof(path)) {
+            if (len == 1 && path[0] == '1')
+                strcpy(path, "C:\\dx11um_log.txt");
+            if (!(len == 1 && path[0] == '0'))
+                f = fopen(path, "a+");
+        }
+        if (InterlockedCompareExchange(&state, f ? 2 : 1, 0) == 0)
+            out = f;
+        else if (f)
+            fclose(f);
+        value = InterlockedCompareExchange(&state, 0, 0);
+    }
+
+    if (value == 1 && !tritonVerboseLogEnabled())
+        return;
+
     char tagged[4608];
     int len = snprintf(tagged, sizeof(tagged), "[umd pid=%lu tid=%lu] %s",
                        GetCurrentProcessId(), GetCurrentThreadId(), line);
@@ -41,12 +70,7 @@ extern void print_log_raw(const char *line) {
     if (tritonVerboseLogEnabled())
         OutputDebugStringA(tagged);
 
-    static FILE *out = NULL;
-    if (out == NULL) {
-        out = fopen("C:\\dx11um_log.txt", "a+");
-    }
-
-    if (out != NULL) {
+    if (value == 2 && out != NULL) {
         fwrite(tagged, strlen(tagged), 1, out);
         fflush(out);
     }

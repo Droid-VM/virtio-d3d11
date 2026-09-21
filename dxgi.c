@@ -72,7 +72,7 @@ HRESULT APIENTRY virtio_wddm_present(DXGI_DDI_ARG_PRESENT *pArgs) {
     VIRTIO_WDDM_Resource *src = (void *) pArgs->hSurfaceToPresent;
     HRESULT hr = S_OK;
 
-    INFO("present detail: src=%p kmalloc=0x%08x dst=0x%08x flags=0x%08x fence=%llu", src,
+    VERBOSE("present detail: src=%p kmalloc=0x%08x dst=0x%08x flags=0x%08x fence=%llu", src,
          src ? src->base.hKMAllocation : 0, pArgs->hDstResource,
          pArgs->Flags.Value, (unsigned long long)device->base.presentFenceValue);
 
@@ -88,7 +88,7 @@ HRESULT APIENTRY virtio_wddm_present(DXGI_DDI_ARG_PRESENT *pArgs) {
     }
 
     hr = virtio_wddm_sync_with_present_context(device);
-    INFO("present sync result: hr=0x%08lx fence=%llu", hr,
+    VERBOSE("present sync result: hr=0x%08lx fence=%llu", hr,
          (unsigned long long)device->base.presentFenceValue);
     if (FAILED(hr)) {
         ERROR("%s: Failed to flush: 0x%08lx", __FUNCTION__, hr);
@@ -102,7 +102,7 @@ HRESULT APIENTRY virtio_wddm_present(DXGI_DDI_ARG_PRESENT *pArgs) {
         .hContext = device->present.context,
     };
     hr = device->dxgi_callbacks->pfnPresentCb(device->base.hRTDevice.handle, &present);
-    INFO("present callback result: hr=0x%08lx src_km=0x%08x ctx=%p", hr,
+    VERBOSE("present callback result: hr=0x%08lx src_km=0x%08x ctx=%p", hr,
          present.hSrcAllocation, present.hContext);
     if (FAILED(hr)) {
         ERROR("%s: Failed to present: 0x%08lx", __FUNCTION__, hr);
