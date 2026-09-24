@@ -379,18 +379,7 @@ static void APIENTRY virtio_wddm_destroy_device(D3D10DDI_HDEVICE hDevice)
         INFO("%s: destroyed Vulkan instance", __FUNCTION__);
     }
 
-    if (device->vulkan) {
-        INFO("%s: unloading Vulkan loader %p", __FUNCTION__, device->vulkan);
-        FreeLibrary(device->vulkan);
-        device->vulkan = NULL;
-        INFO("%s: unloaded Vulkan loader", __FUNCTION__);
-    }
-    if (device->icd) {
-        INFO("%s: unloading Vulkan ICD %p", __FUNCTION__, device->icd);
-        FreeLibrary(device->icd);
-        device->icd = NULL;
-        INFO("%s: unloaded Vulkan ICD", __FUNCTION__);
-    }
+    virtio_wddm_vk_bootstrap_release(&device->vk_bootstrap);
 
     memset(device, 0, sizeof(*device));
     INFO("%s: complete", __FUNCTION__);
@@ -447,93 +436,6 @@ static HRESULT create_paging_queue(VIRTIO_WDDM_Device *device) {
     return S_OK;
 }
 
-static const char *get_drm_context_type_name(uint32_t drm_context_type) {
-    switch (drm_context_type) {
-        case VIRTGPU_DRM_CONTEXT_MSM:      return "msm";
-        case VIRTGPU_DRM_CONTEXT_AMDGPU:   return "amdgpu";
-        case VIRTGPU_DRM_CONTEXT_I915:     return "i915";
-        case VIRTGPU_DRM_CONTEXT_ASAHI:    return "asahi";
-        case VIRTGPU_DRM_CONTEXT_PANFROST: return "panfrost";
-        case VIRTGPU_DRM_CONTEXT_XE:       return "xe";
-    }
-    ERROR("%s: Unknown drm context type: %u", __FUNCTION__, drm_context_type);
-    return NULL;
-}
-
-static const wchar_t *get_drm_context_type_icd_name(uint32_t drm_context_type) {
-    switch (drm_context_type) {
-        case VIRTGPU_DRM_CONTEXT_MSM:      return L"vulkan_freedreno.dll";
-        // TODO: port more drivers
-        /*
-        case VIRTGPU_DRM_CONTEXT_AMDGPU:   return L"vulkan_radeon.dll";
-        case VIRTGPU_DRM_CONTEXT_I915:     return L"vulkan_intel.dll";
-        case VIRTGPU_DRM_CONTEXT_ASAHI:    return L"vulkan_asahi.dll";
-        case VIRTGPU_DRM_CONTEXT_PANFROST: return L"vulkan_panfrost.dll";
-        */
-        case VIRTGPU_DRM_CONTEXT_XE:       return L"vulkan_intel.dll";
-    }
-    ERROR("%s: Unsupported drm context type: %u (%s)", __FUNCTION__, drm_context_type, get_drm_context_type_name(drm_context_type));
-    return NULL;
-}
-
-static HRESULT get_drm_context_type(VIRTIO_WDDM_Device *device, uint32_t *drm_context_type) {
-    struct {
-        VIRTIO_WDDM_Capset capset;
-        uint8_t caps[sizeof(struct virgl_renderer_capset_drm)];
-    } escape_priv = {
-        .capset = {
-            .tag = VIRTIO_WDDM_ESCAPE_CAPSET_TAG,
-            .capset_id = VIRTIO_WDDM_CAPSET_ID_DRM,
-            .version = 0,
-        },
-    };
-    D3DDDICB_ESCAPE escape = {
-        .hDevice = device->base.hRTDevice.handle,
-        .pPrivateDriverData = &escape_priv,
-        .PrivateDriverDataSize = sizeof(escape_priv),
-    };
-
-    INFO("%s: Escape DRM capset enter size=%u", __FUNCTION__,
-         (unsigned)escape.PrivateDriverDataSize);
-    HRESULT hr = device->base.KTCallbacks.pfnEscapeCb(device->base.pAdapter->hRTAdapter.handle, &escape);
-    INFO("%s: Escape DRM capset result=0x%08lx", __FUNCTION__, (unsigned long)hr);
-    if (FAILED(hr)) {
-        ERROR("%s: Failed to query DRM capset info: %08lx", __FUNCTION__, hr);
-        return hr;
-    }
-
-    struct virgl_renderer_capset_drm caps;
-    memcpy(&caps, escape_priv.caps, sizeof(caps));
-
-    *drm_context_type = caps.context_type;
-
-    return S_OK;
-}
-
-static HMODULE load_icd(const wchar_t *icd_name) {
-    wchar_t umd_path[MAX_PATH];
-    HMODULE umd_module = NULL;
-
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCWSTR)&load_icd, &umd_module);
-
-    if (!umd_module) return NULL;
-
-    GetModuleFileNameW(umd_module, umd_path, MAX_PATH);
-    wchar_t *last_slash = wcsrchr(umd_path, L'\\');
-    if (!last_slash) {
-        return NULL;
-    }
-
-    size_t remaining_space = MAX_PATH - (last_slash - umd_path) - 1;
-
-    if (wcscpy_s(last_slash + 1, remaining_space, icd_name) != 0) {
-        return FALSE;
-    }
-
-    return LoadLibraryExW(umd_path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-}
-
 HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIARG_CREATEDEVICE *pArgs) {
     TRACE();
     INFO("%s: enter", __FUNCTION__);
@@ -561,40 +463,6 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
          __FUNCTION__, GetCurrentProcessId(), GetCurrentThreadId(),
          pArgs->Interface, pArgs->Version, pArgs->Flags);
 
-    /* Keep the loader in the signed package and in the same ABI as the ICD. */
-    device->vulkan = load_icd(L"droidvm_vulkan.dll");
-    if (!device->vulkan) {
-        ERROR("%s: Vulkan loader unavailable: %lu", __FUNCTION__, GetLastError());
-        return E_FAIL;
-    }
-    INFO("%s: loaded droidvm_vulkan.dll=%p", __FUNCTION__, device->vulkan);
-
-    if (adapter->supported_capsets & VIRTIO_WDDM_CAPSET_MASK_DRM) {
-        uint32_t drm_context_type = 0;
-        hr = get_drm_context_type(device, &drm_context_type);
-        if (SUCCEEDED(hr)) {
-            INFO("%s: Supported DRM context type: %s", __FUNCTION__, get_drm_context_type_name(drm_context_type));
-            const wchar_t *vdrm_icd_name = get_drm_context_type_icd_name(drm_context_type);
-            if (vdrm_icd_name != NULL) {
-                INFO("%s: Using vDRM Vulkan ICD: %ws", __FUNCTION__, vdrm_icd_name);
-                device->icd = load_icd(vdrm_icd_name);
-            }
-        }
-    }
-
-    if (device->icd == NULL) {
-        device->icd = load_icd(L"vulkan_virtio.dll");
-    }
-
-    /* Missing optional ICDs must fail device creation, not abort the host
-     * process (which may be the desktop window manager). */
-    if (!device->icd) {
-        ERROR("%s: No compatible Vulkan ICD: %lu", __FUNCTION__, GetLastError());
-        FreeLibrary(device->vulkan);
-        device->vulkan = NULL;
-        return E_FAIL;
-    }
-
     /* Chained off `callbacks` below. Both hooks or neither: the ICD ignores a
      * half-installed allocator, and an allocation made without the matching free
      * would leak the runtime's resource association. */
@@ -619,80 +487,22 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
         .p11UMCallbacks = pArgs->p11UMCallbacks,
     };
 
-    VkDirectDriverLoadingInfoLUNARG driver_info = {
-        .sType = VK_STRUCTURE_TYPE_DIRECT_DRIVER_LOADING_INFO_LUNARG,
-        .pNext = NULL,
-        .flags = 0,
-        .pfnGetInstanceProcAddr = (PFN_vkGetInstanceProcAddrLUNARG) GetProcAddress(device->icd, "vk_icdGetInstanceProcAddr"),
-    };
-    if (!driver_info.pfnGetInstanceProcAddr) {
-        ERROR("%s: Vulkan ICD lacks vk_icdGetInstanceProcAddr", __FUNCTION__);
-        FreeLibrary(device->icd);
-        FreeLibrary(device->vulkan);
-        device->icd = NULL;
-        device->vulkan = NULL;
-        return E_FAIL;
-    }
+    hr = virtio_wddm_vk_bootstrap(&device->vk_bootstrap, adapter->supported_capsets,
+                                  adapter->base.hRTAdapter.handle, device->base.hRTDevice.handle,
+                                  &device->base.KTCallbacks, &device->callbacks);
+    if (FAILED(hr))
+        return hr;
 
-    VkDirectDriverLoadingListLUNARG loading_list = {
-        .sType = VK_STRUCTURE_TYPE_DIRECT_DRIVER_LOADING_LIST_LUNARG,
-        .pNext = &device->callbacks,
-        .mode = VK_DIRECT_DRIVER_LOADING_MODE_EXCLUSIVE_LUNARG,
-        .driverCount = 1,
-        .pDrivers = &driver_info,
-    };
-
-    INFO("D3DDDI callbacks: %p, dev %p", &device->callbacks, device->callbacks.hRTDevice);
-
-    PFN_vkGetInstanceProcAddr vk_GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr) GetProcAddress(device->vulkan, "vkGetInstanceProcAddr");
-    PFN_vkGetDeviceProcAddr vk_GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr) GetProcAddress(device->vulkan, "vkGetDeviceProcAddr");
-    if (!vk_GetInstanceProcAddr || !vk_GetDeviceProcAddr) {
-        ERROR("%s: Vulkan loader entry points unavailable: gipa=%p gdpa=%p",
-              __FUNCTION__, vk_GetInstanceProcAddr, vk_GetDeviceProcAddr);
-        return E_FAIL;
-    }
+    PFN_vkGetInstanceProcAddr vk_GetInstanceProcAddr = device->vk_bootstrap.vk_GetInstanceProcAddr;
+    PFN_vkGetDeviceProcAddr vk_GetDeviceProcAddr = device->vk_bootstrap.vk_GetDeviceProcAddr;
     INFO("%s: resolving loader instance entry points", __FUNCTION__);
 
 #define LOAD_PROC(name) PFN_vk##name vk_##name = (PFN_vk##name) vk_GetInstanceProcAddr(NULL, "vk" #name)
     LOAD_PROC(CreateInstance);
-    LOAD_PROC(EnumerateInstanceExtensionProperties);
 #undef LOAD_PROC
 
-    if (!vk_CreateInstance || !vk_EnumerateInstanceExtensionProperties)
+    if (!vk_CreateInstance)
         return E_FAIL;
-
-    uint32_t extension_count = 0;
-    INFO("%s: enumerating instance extensions (count)", __FUNCTION__);
-    res = vk_EnumerateInstanceExtensionProperties(NULL, &extension_count, NULL);
-    if (res != VK_SUCCESS) {
-        ERROR("Failed to enumerate instance extensions: %s", vk_result_to_str(res));
-        return E_FAIL;
-    }
-
-    CLEANUP_FREE VkExtensionProperties *extension_props = calloc(sizeof(*extension_props), extension_count);
-    CLEANUP_FREE const char **extension_names = calloc(sizeof(*extension_names), extension_count);
-    if (extension_count && (!extension_props || !extension_names))
-        return E_OUTOFMEMORY;
-    INFO("%s: enumerating %u instance extensions (properties)", __FUNCTION__, extension_count);
-    res = vk_EnumerateInstanceExtensionProperties(NULL, &extension_count, extension_props);
-    if (res != VK_SUCCESS) {
-        ERROR("Failed to enumerate instance extensions: %s", vk_result_to_str(res));
-        return E_FAIL;
-    }
-
-    bool have_LUNARG_direct_driver_loading = false;
-
-    for (size_t i = 0; i < extension_count; i++) {
-        extension_names[i] = extension_props[i].extensionName;
-        if (!strcmp(extension_props[i].extensionName, VK_LUNARG_DIRECT_DRIVER_LOADING_EXTENSION_NAME)) {
-            have_LUNARG_direct_driver_loading = true;
-        }
-    }
-
-    if (!have_LUNARG_direct_driver_loading) {
-        ERROR("Direct driver loading is not supported, cannot continue");
-        return E_FAIL;
-    }
 
     VkApplicationInfo app_info = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -705,7 +515,7 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
 
     VkInstanceCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        .pNext = &loading_list,
+        .pNext = &device->vk_bootstrap.loading_list,
         .pApplicationInfo = &app_info,
         .enabledLayerCount = 0,
         .ppEnabledLayerNames = NULL,

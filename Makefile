@@ -47,7 +47,7 @@ clean:
 
 DXVK_LIBS=$(BUILD_DIR)/dxvk-d3d11.a $(BUILD_DIR)/dxvk-dxgi.a $(BUILD_DIR)/dxvk.a
 
-UMD_DLL_OBJS=$(addprefix $(BUILD_DIR)/,adapter.o device.o dxgi.o resource.o dxvk.o)
+UMD_DLL_OBJS=$(addprefix $(BUILD_DIR)/,adapter.o device.o dxgi.o resource.o vk_bootstrap.o dxvk.o)
 
 $(BUILD_DIR)/$(UMD_NAME).dll: $(UMD_DLL_OBJS) $(UMD_NAME).def $(DXVK_LIBS) $(BUILD_DIR)/triton.a | $(BUILD_DIR)
 	$(CXX) $(CFLAGS) -shared -o $@ $(UMD_DLL_OBJS) $(DXVK_LIBS) $(BUILD_DIR)/triton.a -Wl,$(UMD_NAME).def $(LDFLAGS)

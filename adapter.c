@@ -108,80 +108,20 @@ static HRESULT APIENTRY virtio_wddm_close_adapter(D3D10DDI_HADAPTER hAdapter) {
     return S_OK;
 }
 
-static void dump_capsets(char *buf, size_t len, VIRTIO_WDDM_CapsetMask mask) {
-    static const struct {
-        VIRTIO_WDDM_CapsetMask value;
-        const char *name;
-    } mask_table[] = {
-        { VIRTIO_WDDM_CAPSET_MASK_VIRGL,        "virgl"        },
-        { VIRTIO_WDDM_CAPSET_MASK_VIRGL2,       "virgl2"       },
-        { VIRTIO_WDDM_CAPSET_MASK_GFXSTREAM,    "gfxstream"    },
-        { VIRTIO_WDDM_CAPSET_MASK_VENUS,        "venus"        },
-        { VIRTIO_WDDM_CAPSET_MASK_CROSS_DOMAIN, "cross_domain" },
-        { VIRTIO_WDDM_CAPSET_MASK_DRM,          "drm"          },
-    };
-
-    buf[0] = 0;
-
-    size_t pos = 0;
-    bool first = true;
-
-    for (size_t i = 0; i < ARRAY_SIZE(mask_table); i++) {
-        if (!(mask & mask_table[i].value)) continue;
-        if (!first) {
-            int ret = snprintf(&buf[pos], len - pos, " | ");
-            if (ret < 0 || (size_t)ret >= len - pos) {
-                break;
-            }
-            pos += ret;
-        }
-        first = false;
-
-        int ret = snprintf(&buf[pos], len - pos, "%s", mask_table[i].name);
-        if (ret < 0 || (size_t)ret >= len - pos)
-            break;
-        pos += ret;
-    }
-
-    if (first) {
-        snprintf(buf, len, "NONE");
-    }
-}
-
 __attribute__((visibility("default"))) HRESULT APIENTRY OpenAdapter10_2(D3D10DDIARG_OPENADAPTER* pArgs) {
     TRACE();
     INFO("%s: enter interface=0x%x version=0x%x", __FUNCTION__,
          pArgs->Interface, pArgs->Version);
-    VIRTIO_WDDM_AdapterInfo adapter_info_priv = { 0 };
-    D3DDDICB_QUERYADAPTERINFO query_adapter_info = {
-        .pPrivateDriverData = &adapter_info_priv,
-        .PrivateDriverDataSize = sizeof(adapter_info_priv),
-    };
-
-    HRESULT hr = pArgs->pAdapterCallbacks->pfnQueryAdapterInfoCb(pArgs->hRTAdapter.handle, &query_adapter_info);
-    if (FAILED(hr)) {
+    VIRTIO_WDDM_AdapterCaps adapter_caps;
+    HRESULT hr = virtio_wddm_query_adapter(pArgs->pAdapterCallbacks, pArgs->hRTAdapter.handle, &adapter_caps);
+    if (FAILED(hr))
         return hr;
-    };
-    if (adapter_info_priv.tag != VIRTIO_WDDM_ADAPTER_INFO_TAG || !adapter_info_priv.supports_3d || !adapter_info_priv.has_shmem) {
-        ERROR("Invalid driver: tag %llu, 3d %u, shmem %u", adapter_info_priv.tag, adapter_info_priv.supports_3d, adapter_info_priv.has_shmem);
-        return ERROR_GRAPHICS_DRIVER_MISMATCH;
-    }
-
-    char capsets[4096];
-    dump_capsets(capsets, sizeof(capsets), adapter_info_priv.capset_mask);
-    INFO("%s: Supported capsets: %s", __FUNCTION__, capsets);
-
-    if (!(adapter_info_priv.capset_mask & (VIRTIO_WDDM_CAPSET_MASK_VENUS | VIRTIO_WDDM_CAPSET_MASK_DRM))) {
-        INFO("%s: Adapter does not support nor Venus nor vDRM", __FUNCTION__);
-        return ERROR_GRAPHICS_DRIVER_MISMATCH;
-    }
 
     VIRTIO_WDDM_Adapter *adapter = calloc(sizeof(*adapter), 1);
     if (!adapter) return E_OUTOFMEMORY;
 
-    static_assert(sizeof(adapter->luid) == sizeof(adapter_info_priv.luid));
-    memcpy(&adapter->luid, &adapter_info_priv.luid, sizeof(adapter->luid));
-    adapter->supported_capsets = adapter_info_priv.capset_mask;
+    adapter->luid = adapter_caps.luid;
+    adapter->supported_capsets = adapter_caps.capsets;
 
     adapter->base.hRTAdapter = pArgs->hRTAdapter;
     adapter->base.uIfVersion = pArgs->Interface;

@@ -7,6 +7,8 @@
 #include <vulkan/vulkan.h>
 #include <vulkan_d3dddi.h>
 
+#include "vk_bootstrap.h"
+
 #define VK_INSTANCE_FUNCTION_LIST \
     X(GetPhysicalDeviceMemoryProperties2) \
     X(DestroyInstance)
@@ -26,8 +28,7 @@
 typedef struct {
     TRITON_DEVICE base;
     DXGI_DDI_BASE_CALLBACKS *dxgi_callbacks;
-    HMODULE vulkan;
-    HMODULE icd;
+    VIRTIO_WDDM_VkBootstrap vk_bootstrap;
     VkD3DDDICallbacks callbacks;
     IDXGIAdapter *adapter;
     // ID3D11Device is stored in base
