@@ -91,6 +91,8 @@ typedef struct VIRTIO_WDDM_RuntimeAllocator {
 
 #define VIRTIO_WDDM_ALLOCATE_3D_TAG 5496436857343066454ull
 
+#define VIRTIO_WDDM_ALLOCATE_SYSMEM_TAG UINT64_C(0x4D5359534C4C4156)
+
 #define VIRTIO_WDDM_ALLOCATE_BLOB_TAG 4778121577295003990ull
 
 #define VIRTIO_WDDM_SUBMIT_COMMAND_VIRTUAL_TAG 6216178336949162838ull
@@ -189,6 +191,13 @@ typedef union __attribute__((packed)) {
     VIRTIO_WDDM_Allocate3d _3d;
     VIRTIO_WDDM_AllocateBlob blob;
 } VIRTIO_WDDM_CreateAllocation;
+
+/* pSystemMem wrap: dxgkrnl builds an MDL over the UMD's inner host memory.
+ * Pure bookkeeping on the KMD side; no host or segment interaction. */
+typedef struct __attribute__((packed)) {
+    uint64_t tag;
+    uint64_t size;
+} VIRTIO_WDDM_AllocateSysmem;
 
 #define VIRTIO_WDDM_REUSE_BLOB_TAG UINT64_C(0x3145535545524242)
 typedef struct __attribute__((packed)) {
