@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <wchar.h>
 
 #include <winddk_compat.h>
 /* d3d10umddi.h defines the D3D10 hardware constants as non-static C objects;
@@ -174,6 +175,17 @@ static HRESULT get_drm_context_type(HANDLE hRTAdapter, HANDLE hRTDevice, const D
 static HMODULE load_icd(const wchar_t *icd_name) {
     wchar_t umd_path[MAX_PATH];
     HMODULE umd_module = NULL;
+#if defined(__i386__)
+    /* The signed package contains both 64-bit and WoW dependencies. */
+    wchar_t wow_name[MAX_PATH];
+    const wchar_t *suffix = wcsrchr(icd_name, L'.');
+    if (!suffix || wcscmp(suffix, L".dll") != 0) return NULL;
+    size_t stem = suffix - icd_name;
+    if (stem + ARRAYSIZE(L"_x86.dll") > ARRAYSIZE(wow_name)) return NULL;
+    wmemcpy(wow_name, icd_name, stem);
+    wcscpy(wow_name + stem, L"_x86.dll");
+    icd_name = wow_name;
+#endif
 
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCWSTR)&load_icd, &umd_module);
