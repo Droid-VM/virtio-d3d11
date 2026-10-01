@@ -12,11 +12,11 @@
 #include "dxvk.h"
 #include "resource.h"
 
-size_t APIENTRY virtio_wddm_calc_resource_size(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATERESOURCE *pArgs) {
+SIZE_T APIENTRY virtio_wddm_calc_resource_size(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATERESOURCE *pArgs) {
     return sizeof(VIRTIO_WDDM_Resource);
 }
 
-size_t APIENTRY virtio_wddm_calc_opened_resource_size(D3D10DDI_HDEVICE hDevice, const D3D10DDIARG_OPENRESOURCE *pArgs) {
+SIZE_T APIENTRY virtio_wddm_calc_opened_resource_size(D3D10DDI_HDEVICE hDevice, const D3D10DDIARG_OPENRESOURCE *pArgs) {
     return sizeof(VIRTIO_WDDM_Resource);
 }
 
