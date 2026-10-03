@@ -238,6 +238,17 @@ typedef struct TRITON_DEVICE {
 void tritonSetError_impl(PTRITON_DEVICE pD, HRESULT hr, const char *function);
 #define tritonSetError(pD, hr) tritonSetError_impl(pD, hr, __FUNCTION__)
 
+/* D3D11 no longer drains the runtime's deferred-destruction queue through
+ * pfnRenderCb. Call this on the entering DDI thread at submission boundaries;
+ * the callback may re-enter our object/view destruction DDIs. The D3D10
+ * callback table is shorter and does not contain this slot. */
+static inline void tritonPerformAmortizedProcessing(PTRITON_DEVICE pD)
+{
+    if ((pD->uIfVersion >> 16) >= D3D11_DDI_MAJOR_VERSION &&
+        pD->pUMCallbacks && pD->pUMCallbacks->pfnPerformAmortizedProcessingCb)
+        pD->pUMCallbacks->pfnPerformAmortizedProcessingCb(pD->hRTCoreLayer);
+}
+
 /* Map the DDI's D3DWDDM2_0DDI_CONTEXTTYPE_FLAG bit flag to the sequential
  * D3D11_CONTEXT_TYPE enum (they diverge at COPY/VIDEO). Defined in
  * tritonQuery.c; shared with the WDDM 2.0 Flush path in tritonView.c. */

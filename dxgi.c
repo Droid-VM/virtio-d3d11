@@ -109,6 +109,11 @@ HRESULT APIENTRY virtio_wddm_present(DXGI_DDI_ARG_PRESENT *pArgs) {
         return hr;
     }
 
+    /* Present flushes the internal context directly, without entering the
+     * Flush DDI. Let the D3D11 runtime retire released resources here too,
+     * before it refreshes bindings for the next frame. */
+    tritonPerformAmortizedProcessing(&device->base);
+
     return S_OK;
 }
 
