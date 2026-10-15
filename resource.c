@@ -7,6 +7,7 @@
 #include <virgl_hw.h>
 
 #undef ERROR
+#include "vulkan_host_scanout.h"
 #include "adapter.h"
 #include "device.h"
 #include "dxvk.h"
@@ -229,6 +230,11 @@ static ssize_t vulkan_find_mem_type(VIRTIO_WDDM_Device *device, VkMemoryProperty
 }
 
 static HRESULT create_shared_vk_image(VIRTIO_WDDM_Device *device, D3D11_TEXTURE2D_DESC1 *desc, VkImageTiling tiling, void *image_next, void *alloc_next, VkDeviceMemory *memory, VkImage *image, D3DKMT_HANDLE *alloc) {
+    const VkD3DDDIHostScanout *scanout = NULL;
+    for (const VkBaseInStructure *ext = image_next; ext; ext = ext->pNext) {
+        if (ext->sType == VK_STRUCTURE_TYPE_D3DDDI_HOST_SCANOUT)
+            scanout = (const VkD3DDDIHostScanout *)ext;
+    }
     VkExternalMemoryImageCreateInfo external_mem_info = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
         .pNext = image_next,
@@ -264,6 +270,9 @@ static HRESULT create_shared_vk_image(VIRTIO_WDDM_Device *device, D3D11_TEXTURE2
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
 
+    if (scanout)
+        image_create_info.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
+
     if (image_create_info.format == VK_FORMAT_UNDEFINED) {
         ERROR("%s: Unsupported DXGI format: %u", __FUNCTION__, desc->Format);
         return E_OUTOFMEMORY;
@@ -294,6 +303,21 @@ static HRESULT create_shared_vk_image(VIRTIO_WDDM_Device *device, D3D11_TEXTURE2
         return E_OUTOFMEMORY;
     }
 
+    uint64_t allocation_size = mem_req.memoryRequirements.size;
+    if (scanout && scanout->import_backing) {
+        VkPhysicalDeviceMemoryProperties2 props = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+        };
+        device->vk_GetPhysicalDeviceMemoryProperties2(device->vk_phys, &props);
+        if (props.memoryProperties.memoryTypes[mem].propertyFlags != VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ||
+            scanout->backing_size < allocation_size) {
+            device->vk_DestroyImage(device->vk, *image, NULL);
+            *image = VK_NULL_HANDLE;
+            return E_INVALIDARG;
+        }
+        allocation_size = scanout->backing_size;
+    }
+
     //VkImageDrmFormatModifierPropertiesEXT mod_props = {
     //    .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT,
     //};
@@ -317,7 +341,7 @@ static HRESULT create_shared_vk_image(VIRTIO_WDDM_Device *device, D3D11_TEXTURE2
     VkMemoryAllocateInfo memory_alloc_info = {
        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
        .pNext = &export_info,
-       .allocationSize = mem_req.memoryRequirements.size,
+       .allocationSize = allocation_size,
        .memoryTypeIndex = mem,
     };
     res = device->vk_AllocateMemory(device->vk, &memory_alloc_info, NULL, memory);
@@ -922,9 +946,17 @@ void APIENTRY virtio_wddm_create_resource(D3D10DDI_HDEVICE hDevice, const D3D11D
         };
         if (is_primary)
             virtio_wddm_runtime_alloc_scope.primary_desc = *pArgs->pPrimaryDesc;
+        VkD3DDDIHostScanout scanout_hint = {
+            .sType = VK_STRUCTURE_TYPE_D3DDDI_HOST_SCANOUT,
+            .version = 1,
+        };
+        const bool host_scanout_candidate = is_primary && linear_present &&
+            desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM && !desc.CPUAccessFlags &&
+            !(desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS);
         hr = create_shared_vk_image(device, &desc,
             linear_present ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL,
-            NULL, &d3d_create, &resource->memory, &resource->image, NULL);
+            host_scanout_candidate ? &scanout_hint : NULL,
+            &d3d_create, &resource->memory, &resource->image, NULL);
         virtio_wddm_runtime_alloc_scope = previous_scope;
         if (FAILED(hr)) {
             ERROR("%s: failed to create shared blob texture: 0x%08lx", __FUNCTION__, hr);
@@ -1325,8 +1357,26 @@ void APIENTRY virtio_wddm_open_resource(D3D10DDI_HDEVICE hDevice, const D3D10DDI
             .handle = (HANDLE) (intptr_t) resource->base.hKMAllocation,
         };
 
+        const bool host_scanout =
+            alloc_info.blob.blob.mem == VIRTIO_WDDM_BLOB_MEM_HOST3D &&
+            alloc_info.blob.blob.flags == VIRTIO_WDDM_BLOB_FLAG_SHAREABLE &&
+            alloc_info.blob.blob.id != 0;
+        VkD3DDDIHostScanout scanout_hint = {
+            .sType = VK_STRUCTURE_TYPE_D3DDDI_HOST_SCANOUT,
+            .pNext = &modifier_info,
+            .version = 1,
+            .import_backing = 1,
+            .backing_size = alloc_info.blob.blob.size,
+        };
+        if (host_scanout && (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM ||
+                             alloc_info.blob.info.modifier != 0)) {
+            tritonSetError(&device->base, E_INVALIDARG);
+            return;
+        }
         if (alloc_info.blob.info.modifier != 0x00FFFFFFFFFFFFFF) {
-            hr = create_shared_vk_image(device, &desc, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, &modifier_info, &handle_info, &resource->memory, &resource->image, NULL);
+            hr = create_shared_vk_image(device, &desc, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+                host_scanout ? (void *)&scanout_hint : (void *)&modifier_info,
+                &handle_info, &resource->memory, &resource->image, NULL);
         } else {
             hr = create_shared_vk_image(device, &desc, VK_IMAGE_TILING_OPTIMAL, NULL, &handle_info, &resource->memory, &resource->image, NULL);
         }
