@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright 2026 Turing Software LLC
  * SPDX-License-Identifier: MIT
  *
@@ -34,6 +34,36 @@ tritonCalcPrivateOpenedResourceSize(D3D10DDI_HDEVICE hDevice,
     return sizeof(TRITON_RESOURCE);
 }
 #endif
+
+/* §5.4 DEFERRED (2026-10-25, round 23): the "wait for the media + the upload
+ * before anything reads this texture" hook.
+ *
+ * The video DDI decodes into D3D11 textures that it does not own at the D3D11
+ * level: DeocderEndFrame only enqueues work, and the pixels reach the texture
+ * later, on whichever thread first reads it.  That read can arrive through any of
+ * the DDI entry points below (Map, CopyResource, CopySubresourceRegion,
+ * ResolveSubresource, the read-after-write hazard callbacks, an SRV read), so each
+ * of them calls this hook before it hands the resource to DXVK.
+ *
+ * A function pointer, not a direct call, so triton.a stays linkable on its own:
+ * the UMD registers the video DDI's implementation once (see
+ * virtio_wddm_video_create_video_decoder) and a build without video simply leaves
+ * it NULL.  `whole` = "every subresource of this resource" (a whole-resource
+ * copy, a hazard, an SRV read); otherwise `subresource` is the one being read. */
+typedef void (*TRITON_TEXTURE_SYNC_HOOK)(void *resource, UINT subresource, BOOL whole);
+
+static TRITON_TEXTURE_SYNC_HOOK g_texture_sync_hook;
+
+void tritonSetTextureSyncHook(TRITON_TEXTURE_SYNC_HOOK hook)
+{
+    g_texture_sync_hook = hook;
+}
+
+static void tritonSyncTexture(PTRITON_RESOURCE r, UINT subresource, BOOL whole)
+{
+    if (g_texture_sync_hook && r && r->pResource)
+        g_texture_sync_hook((void *)r->pResource, subresource, whole);
+}
 
 /* Translate the DDI's combined Usage/CpuAccess/Bind flag salad into the
  * corresponding D3D11 enums.
@@ -687,6 +717,9 @@ tritonResourceMap(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource,
     PTRITON_RESOURCE r  = (PTRITON_RESOURCE)(hResource.pDrvPrivate);
     if (!pD || !r || !r->pResource || !pMapped) return;
 
+    /* §5.4: a Map is a read of this subresource (CPU access to the pixels). */
+    tritonSyncTexture(r, Subresource, FALSE);
+
     UINT mapFlags = 0;
     if (Flags & D3D10_DDI_MAP_FLAG_DONOTWAIT) mapFlags |= D3D11_MAP_FLAG_DO_NOT_WAIT;
 
@@ -800,6 +833,8 @@ tritonResourceCopy(D3D10DDI_HDEVICE hDevice,
     PTRITON_RESOURCE d  = (PTRITON_RESOURCE)(hDst.pDrvPrivate);
     PTRITON_RESOURCE s  = (PTRITON_RESOURCE)(hSrc.pDrvPrivate);
     if (!pD || !d || !s || !d->pResource || !s->pResource) return;
+    /* §5.4: the source of a whole-resource copy is read, every subresource. */
+    tritonSyncTexture(s, 0, TRUE);
     ID3D11DeviceContext1_CopyResource(pD->pCtx1, d->pResource, s->pResource);
 }
 
@@ -815,6 +850,8 @@ tritonResourceCopyRegion(D3D10DDI_HDEVICE hDevice,
     PTRITON_RESOURCE d  = (PTRITON_RESOURCE)(hDst.pDrvPrivate);
     PTRITON_RESOURCE s  = (PTRITON_RESOURCE)(hSrc.pDrvPrivate);
     if (!pD || !d || !s || !d->pResource || !s->pResource) return;
+    /* §5.4: CopySubresourceRegion reads SrcSubresource. */
+    tritonSyncTexture(s, SrcSubresource, FALSE);
     ID3D11DeviceContext1_CopySubresourceRegion(
         pD->pCtx1, d->pResource, DstSubresource, DstX, DstY, DstZ,
         s->pResource, SrcSubresource, (const D3D11_BOX *)(pSrcBox));
@@ -832,6 +869,8 @@ tritonResourceCopyRegion_11_1(D3D10DDI_HDEVICE hDevice,
     PTRITON_RESOURCE d  = (PTRITON_RESOURCE)(hDst.pDrvPrivate);
     PTRITON_RESOURCE s  = (PTRITON_RESOURCE)(hSrc.pDrvPrivate);
     if (!pD || !d || !s || !d->pResource || !s->pResource) return;
+    /* §5.4: CopySubresourceRegion1 reads SrcSubresource. */
+    tritonSyncTexture(s, SrcSubresource, FALSE);
     ID3D11DeviceContext1_CopySubresourceRegion1(
         pD->pCtx1, d->pResource, DstSubresource, DstX, DstY, DstZ,
         s->pResource, SrcSubresource, (const D3D11_BOX *)(pSrcBox), CopyFlags);
@@ -848,17 +887,34 @@ tritonResourceResolveSubresource(D3D10DDI_HDEVICE hDevice,
     PTRITON_RESOURCE d  = (PTRITON_RESOURCE)(hDst.pDrvPrivate);
     PTRITON_RESOURCE s  = (PTRITON_RESOURCE)(hSrc.pDrvPrivate);
     if (!pD || !d || !s || !d->pResource || !s->pResource) return;
+    /* §5.4: ResolveSubresource reads SrcSubresource. */
+    tritonSyncTexture(s, SrcSubresource, FALSE);
     ID3D11DeviceContext1_ResolveSubresource(
         pD->pCtx1, d->pResource, DstSubresource, s->pResource, SrcSubresource, Format);
 }
 
-/* D3D11 tracks hazards on the immediate context; nothing to do here. */
+/* D3D11 tracks hazards on the immediate context; nothing to do here -- except
+ * that "nothing to do" is exactly where the video DDI's deferred picture has to
+ * be made visible: the runtime calls these two before a resource (or an SRV's
+ * resource) is read by GPU commands, i.e. before the draw that samples the
+ * decoded surface.  §5.4: wait for the media + the upload there, not in
+ * DecoderEndFrame. */
+void APIENTRY
+tritonResourceReadAfterWriteHazard(D3D10DDI_HDEVICE hDev, D3D10DDI_HRESOURCE hRes)
+{
+    PTRITON_RESOURCE r = (PTRITON_RESOURCE)(hRes.pDrvPrivate);
+    (void)hDev;
+    tritonSyncTexture(r, 0, TRUE);
+}
 
 void APIENTRY
-tritonResourceReadAfterWriteHazard(D3D10DDI_HDEVICE hDev, D3D10DDI_HRESOURCE hRes) {}
-
-void APIENTRY
-tritonShaderResourceViewReadAfterWriteHazard(D3D10DDI_HDEVICE hDev, D3D10DDI_HSHADERRESOURCEVIEW hSRV, D3D10DDI_HRESOURCE hRes) {}
+tritonShaderResourceViewReadAfterWriteHazard(D3D10DDI_HDEVICE hDev, D3D10DDI_HSHADERRESOURCEVIEW hSRV, D3D10DDI_HRESOURCE hRes)
+{
+    PTRITON_RESOURCE r = (PTRITON_RESOURCE)(hRes.pDrvPrivate);
+    (void)hDev;
+    (void)hSRV;
+    tritonSyncTexture(r, 0, TRUE);
+}
 
 /* Per-stage constant-buffer setters. D3D11_0 takes only handles
  * (whole-buffer bind); D3D11_1 adds FirstConstant + NumConstants for

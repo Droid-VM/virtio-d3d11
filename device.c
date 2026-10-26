@@ -9,6 +9,7 @@
 
 #undef ERROR
 #include "adapter.h"
+#include "d3d11_video.h"
 #include "device.h"
 #include "dxgi.h"
 #include "resource.h"
@@ -776,6 +777,13 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
         pArgs->DXGIBaseDDI.pDXGIDDIBaseFunctions2->pfnBlt                      = virtio_wddm_blt;
         pArgs->DXGIBaseDDI.pDXGIDDIBaseFunctions2->pfnResolveSharedResource    = virtio_wddm_resolve_shared_resource;
     }
+
+    /* D3D11 video lives in a table of its own. Here we only register the
+     * driver's RetrieveSubObject callback; the runtime calls it when an
+     * application asks for ID3D11VideoDevice. Registration cannot fail, and
+     * without it the device keeps working exactly as before video existed, with
+     * only ID3D11VideoDevice missing. */
+    virtio_wddm_fill_video_funcs(pArgs);
 
     failed_device = NULL;
     return S_OK;

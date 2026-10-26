@@ -1,0 +1,1540 @@
+/* D3D11 video DDI: caps + a real video processor blit (M2).
+ *
+ * What this file does:
+ *
+ *   - decoder side reports "no hardware decoder" (0 profiles, 0 configs,
+ *     CheckVideoDecoderFormat = FALSE, CreateVideoDecoder = E_NOT_SUPPORTED).
+ *     Media Foundation then decodes in software (msmpeg2vdec / msvproc), which
+ *     is the honest answer: this UMD cannot decode anything.
+ *   - processor side reports the one conversion it can promise at the caps
+ *     level (NV12 / YUY2 in -> BGRA8 out, linear space + YCbCr->RGB matrix
+ *     conversion) and creates the enumerator / processor objects so
+ *     ID3D11VideoDevice exists and MF's Video Processor MFT sees a processor.
+ *   - VideoProcessorBlt is implemented. It does not contain a CSC or a
+ *     scaler: it forwards the DDI objects to DXVK's video processor, which the
+ *     UMD already links into this DLL (thirdparty/dxvk, d3d11_video.cpp).
+ *     DXVK runs the YUV->RGB matrix in d3d11_video_blit_frag.frag, samples the
+ *     NV12 luma/chroma planes (or the packed YUY2 texture), scales through the
+ *     stream source/dest rectangles and draws into the output view. All of it
+ *     is queued on the internal DXVK immediate context that device.c created
+ *     (device->base.pDev1 / pCtx1), i.e. the same Vulkan queue as every other
+ *     D3D11 command this UMD issues.
+ *   - Synchronisation is not re-invented: the blit joins DXVK's command stream,
+ *     and the existing present path (dxgi.c) signals device->base.pPresentFence
+ *     on pCtx4, flushes the context and waits for the fence. No busy-wait.
+ *
+ * Every entry of the table is populated (no NULL pointers), because the
+ * runtime dispatches through it without checking individual slots.
+ */
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include <winddk_compat.h>
+#include <virtio_wddm_uapi.h>
+
+#undef ERROR
+#include "adapter.h"
+#include "d3d11_video.h"
+/* device.h / resource.h give the D3D11 resource and the internal DXVK device
+ * that the video path has to reach; the DXVK header keeps the C++ D3D11
+ * runtime headers (and COM) out of this translation unit. */
+#include "device.h"
+#include "resource.h"
+#include "d3d11_video_dxvk.h"
+
+/* WDK spells this E_NOT_SUPPORTED in the DDI docs; winerror.h does not carry
+ * the name, only the Win32 error it maps to. */
+#ifndef E_NOT_SUPPORTED
+#define E_NOT_SUPPORTED HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)
+#endif
+
+/* ------------------------------------------------------------------------- */
+/* Reported caps                                                             */
+/* ------------------------------------------------------------------------- */
+
+/* One input stream is all a plain video processor needs for playback, and it is
+ * the smallest value the runtime accepts. MaxStreamStates must be >= the number
+ * of streams the driver accepts states for. */
+#define VIRTIO_WDDM_VIDEO_MAX_INPUT_STREAMS 1
+#define VIRTIO_WDDM_VIDEO_MAX_STREAM_STATES 1
+
+/* A processor must expose at least one rate-conversion entry even when it does
+ * no frame-rate conversion at all: ID3D11VideoDevice::CreateVideoProcessor takes
+ * a RateConversionCapsIndex and 0 is only valid if the count is non-zero. */
+#define VIRTIO_WDDM_VIDEO_RATE_CONVERSION_CAPS 1
+
+/* DeviceCaps for GetVideoProcessorCaps. LINEAR_SPACE covers the RGB output
+ * range handling; YCbCr_MATRIX_CONVERSION is the NV12/YUY2 -> RGB matrix. We do
+ * not report xvYCC, RGB range conversion, nominal range or any feature caps
+ * (alpha fill, constriction, luma key, stereo, rotation, mirror, HDR10): this
+ * driver does not implement them. */
+#define VIRTIO_WDDM_VIDEO_DEVICE_CAPS \
+    (D3D11_1DDI_VIDEO_PROCESSOR_DEVICE_CAPS_LINEAR_SPACE | \
+     D3D11_1DDI_VIDEO_PROCESSOR_DEVICE_CAPS_YCbCr_MATRIX_CONVERSION)
+
+/* ------------------------------------------------------------------------- */
+/* Private objects                                                           */
+/* ------------------------------------------------------------------------- */
+
+/* The runtime allocates the private block from the matching CalcPrivate*Size
+ * and hands it back as hDrv…  (…) .pDrvPrivate; nothing here allocates. The magic
+ * is a cheap way to notice a handle that was never created before it is
+ * dereferenced.
+ *
+ * The `dxvk_*` members are DXVK COM objects (ID3D11VideoProcessor*, …) created
+ * through d3d11_video_dxvk.cpp. Each object owns exactly one reference, taken
+ * when it is created and dropped in the matching Destroy* entry. They are
+ * stored as void * so this file never has to see a C++ D3D11 header. */
+#define VIRTIO_WDDM_VIDEO_MAGIC_ENUM 0x56454e55u /* 'VENU' */
+#define VIRTIO_WDDM_VIDEO_MAGIC_PROC 0x56505243u /* 'VPRC' */
+#define VIRTIO_WDDM_VIDEO_MAGIC_VIEW 0x56564957u /* 'VVIW' */
+
+typedef struct {
+    UINT magic;
+    D3D11_1DDI_VIDEO_PROCESSOR_CONTENT_DESC content;
+    /* ID3D11VideoDevice * / ID3D11VideoContext * / ID3D11VideoProcessorEnumerator*.
+     * The first two are held here so destroying the enumerator cannot pull the
+     * interfaces out from under a processor that is still alive. */
+    void *dxvk_device;
+    void *dxvk_context;
+    void *dxvk_enum;
+} VIRTIO_WDDM_VideoProcessorEnum;
+
+typedef struct {
+    UINT magic;
+    /* Enumeration this processor was created from. Kept for logging only; the
+     * DXVK objects below carry their own references, so a processor outliving
+     * the enumerator still works. */
+    VIRTIO_WDDM_VideoProcessorEnum *enumeration;
+    UINT rate_conversion_caps_index;
+    /* ID3D11VideoProcessor * plus its own device/context references. */
+    void *dxvk_device;
+    void *dxvk_context;
+    void *dxvk_processor;
+} VIRTIO_WDDM_VideoProcessor;
+
+typedef struct {
+    UINT magic;
+    D3D10DDI_HRESOURCE resource;
+    UINT four_cc;
+    UINT mip_slice;
+    UINT first_array_slice;
+    UINT array_size;
+    void *dxvk_view; /* ID3D11VideoProcessorInputView * */
+} VIRTIO_WDDM_VideoProcessorInputView;
+
+typedef struct {
+    UINT magic;
+    D3D10DDI_HRESOURCE resource;
+    UINT mip_slice;
+    UINT first_array_slice;
+    UINT array_size;
+    void *dxvk_view; /* ID3D11VideoProcessorOutputView * */
+} VIRTIO_WDDM_VideoProcessorOutputView;
+
+/* ------------------------------------------------------------------------- */
+/* Format support                                                            */
+/* ------------------------------------------------------------------------- */
+
+/* Only the formats the processor path really negotiates: the two multi-plane /
+ * packed 4:2:2 YCbCr formats MF's Video Processor MFT feeds us, and the BGRA8
+ * render target it converts to. Reporting more (P010, YV12, RGB input, ...)
+ * would advertise conversions that were never validated. */
+static BOOL video_input_format_supported(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_NV12:
+    case DXGI_FORMAT_YUY2:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static BOOL video_output_format_supported(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Decoder: report no support, do not pretend otherwise                      */
+/* ------------------------------------------------------------------------- */
+
+static VOID APIENTRY virtio_wddm_video_get_video_decoder_profile_count(
+    D3D10DDI_HDEVICE hDevice, UINT *pCount) {
+    (void)hDevice;
+    if (!pCount)
+        return;
+    /* Zero profiles is what makes MF/browsers pick their software decoder
+     * instead of trying to drive a decoder that does not exist. */
+    *pCount = 0;
+    VERBOSE("%s: count=0 (hardware decode not implemented)", __FUNCTION__);
+}
+
+static VOID APIENTRY virtio_wddm_video_get_video_decoder_profile(
+    D3D10DDI_HDEVICE hDevice, UINT index, GUID *pProfile) {
+    (void)hDevice;
+    (void)pProfile;
+    ERROR("%s: called with index=%u although the profile count is 0", __FUNCTION__, index);
+}
+
+static VOID APIENTRY virtio_wddm_video_check_video_decoder_format(
+    D3D10DDI_HDEVICE hDevice, CONST GUID *pDecodeProfile, DXGI_FORMAT format,
+    BOOL *pSupported) {
+    (void)hDevice;
+    (void)pDecodeProfile;
+    if (!pSupported)
+        return;
+    *pSupported = FALSE;
+    VERBOSE("%s: format=%u supported=FALSE", __FUNCTION__, (unsigned)format);
+}
+
+static VOID APIENTRY virtio_wddm_video_get_video_decoder_config_count(
+    D3D10DDI_HDEVICE hDevice, CONST D3D11_1DDI_VIDEO_DECODER_DESC *pDesc,
+    UINT *pCount) {
+    (void)hDevice;
+    (void)pDesc;
+    if (!pCount)
+        return;
+    *pCount = 0;
+}
+
+static VOID APIENTRY virtio_wddm_video_get_video_decoder_config(
+    D3D10DDI_HDEVICE hDevice, CONST D3D11_1DDI_VIDEO_DECODER_DESC *pDesc,
+    UINT index, D3D11_1DDI_VIDEO_DECODER_CONFIG *pConfig) {
+    (void)hDevice;
+    (void)pDesc;
+    (void)index;
+    if (pConfig)
+        memset(pConfig, 0, sizeof(*pConfig));
+}
+
+static VOID APIENTRY virtio_wddm_video_get_video_decoder_buffer_type_count(
+    D3D10DDI_HDEVICE hDevice, CONST D3D11_1DDI_VIDEO_DECODER_DESC *pDesc,
+    UINT *pCount) {
+    (void)hDevice;
+    (void)pDesc;
+    if (!pCount)
+        return;
+    *pCount = 0;
+}
+
+static VOID APIENTRY virtio_wddm_video_get_video_decoder_buffer_info(
+    D3D10DDI_HDEVICE hDevice, CONST D3D11_1DDI_VIDEO_DECODER_DESC *pDesc,
+    UINT index, D3D11_1DDI_VIDEO_DECODER_BUFFER_INFO *pInfo) {
+    (void)hDevice;
+    (void)pDesc;
+    (void)index;
+    if (pInfo)
+        memset(pInfo, 0, sizeof(*pInfo));
+}
+
+static SIZE_T APIENTRY virtio_wddm_video_calc_private_video_decoder_size(
+    D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEODECODER *pArgs) {
+    (void)hDevice;
+    (void)pArgs;
+    /* CreateVideoDecoder refuses, so the size only has to be a legal non-zero
+     * allocation for the runtime. */
+    return sizeof(UINT);
+}
+
+static HRESULT APIENTRY virtio_wddm_video_create_video_decoder(
+    D3D10DDI_HDEVICE hDevice, CONST D3D11_1DDIARG_CREATEVIDEODECODER *pArgs,
+    D3D11_1DDI_HDECODE hDecode, D3D11_1DDI_HRTDECODE hRTDecode) {
+    (void)hDevice;
+    (void)hDecode;
+    (void)hRTDecode;
+    INFO("%s: refusing (no hardware decoder) profile=%08lx-%04x-%04x",
+         __FUNCTION__, (unsigned long)pArgs->Desc.Guid.Data1, pArgs->Desc.Guid.Data2,
+         pArgs->Desc.Guid.Data3);
+    return E_NOT_SUPPORTED;
+}
+
+static VOID APIENTRY virtio_wddm_video_destroy_video_decoder(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecode) {
+    (void)hDevice;
+    (void)hDecode;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_video_decoder_extension(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecode,
+    CONST D3D11_1DDIARG_VIDEODECODEREXTENSION *pArgs) {
+    (void)hDevice;
+    (void)hDecode;
+    (void)pArgs;
+    return E_NOTIMPL;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_video_decoder_begin_frame(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecode,
+    CONST D3D11_1DDIARG_VIDEODECODERBEGINFRAME *pArgs) {
+    (void)hDevice;
+    (void)hDecode;
+    (void)pArgs;
+    return E_NOTIMPL;
+}
+
+static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecode) {
+    (void)hDevice;
+    (void)hDecode;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_video_decoder_submit_buffers(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecode, UINT count,
+    CONST D3D11_1DDI_VIDEO_DECODER_BUFFER_DESC *pBuffers) {
+    (void)hDevice;
+    (void)hDecode;
+    (void)count;
+    (void)pBuffers;
+    return E_NOTIMPL;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Video processor: enumerator, caps, object                                 */
+/* ------------------------------------------------------------------------- */
+
+static SIZE_T APIENTRY virtio_wddm_video_calc_private_video_processor_enum_size(
+    D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEOPROCESSORENUM *pArgs) {
+    (void)hDevice;
+    (void)pArgs;
+    return sizeof(VIRTIO_WDDM_VideoProcessorEnum);
+}
+
+static HRESULT APIENTRY virtio_wddm_video_create_video_processor_enum(
+    D3D10DDI_HDEVICE hDevice, CONST D3D11_1DDIARG_CREATEVIDEOPROCESSORENUM *pArgs,
+    D3D11_1DDI_HVIDEOPROCESSORENUM hEnum, D3D11_1DDI_HRTVIDEOPROCESSORENUM hRTEnum) {
+    (void)hRTEnum;
+
+    VIRTIO_WDDM_Device *device = hDevice.pDrvPrivate;
+    VIRTIO_WDDM_VideoProcessorEnum *object = hEnum.pDrvPrivate;
+    if (!object || !device)
+        return E_INVALIDARG;
+
+    memset(object, 0, sizeof(*object));
+    object->content = pArgs->Desc;
+
+    void *dxvk_device = NULL;
+    void *dxvk_context = NULL;
+    HRESULT hr = virtio_wddm_dxvk_video_get(device->base.pDev1, device->base.pCtx1,
+                                            &dxvk_device, &dxvk_context);
+    if (FAILED(hr)) {
+        /* No DXVK video device means no processor; the runtime reports the
+         * failure to the app and MF falls back to its software path. */
+        ERROR("%s: internal DXVK device has no video interfaces: 0x%08lx",
+              __FUNCTION__, hr);
+        return hr;
+    }
+
+    VIRTIO_WDDM_VideoContentDesc desc = {
+        .frame_format = (UINT)pArgs->Desc.InputFrameFormat,
+        .input_numerator = pArgs->Desc.InputFrameRate.Numerator,
+        .input_denominator = pArgs->Desc.InputFrameRate.Denominator,
+        .input_width = pArgs->Desc.InputWidth,
+        .input_height = pArgs->Desc.InputHeight,
+        .output_numerator = pArgs->Desc.OutputFrameRate.Numerator,
+        .output_denominator = pArgs->Desc.OutputFrameRate.Denominator,
+        .output_width = pArgs->Desc.OutputWidth,
+        .output_height = pArgs->Desc.OutputHeight,
+        .usage = (UINT)pArgs->Desc.Usage,
+    };
+
+    hr = virtio_wddm_dxvk_video_create_enum(dxvk_device, &desc, &object->dxvk_enum);
+    if (FAILED(hr)) {
+        ERROR("%s: DXVK CreateVideoProcessorEnumerator failed: 0x%08lx",
+              __FUNCTION__, hr);
+        virtio_wddm_dxvk_video_release(dxvk_device, dxvk_context);
+        return hr;
+    }
+
+    object->dxvk_device = dxvk_device;
+    object->dxvk_context = dxvk_context;
+    object->magic = VIRTIO_WDDM_VIDEO_MAGIC_ENUM;
+
+    INFO("%s: enum=%p %ux%u@%u/%u -> %ux%u@%u/%u fm=%u usage=%u dxvk=%p", __FUNCTION__,
+         (void *)object,
+         pArgs->Desc.InputWidth, pArgs->Desc.InputHeight,
+         pArgs->Desc.InputFrameRate.Numerator, pArgs->Desc.InputFrameRate.Denominator,
+         pArgs->Desc.OutputWidth, pArgs->Desc.OutputHeight,
+         pArgs->Desc.OutputFrameRate.Numerator, pArgs->Desc.OutputFrameRate.Denominator,
+         (unsigned)pArgs->Desc.InputFrameFormat, (unsigned)pArgs->Desc.Usage,
+         object->dxvk_enum);
+    return S_OK;
+}
+
+static VOID APIENTRY virtio_wddm_video_destroy_video_processor_enum(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum) {
+    (void)hDevice;
+
+    VIRTIO_WDDM_VideoProcessorEnum *object = hEnum.pDrvPrivate;
+    if (!object || object->magic != VIRTIO_WDDM_VIDEO_MAGIC_ENUM) {
+        ERROR("%s: bad enumerator handle %p", __FUNCTION__, (void *)object);
+        return;
+    }
+    object->magic = 0;
+    virtio_wddm_dxvk_video_destroy_enum(object->dxvk_enum);
+    virtio_wddm_dxvk_video_release(object->dxvk_device, object->dxvk_context);
+    object->dxvk_enum = NULL;
+    object->dxvk_device = NULL;
+    object->dxvk_context = NULL;
+    VERBOSE("%s: enum=%p", __FUNCTION__, (void *)object);
+}
+
+static VOID APIENTRY virtio_wddm_video_check_video_processor_format(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum,
+    DXGI_FORMAT format, UINT *pFlags) {
+    (void)hDevice;
+    (void)hEnum;
+    if (!pFlags)
+        return;
+
+    UINT flags = 0;
+    if (video_input_format_supported(format))
+        flags |= D3D11_1DDI_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT;
+    if (video_output_format_supported(format))
+        flags |= D3D11_1DDI_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT;
+
+    *pFlags = flags;
+    VERBOSE("%s: format=%u flags=0x%x", __FUNCTION__, (unsigned)format, flags);
+}
+
+static VOID APIENTRY virtio_wddm_video_get_video_processor_caps(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum,
+    D3D11_1DDI_VIDEO_PROCESSOR_CAPS *pCaps) {
+    (void)hDevice;
+    (void)hEnum;
+    if (!pCaps)
+        return;
+
+    *pCaps = (D3D11_1DDI_VIDEO_PROCESSOR_CAPS) {
+        .DeviceCaps = VIRTIO_WDDM_VIDEO_DEVICE_CAPS,
+        .FeatureCaps = 0,
+        .FilterCaps = 0,
+        .InputFormatCaps = 0,
+        .AutoStreamCaps = 0,
+        .StereoCaps = 0,
+        .RateConversionCapsCount = VIRTIO_WDDM_VIDEO_RATE_CONVERSION_CAPS,
+        .MaxInputStreams = VIRTIO_WDDM_VIDEO_MAX_INPUT_STREAMS,
+        .MaxStreamStates = VIRTIO_WDDM_VIDEO_MAX_STREAM_STATES,
+    };
+
+    INFO("%s: dev=0x%x feat=0x%x filter=0x%x rateconv=%u maxin=%u maxstates=%u",
+         __FUNCTION__, pCaps->DeviceCaps, pCaps->FeatureCaps, pCaps->FilterCaps,
+         pCaps->RateConversionCapsCount, pCaps->MaxInputStreams,
+         pCaps->MaxStreamStates);
+}
+
+static VOID APIENTRY virtio_wddm_video_get_video_processor_rate_conversion_caps(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum, UINT index,
+    D3D11_1DDI_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS *pCaps) {
+    (void)hDevice;
+    (void)hEnum;
+    (void)index;
+    if (!pCaps)
+        return;
+
+    /* No deinterlacing, no inverse telecine, no frame-rate conversion: the
+     * conversion caps field stays 0 and no custom rates exist. */
+    memset(pCaps, 0, sizeof(*pCaps));
+    VERBOSE("%s: index=%u (no frame-rate conversion)", __FUNCTION__, index);
+}
+
+static VOID APIENTRY virtio_wddm_video_get_video_processor_custom_rate(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum,
+    UINT rate_conversion_index, UINT custom_rate_index,
+    D3D11_1DDI_VIDEO_PROCESSOR_CUSTOM_RATE *pRate) {
+    (void)hDevice;
+    (void)hEnum;
+    (void)rate_conversion_index;
+    (void)custom_rate_index;
+    if (pRate)
+        memset(pRate, 0, sizeof(*pRate));
+}
+
+static VOID APIENTRY virtio_wddm_video_get_video_processor_filter_range(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum,
+    D3D11_1DDI_VIDEO_PROCESSOR_FILTER filter,
+    D3D11_1DDI_VIDEO_PROCESSOR_FILTER_RANGE *pRange) {
+    (void)hDevice;
+    (void)hEnum;
+    (void)filter;
+    if (!pRange)
+        return;
+
+    /* FilterCaps is 0, so the runtime should not ask. Answer with an identity
+     * range rather than leaving the output undefined. */
+    *pRange = (D3D11_1DDI_VIDEO_PROCESSOR_FILTER_RANGE) {
+        .Minimum = 0,
+        .Maximum = 0,
+        .Default = 0,
+        .Multiplier = 1.0f,
+    };
+}
+
+static SIZE_T APIENTRY virtio_wddm_video_calc_private_video_processor_size(
+    D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEOPROCESSOR *pArgs) {
+    (void)hDevice;
+    (void)pArgs;
+    return sizeof(VIRTIO_WDDM_VideoProcessor);
+}
+
+static HRESULT APIENTRY virtio_wddm_video_create_video_processor(
+    D3D10DDI_HDEVICE hDevice, CONST D3D11_1DDIARG_CREATEVIDEOPROCESSOR *pArgs,
+    D3D11_1DDI_HVIDEOPROCESSOR hProcessor, D3D11_1DDI_HRTVIDEOPROCESSOR hRTProcessor) {
+    (void)hRTProcessor;
+
+    VIRTIO_WDDM_VideoProcessor *object = hProcessor.pDrvPrivate;
+    VIRTIO_WDDM_VideoProcessorEnum *enumeration = pArgs->hVideoProcessorEnum.pDrvPrivate;
+
+    if (!object)
+        return E_INVALIDARG;
+    if (!enumeration || enumeration->magic != VIRTIO_WDDM_VIDEO_MAGIC_ENUM) {
+        ERROR("%s: invalid enumerator %p", __FUNCTION__, (void *)enumeration);
+        return E_INVALIDARG;
+    }
+    if (pArgs->RateConversionCapsIndex >= VIRTIO_WDDM_VIDEO_RATE_CONVERSION_CAPS) {
+        ERROR("%s: rate conversion index %u out of range", __FUNCTION__,
+              pArgs->RateConversionCapsIndex);
+        return E_INVALIDARG;
+    }
+
+    memset(object, 0, sizeof(*object));
+    object->enumeration = enumeration;
+    object->rate_conversion_caps_index = pArgs->RateConversionCapsIndex;
+
+    /* The processor gets its own references: the app is free to release the
+     * enumerator while keeping the processor, and the runtime would then call
+     * DestroyVideoProcessorEnum before DestroyVideoProcessor. */
+    VIRTIO_WDDM_Device *device = hDevice.pDrvPrivate;
+    if (!device)
+        return E_INVALIDARG;
+
+    void *dxvk_device = NULL;
+    void *dxvk_context = NULL;
+    HRESULT hr = virtio_wddm_dxvk_video_get(device->base.pDev1, device->base.pCtx1,
+                                            &dxvk_device, &dxvk_context);
+    if (FAILED(hr)) {
+        ERROR("%s: internal DXVK device has no video interfaces: 0x%08lx",
+              __FUNCTION__, hr);
+        return hr;
+    }
+
+    hr = virtio_wddm_dxvk_video_create_processor(dxvk_device, enumeration->dxvk_enum,
+                                                 pArgs->RateConversionCapsIndex,
+                                                 &object->dxvk_processor);
+    if (FAILED(hr)) {
+        ERROR("%s: DXVK CreateVideoProcessor failed: 0x%08lx", __FUNCTION__, hr);
+        virtio_wddm_dxvk_video_release(dxvk_device, dxvk_context);
+        return hr;
+    }
+
+    object->dxvk_device = dxvk_device;
+    object->dxvk_context = dxvk_context;
+    object->magic = VIRTIO_WDDM_VIDEO_MAGIC_PROC;
+
+    INFO("%s: processor=%p enum=%p rateconv=%u dxvk=%p", __FUNCTION__, (void *)object,
+         (void *)enumeration, pArgs->RateConversionCapsIndex, object->dxvk_processor);
+    return S_OK;
+}
+
+static VOID APIENTRY virtio_wddm_video_destroy_video_processor(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor) {
+    (void)hDevice;
+
+    VIRTIO_WDDM_VideoProcessor *object = hProcessor.pDrvPrivate;
+    if (!object || object->magic != VIRTIO_WDDM_VIDEO_MAGIC_PROC) {
+        ERROR("%s: bad processor handle %p", __FUNCTION__, (void *)object);
+        return;
+    }
+    object->magic = 0;
+    virtio_wddm_dxvk_video_destroy_processor(object->dxvk_processor);
+    virtio_wddm_dxvk_video_release(object->dxvk_device, object->dxvk_context);
+    object->dxvk_processor = NULL;
+    object->dxvk_device = NULL;
+    object->dxvk_context = NULL;
+    VERBOSE("%s: processor=%p", __FUNCTION__, (void *)object);
+}
+
+/* Helper: a processor handle is valid and carries the DXVK objects the state
+ * setters and the blit need. Returns NULL for an unknown handle. */
+static VIRTIO_WDDM_VideoProcessor *video_processor_from_handle(
+    D3D11_1DDI_HVIDEOPROCESSOR hProcessor, const char *function) {
+    VIRTIO_WDDM_VideoProcessor *object = hProcessor.pDrvPrivate;
+    if (!object || object->magic != VIRTIO_WDDM_VIDEO_MAGIC_PROC) {
+        ERROR("%s: bad processor handle %p", function, (void *)object);
+        return NULL;
+    }
+    if (!object->dxvk_processor || !object->dxvk_context) {
+        ERROR("%s: processor %p has no DXVK objects", function, (void *)object);
+        return NULL;
+    }
+    return object;
+}
+
+/* Output/stream state. Each setter is forwarded to the matching DXVK video
+ * context entry, which stores it on the DXVK processor; the blit reads that
+ * state when it builds the source/destination rectangles and the YCbCr matrix.
+ * The DDI and the D3D11 runtime enums share their numeric values, so they are
+ * cast rather than mapped. */
+static VOID APIENTRY virtio_wddm_video_set_output_target_rect(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    BOOL enable, CONST RECT *pRect) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    virtio_wddm_dxvk_video_set_output_target_rect(object->dxvk_context,
+                                                  object->dxvk_processor, enable, pRect);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_output_background_color(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    BOOL ycbcr, CONST D3D11_1DDI_VIDEO_COLOR *pColor) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    const float *color = pColor ? &pColor->RGBA.R : NULL;
+    virtio_wddm_dxvk_video_set_output_background_color(object->dxvk_context,
+                                                       object->dxvk_processor, ycbcr, color);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_output_color_space(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    CONST D3D11_1DDI_VIDEO_PROCESSOR_COLOR_SPACE *pColorSpace) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object || !pColorSpace)
+        return;
+    UINT bits = 0;
+    memcpy(&bits, pColorSpace, sizeof(bits));
+    virtio_wddm_dxvk_video_set_output_color_space(object->dxvk_context,
+                                                  object->dxvk_processor, bits);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_output_alpha_fill_mode(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    D3D11_1DDI_VIDEO_PROCESSOR_ALPHA_FILL_MODE mode, UINT stream_index) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    virtio_wddm_dxvk_video_set_output_alpha_fill_mode(object->dxvk_context,
+                                                      object->dxvk_processor,
+                                                      (UINT)mode, stream_index);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_output_constriction(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    BOOL enable, SIZE size) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    virtio_wddm_dxvk_video_set_output_constriction(object->dxvk_context,
+                                                   object->dxvk_processor, enable,
+                                                   (UINT)size.cx, (UINT)size.cy);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_output_stereo_mode(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor, BOOL enable) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    virtio_wddm_dxvk_video_set_output_stereo_mode(object->dxvk_context,
+                                                  object->dxvk_processor, enable);
+}
+
+static HRESULT APIENTRY virtio_wddm_video_set_output_extension(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    CONST GUID *pExtensionGuid, UINT data_size, void *pData) {
+    (void)hDevice; (void)hProcessor; (void)pExtensionGuid; (void)data_size; (void)pData;
+    return E_NOTIMPL;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_get_output_extension(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    CONST GUID *pExtensionGuid, UINT data_size, void *pData) {
+    (void)hDevice; (void)hProcessor; (void)pExtensionGuid; (void)data_size; (void)pData;
+    return E_NOTIMPL;
+}
+
+/* Stream state. Forwarded exactly like the output state: DXVK's video blit
+ * reads these when it builds the coordinate matrix (source/dest rectangle,
+ * rotation) and the YCbCr->RGB matrix (color space, nominal range). */
+static VOID APIENTRY virtio_wddm_video_set_stream_frame_format(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, D3D11_1DDI_VIDEO_FRAME_FORMAT format) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    virtio_wddm_dxvk_video_set_stream_frame_format(object->dxvk_context,
+                                                   object->dxvk_processor,
+                                                   stream_index, (UINT)format);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_stream_color_space(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, CONST D3D11_1DDI_VIDEO_PROCESSOR_COLOR_SPACE *pColorSpace) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object || !pColorSpace)
+        return;
+    UINT bits = 0;
+    memcpy(&bits, pColorSpace, sizeof(bits));
+    virtio_wddm_dxvk_video_set_stream_color_space(object->dxvk_context,
+                                                  object->dxvk_processor,
+                                                  stream_index, bits);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_stream_output_rate(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, D3D11_1DDI_VIDEO_PROCESSOR_OUTPUT_RATE rate,
+    BOOL repeat_frame, CONST DXGI_RATIONAL *pCustom_rate) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    UINT numerator = pCustom_rate ? pCustom_rate->Numerator : 0;
+    UINT denominator = pCustom_rate ? pCustom_rate->Denominator : 0;
+    virtio_wddm_dxvk_video_set_stream_output_rate(object->dxvk_context,
+                                                  object->dxvk_processor, stream_index,
+                                                  (UINT)rate, repeat_frame,
+                                                  numerator, denominator);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_stream_source_rect(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, BOOL enable, CONST RECT *pRect) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    virtio_wddm_dxvk_video_set_stream_source_rect(object->dxvk_context,
+                                                  object->dxvk_processor,
+                                                  stream_index, enable, pRect);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_stream_dest_rect(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, BOOL enable, CONST RECT *pRect) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    virtio_wddm_dxvk_video_set_stream_dest_rect(object->dxvk_context,
+                                                object->dxvk_processor,
+                                                stream_index, enable, pRect);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_stream_alpha(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, BOOL enable, FLOAT alpha) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    virtio_wddm_dxvk_video_set_stream_alpha(object->dxvk_context,
+                                            object->dxvk_processor,
+                                            stream_index, enable, alpha);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_stream_palette(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, UINT count, CONST UINT *pEntries) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    virtio_wddm_dxvk_video_set_stream_palette(object->dxvk_context,
+                                              object->dxvk_processor,
+                                              stream_index, count, pEntries);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_stream_pixel_aspect_ratio(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, BOOL enable, CONST DXGI_RATIONAL *pSource,
+    CONST DXGI_RATIONAL *pDestination) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    UINT source_numerator = pSource ? pSource->Numerator : 0;
+    UINT source_denominator = pSource ? pSource->Denominator : 0;
+    UINT destination_numerator = pDestination ? pDestination->Numerator : 0;
+    UINT destination_denominator = pDestination ? pDestination->Denominator : 0;
+    virtio_wddm_dxvk_video_set_stream_pixel_aspect_ratio(
+        object->dxvk_context, object->dxvk_processor, stream_index, enable,
+        source_numerator, source_denominator, destination_numerator, destination_denominator);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_stream_luma_key(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, BOOL enable, FLOAT lower, FLOAT upper) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    virtio_wddm_dxvk_video_set_stream_luma_key(object->dxvk_context,
+                                               object->dxvk_processor,
+                                               stream_index, enable, lower, upper);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_stream_stereo_format(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, BOOL enable, D3D11_1DDI_VIDEO_PROCESSOR_STEREO_FORMAT format,
+    BOOL left_view_frame0, BOOL right_view_frame0,
+    D3D11_1DDI_VIDEO_PROCESSOR_STEREO_FLIP_MODE flip_mode, int mono_offset) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    virtio_wddm_dxvk_video_set_stream_stereo_format(
+        object->dxvk_context, object->dxvk_processor, stream_index, enable, (UINT)format,
+        left_view_frame0, right_view_frame0, (UINT)flip_mode, mono_offset);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_stream_auto_processing_mode(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, BOOL enable) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    virtio_wddm_dxvk_video_set_stream_auto_processing_mode(object->dxvk_context,
+                                                           object->dxvk_processor,
+                                                           stream_index, enable);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_stream_filter(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, D3D11_1DDI_VIDEO_PROCESSOR_FILTER filter, BOOL enable,
+    int value) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    virtio_wddm_dxvk_video_set_stream_filter(object->dxvk_context,
+                                             object->dxvk_processor,
+                                             stream_index, (UINT)filter, enable, value);
+}
+
+static VOID APIENTRY virtio_wddm_video_set_stream_rotation(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, BOOL enable, D3D11_1DDI_VIDEO_PROCESSOR_ROTATION rotation) {
+    (void)hDevice;
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return;
+    virtio_wddm_dxvk_video_set_stream_rotation(object->dxvk_context,
+                                               object->dxvk_processor,
+                                               stream_index, enable, (UINT)rotation);
+}
+
+static HRESULT APIENTRY virtio_wddm_video_set_stream_extension(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, CONST GUID *pExtensionGuid, UINT data_size, void *pData) {
+    (void)hDevice; (void)hProcessor; (void)stream_index; (void)pExtensionGuid;
+    (void)data_size; (void)pData;
+    return E_NOTIMPL;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_get_stream_extension(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    UINT stream_index, CONST GUID *pExtensionGuid, UINT data_size, void *pData) {
+    (void)hDevice; (void)hProcessor; (void)stream_index; (void)pExtensionGuid;
+    (void)data_size; (void)pData;
+    return E_NOTIMPL;
+}
+
+/* The blit: translate the DDI stream array and hand the whole thing to DXVK's
+ * video processor. DXVK does the YUV->RGB matrix, the plane sampling and the
+ * scaling draw into the output view on the internal immediate context.
+ *
+ * Failure policy: anything this driver does not implement is refused with an
+ * explicit error instead of being silently ignored. The interesting cases are
+ * deinterlacing (PastFrames/FutureFrames) and stereo (right-hand surfaces),
+ * which our caps do not advertise; if the runtime asks anyway it gets
+ * E_NOTIMPL and the app can fall back, rather than a wrong-looking frame. */
+static HRESULT APIENTRY virtio_wddm_video_video_processor_blt(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+    D3D11_1DDI_HVIDEOPROCESSOROUTPUTVIEW hOutputView, UINT output_frame,
+    UINT stream_count, CONST D3D11_1DDI_VIDEO_PROCESSOR_STREAM *pStreams) {
+    (void)hDevice;
+
+    VIRTIO_WDDM_VideoProcessor *object =
+        video_processor_from_handle(hProcessor, __FUNCTION__);
+    if (!object)
+        return E_INVALIDARG;
+
+    VIRTIO_WDDM_VideoProcessorOutputView *output = hOutputView.pDrvPrivate;
+    if (!output || output->magic != VIRTIO_WDDM_VIDEO_MAGIC_VIEW || !output->dxvk_view) {
+        ERROR("%s: invalid output view %p", __FUNCTION__, (void *)output);
+        return E_INVALIDARG;
+    }
+
+    if (!pStreams || stream_count == 0 ||
+        stream_count > VIRTIO_WDDM_VIDEO_MAX_INPUT_STREAMS) {
+        ERROR("%s: bad stream count %u (max %u)", __FUNCTION__, stream_count,
+              VIRTIO_WDDM_VIDEO_MAX_INPUT_STREAMS);
+        return E_INVALIDARG;
+    }
+
+    VIRTIO_WDDM_VideoStream streams[VIRTIO_WDDM_VIDEO_MAX_INPUT_STREAMS];
+    for (UINT i = 0; i < stream_count; i++) {
+        CONST D3D11_1DDI_VIDEO_PROCESSOR_STREAM *in = &pStreams[i];
+
+        /* No deinterlacing, no frame-rate conversion, no stereo: caps say so,
+         * and DXVK's blit would only log and ignore these anyway. */
+        if (in->PastFrames || in->FutureFrames) {
+            ERROR("%s: stream %u asks for deinterlacing (past=%u future=%u), not "
+                  "supported", __FUNCTION__, i, in->PastFrames, in->FutureFrames);
+            return E_NOTIMPL;
+        }
+        if (in->pPastSurfaces || in->pFutureSurfaces || in->pPastSurfacesRight ||
+            in->pFutureSurfacesRight || in->hInputSurfaceRight.pDrvPrivate) {
+            ERROR("%s: stream %u uses the stereo/deinterlace surfaces, not supported",
+                  __FUNCTION__, i);
+            return E_NOTIMPL;
+        }
+
+        void *input_view = NULL;
+        if (in->hInputSurface.pDrvPrivate) {
+            VIRTIO_WDDM_VideoProcessorInputView *input =
+                in->hInputSurface.pDrvPrivate;
+            if (input->magic != VIRTIO_WDDM_VIDEO_MAGIC_VIEW || !input->dxvk_view) {
+                ERROR("%s: stream %u has an invalid input view %p", __FUNCTION__, i,
+                      (void *)input);
+                return E_INVALIDARG;
+            }
+            input_view = input->dxvk_view;
+        } else if (in->Enable) {
+            ERROR("%s: stream %u is enabled but has no input surface", __FUNCTION__, i);
+            return E_INVALIDARG;
+        }
+
+        streams[i] = (VIRTIO_WDDM_VideoStream) {
+            .enable = in->Enable,
+            .output_index = in->OutputIndex,
+            .input_frame_or_field = in->InputFrameOrField,
+            .input_view = input_view,
+        };
+    }
+
+    HRESULT hr = virtio_wddm_dxvk_video_blt(object->dxvk_context, object->dxvk_processor,
+                                            output->dxvk_view, output_frame,
+                                            stream_count, streams);
+
+    /* One line per process for the first blit: enough to prove on the guest
+     * that pixels went through DXVK, without flooding a per-frame log. */
+    static volatile LONG logged;
+    if (InterlockedCompareExchange(&logged, 1, 0) == 0) {
+        if (SUCCEEDED(hr)) {
+            INFO("%s: first blit queued (streams=%u frame=%u output=%p): DXVK video "
+                 "processor does YCbCr->RGB + scaling on the internal Vulkan queue",
+                 __FUNCTION__, stream_count, output_frame, output->dxvk_view);
+        } else {
+            ERROR("%s: DXVK VideoProcessorBlt failed: 0x%08lx", __FUNCTION__, hr);
+        }
+    }
+    return hr;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Views                                                                     */
+/* ------------------------------------------------------------------------- */
+
+/* Input/output views own a DXVK video-processor view, created from the D3D11
+ * resource that the DDI resource wraps (VIRTIO_WDDM_Resource::base.pResource)
+ * and the DXVK enumerator of the DDI enumerator. The DDI side keeps the
+ * logical description (slice, FourCC) for logging; the blit passes the DXVK
+ * view pointer straight through. */
+
+static SIZE_T APIENTRY virtio_wddm_video_calc_private_video_decoder_output_view_size(
+    D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEODECODEROUTPUTVIEW *pArgs) {
+    (void)hDevice;
+    (void)pArgs;
+    return sizeof(UINT);
+}
+
+static HRESULT APIENTRY virtio_wddm_video_create_video_decoder_output_view(
+    D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEODECODEROUTPUTVIEW *pArgs,
+    D3D11_1DDI_HVIDEODECODEROUTPUTVIEW hView,
+    D3D11_1DDI_HRTVIDEODECODEROUTPUTVIEW hRTView) {
+    (void)hDevice;
+    (void)hView;
+    (void)hRTView;
+    (void)pArgs;
+    /* Without a decoder there is nothing an output view could belong to. */
+    return E_NOT_SUPPORTED;
+}
+
+static VOID APIENTRY virtio_wddm_video_destroy_video_decoder_output_view(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEODECODEROUTPUTVIEW hView) {
+    (void)hDevice;
+    (void)hView;
+}
+
+static SIZE_T APIENTRY virtio_wddm_video_calc_private_video_processor_input_view_size(
+    D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEOPROCESSORINPUTVIEW *pArgs) {
+    (void)hDevice;
+    (void)pArgs;
+    return sizeof(VIRTIO_WDDM_VideoProcessorInputView);
+}
+
+static HRESULT APIENTRY virtio_wddm_video_create_video_processor_input_view(
+    D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEOPROCESSORINPUTVIEW *pArgs,
+    D3D11_1DDI_HVIDEOPROCESSORINPUTVIEW hView,
+    D3D11_1DDI_HRTVIDEOPROCESSORINPUTVIEW hRTView) {
+    (void)hDevice;
+    (void)hRTView;
+
+    VIRTIO_WDDM_VideoProcessorInputView *object = hView.pDrvPrivate;
+    VIRTIO_WDDM_Resource *resource = pArgs->hDrvResource.pDrvPrivate;
+    VIRTIO_WDDM_VideoProcessorEnum *enumeration =
+        pArgs->hDrvVideoProcessorEnum.pDrvPrivate;
+
+    if (!object)
+        return E_INVALIDARG;
+    if (!resource || !resource->base.pResource) {
+        ERROR("%s: resource %p is not backed by a D3D11 texture", __FUNCTION__,
+              (void *)resource);
+        return E_FAIL;
+    }
+    if (!enumeration || enumeration->magic != VIRTIO_WDDM_VIDEO_MAGIC_ENUM ||
+        !enumeration->dxvk_enum) {
+        ERROR("%s: invalid enumerator %p", __FUNCTION__, (void *)enumeration);
+        return E_INVALIDARG;
+    }
+
+    memset(object, 0, sizeof(*object));
+    object->resource = pArgs->hDrvResource;
+    object->four_cc = pArgs->FourCC;
+    object->mip_slice = pArgs->MipSlice;
+    object->first_array_slice = pArgs->FirstArraySlice;
+    object->array_size = pArgs->ArraySize;
+
+    HRESULT hr = virtio_wddm_dxvk_video_create_input_view(
+        enumeration->dxvk_device, resource->base.pResource, enumeration->dxvk_enum,
+        pArgs->FourCC, pArgs->MipSlice, pArgs->FirstArraySlice, &object->dxvk_view);
+    if (FAILED(hr)) {
+        ERROR("%s: DXVK CreateVideoProcessorInputView failed: 0x%08lx", __FUNCTION__, hr);
+        return hr;
+    }
+
+    object->magic = VIRTIO_WDDM_VIDEO_MAGIC_VIEW;
+    VERBOSE("%s: view=%p res=%p fourcc=0x%x slice=%u/%u dxvk=%p", __FUNCTION__,
+            (void *)object, pArgs->hDrvResource.pDrvPrivate, pArgs->FourCC,
+            pArgs->FirstArraySlice, pArgs->ArraySize, object->dxvk_view);
+    return S_OK;
+}
+
+static VOID APIENTRY virtio_wddm_video_destroy_video_processor_input_view(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORINPUTVIEW hView) {
+    (void)hDevice;
+
+    VIRTIO_WDDM_VideoProcessorInputView *object = hView.pDrvPrivate;
+    if (object && object->magic == VIRTIO_WDDM_VIDEO_MAGIC_VIEW) {
+        virtio_wddm_dxvk_video_destroy_input_view(object->dxvk_view);
+        object->dxvk_view = NULL;
+        object->magic = 0;
+    }
+}
+
+static SIZE_T APIENTRY virtio_wddm_video_calc_private_video_processor_output_view_size(
+    D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEOPROCESSOROUTPUTVIEW *pArgs) {
+    (void)hDevice;
+    (void)pArgs;
+    return sizeof(VIRTIO_WDDM_VideoProcessorOutputView);
+}
+
+static HRESULT APIENTRY virtio_wddm_video_create_video_processor_output_view(
+    D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEOPROCESSOROUTPUTVIEW *pArgs,
+    D3D11_1DDI_HVIDEOPROCESSOROUTPUTVIEW hView,
+    D3D11_1DDI_HRTVIDEOPROCESSOROUTPUTVIEW hRTView) {
+    (void)hDevice;
+    (void)hRTView;
+
+    VIRTIO_WDDM_VideoProcessorOutputView *object = hView.pDrvPrivate;
+    VIRTIO_WDDM_Resource *resource = pArgs->hDrvResource.pDrvPrivate;
+    VIRTIO_WDDM_VideoProcessorEnum *enumeration =
+        pArgs->hDrvVideoProcessorEnum.pDrvPrivate;
+
+    if (!object)
+        return E_INVALIDARG;
+    if (!resource || !resource->base.pResource) {
+        ERROR("%s: resource %p is not backed by a D3D11 texture", __FUNCTION__,
+              (void *)resource);
+        return E_FAIL;
+    }
+    if (!enumeration || enumeration->magic != VIRTIO_WDDM_VIDEO_MAGIC_ENUM ||
+        !enumeration->dxvk_enum) {
+        ERROR("%s: invalid enumerator %p", __FUNCTION__, (void *)enumeration);
+        return E_INVALIDARG;
+    }
+
+    memset(object, 0, sizeof(*object));
+    object->resource = pArgs->hDrvResource;
+    object->mip_slice = pArgs->MipSlice;
+    object->first_array_slice = pArgs->FirstArraySlice;
+    object->array_size = pArgs->ArraySize;
+
+    HRESULT hr = virtio_wddm_dxvk_video_create_output_view(
+        enumeration->dxvk_device, resource->base.pResource, enumeration->dxvk_enum,
+        pArgs->MipSlice, pArgs->FirstArraySlice, pArgs->ArraySize, &object->dxvk_view);
+    if (FAILED(hr)) {
+        ERROR("%s: DXVK CreateVideoProcessorOutputView failed: 0x%08lx", __FUNCTION__, hr);
+        return hr;
+    }
+
+    object->magic = VIRTIO_WDDM_VIDEO_MAGIC_VIEW;
+    VERBOSE("%s: view=%p res=%p slice=%u/%u dxvk=%p", __FUNCTION__, (void *)object,
+            pArgs->hDrvResource.pDrvPrivate, pArgs->FirstArraySlice, pArgs->ArraySize,
+            object->dxvk_view);
+    return S_OK;
+}
+
+static VOID APIENTRY virtio_wddm_video_destroy_video_processor_output_view(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOROUTPUTVIEW hView) {
+    (void)hDevice;
+
+    VIRTIO_WDDM_VideoProcessorOutputView *object = hView.pDrvPrivate;
+    if (object && object->magic == VIRTIO_WDDM_VIDEO_MAGIC_VIEW) {
+        virtio_wddm_dxvk_video_destroy_output_view(object->dxvk_view);
+        object->dxvk_view = NULL;
+        object->magic = 0;
+    }
+}
+
+static VOID APIENTRY virtio_wddm_video_video_processor_input_view_read_after_write_hazard(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORINPUTVIEW hView,
+    D3D10DDI_HRESOURCE hResource) {
+    (void)hDevice; (void)hView; (void)hResource;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Content protection: not implemented, and not claimed                      */
+/* ------------------------------------------------------------------------- */
+
+static HRESULT APIENTRY virtio_wddm_video_get_content_protection_caps(
+    D3D10DDI_HDEVICE hDevice, CONST GUID *pCryptoType, CONST GUID *pDecodeProfile,
+    D3D11_1DDI_VIDEO_CONTENT_PROTECTION_CAPS *pCaps) {
+    (void)hDevice; (void)pCryptoType; (void)pDecodeProfile;
+    if (pCaps)
+        memset(pCaps, 0, sizeof(*pCaps));
+    return E_NOTIMPL;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_get_crypto_key_exchange_type(
+    D3D10DDI_HDEVICE hDevice, CONST GUID *pCryptoType, CONST GUID *pDecodeProfile,
+    UINT index, GUID *pKeyExchangeType) {
+    (void)hDevice; (void)pCryptoType; (void)pDecodeProfile; (void)index;
+    (void)pKeyExchangeType;
+    return E_NOTIMPL;
+}
+
+static SIZE_T APIENTRY virtio_wddm_video_calc_private_crypto_session_size(
+    D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATECRYPTOSESSION *pArgs) {
+    (void)hDevice; (void)pArgs;
+    return 0;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_create_crypto_session(
+    D3D10DDI_HDEVICE hDevice, CONST D3D11_1DDIARG_CREATECRYPTOSESSION *pArgs,
+    D3D11_1DDI_HCRYPTOSESSION hSession, D3D11_1DDI_HRTCRYPTOSESSION hRTSession) {
+    (void)hDevice; (void)pArgs; (void)hSession; (void)hRTSession;
+    return E_NOTIMPL;
+}
+
+static VOID APIENTRY virtio_wddm_video_destroy_crypto_session(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HCRYPTOSESSION hSession) {
+    (void)hDevice; (void)hSession;
+}
+
+static VOID APIENTRY virtio_wddm_video_get_certificate_size(
+    D3D10DDI_HDEVICE hDevice, CONST D3D11_1DDI_CERTIFICATE_INFO *pInfo,
+    UINT *pCertificateSize) {
+    (void)hDevice; (void)pInfo;
+    if (pCertificateSize)
+        *pCertificateSize = 0;
+}
+
+static VOID APIENTRY virtio_wddm_video_get_certificate(
+    D3D10DDI_HDEVICE hDevice, CONST D3D11_1DDI_CERTIFICATE_INFO *pInfo,
+    UINT certificate_size, BYTE *pCertificate) {
+    (void)hDevice; (void)pInfo; (void)certificate_size; (void)pCertificate;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_negotiate_crypto_session_key_exchange(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HCRYPTOSESSION hSession, UINT data_size,
+    BYTE *pData) {
+    (void)hDevice; (void)hSession; (void)data_size; (void)pData;
+    return E_NOTIMPL;
+}
+
+static VOID APIENTRY virtio_wddm_video_encryption_blt(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HCRYPTOSESSION hSession,
+    D3D10DDI_HRESOURCE hSrcResource, D3D10DDI_HRESOURCE hDstResource,
+    UINT iv_size, CONST VOID *pIV) {
+    (void)hDevice; (void)hSession; (void)hSrcResource; (void)hDstResource;
+    (void)iv_size; (void)pIV;
+}
+
+static VOID APIENTRY virtio_wddm_video_decryption_blt(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HCRYPTOSESSION hSession,
+    D3D10DDI_HRESOURCE hSrcResource, D3D10DDI_HRESOURCE hDstResource,
+    CONST D3D11_1DDI_ENCRYPTED_BLOCK_INFO *pBlockInfo, UINT content_key_size,
+    CONST VOID *pContentKey, UINT iv_size, CONST VOID *pIV) {
+    (void)hDevice; (void)hSession; (void)hSrcResource; (void)hDstResource;
+    (void)pBlockInfo; (void)content_key_size; (void)pContentKey; (void)iv_size; (void)pIV;
+}
+
+static VOID APIENTRY virtio_wddm_video_start_session_key_refresh(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HCRYPTOSESSION hSession,
+    UINT random_number_size, VOID *pRandomNumber) {
+    (void)hDevice; (void)hSession; (void)random_number_size; (void)pRandomNumber;
+}
+
+static VOID APIENTRY virtio_wddm_video_finish_session_key_refresh(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HCRYPTOSESSION hSession) {
+    (void)hDevice; (void)hSession;
+}
+
+static VOID APIENTRY virtio_wddm_video_get_encryption_blt_key(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HCRYPTOSESSION hSession,
+    UINT key_size, VOID *pReadbackKey) {
+    (void)hDevice; (void)hSession; (void)key_size; (void)pReadbackKey;
+}
+
+static SIZE_T APIENTRY virtio_wddm_video_calc_private_authenticated_channel_size(
+    D3D10DDI_HDEVICE hDevice,
+    const D3D11_1DDIARG_CREATEAUTHENTICATEDCHANNEL *pArgs) {
+    (void)hDevice; (void)pArgs;
+    return 0;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_create_authenticated_channel(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDIARG_CREATEAUTHENTICATEDCHANNEL *pArgs,
+    D3D11_1DDI_HAUTHCHANNEL hChannel, D3D11_1DDI_HRTAUTHCHANNEL hRTChannel) {
+    (void)hDevice; (void)pArgs; (void)hChannel; (void)hRTChannel;
+    return E_NOTIMPL;
+}
+
+static VOID APIENTRY virtio_wddm_video_destroy_authenticated_channel(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HAUTHCHANNEL hChannel) {
+    (void)hDevice; (void)hChannel;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_negotiate_authenticated_channel_key_exchange(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HAUTHCHANNEL hChannel, UINT data_size,
+    VOID *pData) {
+    (void)hDevice; (void)hChannel; (void)data_size; (void)pData;
+    return E_NOTIMPL;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_query_authenticated_channel(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HAUTHCHANNEL hChannel,
+    UINT input_data_size, CONST VOID *pInputData, UINT output_data_size,
+    VOID *pOutputData) {
+    (void)hDevice; (void)hChannel; (void)input_data_size; (void)pInputData;
+    (void)output_data_size; (void)pOutputData;
+    return E_NOTIMPL;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_configure_authenticated_channel(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HAUTHCHANNEL hChannel,
+    UINT input_data_size, CONST VOID *pInputData,
+    D3D11_1DDI_AUTHENTICATED_CONFIGURE_OUTPUT *pOutputData) {
+    (void)hDevice; (void)hChannel; (void)input_data_size; (void)pInputData;
+    (void)pOutputData;
+    return E_NOTIMPL;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_video_decoder_get_handle(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecode,
+    HANDLE *pContentProtectionHandle) {
+    (void)hDevice; (void)hDecode;
+    if (pContentProtectionHandle)
+        *pContentProtectionHandle = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_crypto_session_get_handle(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HCRYPTOSESSION hSession, HANDLE *pHandle) {
+    (void)hDevice; (void)hSession;
+    if (pHandle)
+        *pHandle = NULL;
+    return E_NOTIMPL;
+}
+
+static VOID APIENTRY virtio_wddm_video_get_capture_handle(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_GETCAPTUREHANDLEDATA *pHandleData) {
+    (void)hDevice;
+    if (pHandleData) {
+        pHandleData->hAllocation = 0;
+        pHandleData->DataOffset = 0;
+        pHandleData->DataSize = 0;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Table population                                                          */
+/* ------------------------------------------------------------------------- */
+
+/* The 11.1 table, in WDK order. Kept as one list because the same entries have
+ * to land in the 11.1, 2.0 and 2.1 tables, which all start with these 81
+ * pointers in this order (2.0 adds 13, 2.1 adds 15 more after them). */
+#define VIRTIO_WDDM_VIDEO_FUNCS(X) \
+    X(pfnGetVideoDecoderProfileCount, virtio_wddm_video_get_video_decoder_profile_count) \
+    X(pfnGetVideoDecoderProfile, virtio_wddm_video_get_video_decoder_profile) \
+    X(pfnCheckVideoDecoderFormat, virtio_wddm_video_check_video_decoder_format) \
+    X(pfnGetVideoDecoderConfigCount, virtio_wddm_video_get_video_decoder_config_count) \
+    X(pfnGetVideoDecoderConfig, virtio_wddm_video_get_video_decoder_config) \
+    X(pfnGetVideoDecoderBufferTypeCount, virtio_wddm_video_get_video_decoder_buffer_type_count) \
+    X(pfnGetVideoDecoderBufferInfo, virtio_wddm_video_get_video_decoder_buffer_info) \
+    X(pfnCalcPrivateVideoDecoderSize, virtio_wddm_video_calc_private_video_decoder_size) \
+    X(pfnCreateVideoDecoder, virtio_wddm_video_create_video_decoder) \
+    X(pfnDestroyVideoDecoder, virtio_wddm_video_destroy_video_decoder) \
+    X(pfnVideoDecoderExtension, virtio_wddm_video_video_decoder_extension) \
+    X(pfnVideoDecoderBeginFrame, virtio_wddm_video_video_decoder_begin_frame) \
+    X(pfnVideoDecoderEndFrame, virtio_wddm_video_video_decoder_end_frame) \
+    X(pfnVideoDecoderSubmitBuffers, virtio_wddm_video_video_decoder_submit_buffers) \
+    X(pfnCalcPrivateVideoProcessorEnumSize, virtio_wddm_video_calc_private_video_processor_enum_size) \
+    X(pfnCreateVideoProcessorEnum, virtio_wddm_video_create_video_processor_enum) \
+    X(pfnDestroyVideoProcessorEnum, virtio_wddm_video_destroy_video_processor_enum) \
+    X(pfnCheckVideoProcessorFormat, virtio_wddm_video_check_video_processor_format) \
+    X(pfnGetVideoProcessorCaps, virtio_wddm_video_get_video_processor_caps) \
+    X(pfnGetVideoProcessorRateConversionCaps, virtio_wddm_video_get_video_processor_rate_conversion_caps) \
+    X(pfnGetVideoProcessorCustomRate, virtio_wddm_video_get_video_processor_custom_rate) \
+    X(pfnGetVideoProcessorFilterRange, virtio_wddm_video_get_video_processor_filter_range) \
+    X(pfnCalcPrivateVideoProcessorSize, virtio_wddm_video_calc_private_video_processor_size) \
+    X(pfnCreateVideoProcessor, virtio_wddm_video_create_video_processor) \
+    X(pfnDestroyVideoProcessor, virtio_wddm_video_destroy_video_processor) \
+    X(pfnVideoProcessorSetOutputTargetRect, virtio_wddm_video_set_output_target_rect) \
+    X(pfnVideoProcessorSetOutputBackgroundColor, virtio_wddm_video_set_output_background_color) \
+    X(pfnVideoProcessorSetOutputColorSpace, virtio_wddm_video_set_output_color_space) \
+    X(pfnVideoProcessorSetOutputAlphaFillMode, virtio_wddm_video_set_output_alpha_fill_mode) \
+    X(pfnVideoProcessorSetOutputConstriction, virtio_wddm_video_set_output_constriction) \
+    X(pfnVideoProcessorSetOutputStereoMode, virtio_wddm_video_set_output_stereo_mode) \
+    X(pfnVideoProcessorSetOutputExtension, virtio_wddm_video_set_output_extension) \
+    X(pfnVideoProcessorGetOutputExtension, virtio_wddm_video_get_output_extension) \
+    X(pfnVideoProcessorSetStreamFrameFormat, virtio_wddm_video_set_stream_frame_format) \
+    X(pfnVideoProcessorSetStreamColorSpace, virtio_wddm_video_set_stream_color_space) \
+    X(pfnVideoProcessorSetStreamOutputRate, virtio_wddm_video_set_stream_output_rate) \
+    X(pfnVideoProcessorSetStreamSourceRect, virtio_wddm_video_set_stream_source_rect) \
+    X(pfnVideoProcessorSetStreamDestRect, virtio_wddm_video_set_stream_dest_rect) \
+    X(pfnVideoProcessorSetStreamAlpha, virtio_wddm_video_set_stream_alpha) \
+    X(pfnVideoProcessorSetStreamPalette, virtio_wddm_video_set_stream_palette) \
+    X(pfnVideoProcessorSetStreamPixelAspectRatio, virtio_wddm_video_set_stream_pixel_aspect_ratio) \
+    X(pfnVideoProcessorSetStreamLumaKey, virtio_wddm_video_set_stream_luma_key) \
+    X(pfnVideoProcessorSetStreamStereoFormat, virtio_wddm_video_set_stream_stereo_format) \
+    X(pfnVideoProcessorSetStreamAutoProcessingMode, virtio_wddm_video_set_stream_auto_processing_mode) \
+    X(pfnVideoProcessorSetStreamFilter, virtio_wddm_video_set_stream_filter) \
+    X(pfnVideoProcessorSetStreamExtension, virtio_wddm_video_set_stream_extension) \
+    X(pfnVideoProcessorGetStreamExtension, virtio_wddm_video_get_stream_extension) \
+    X(pfnVideoProcessorBlt, virtio_wddm_video_video_processor_blt) \
+    X(pfnCalcPrivateVideoDecoderOutputViewSize, virtio_wddm_video_calc_private_video_decoder_output_view_size) \
+    X(pfnCreateVideoDecoderOutputView, virtio_wddm_video_create_video_decoder_output_view) \
+    X(pfnDestroyVideoDecoderOutputView, virtio_wddm_video_destroy_video_decoder_output_view) \
+    X(pfnCalcPrivateVideoProcessorInputViewSize, virtio_wddm_video_calc_private_video_processor_input_view_size) \
+    X(pfnCreateVideoProcessorInputView, virtio_wddm_video_create_video_processor_input_view) \
+    X(pfnDestroyVideoProcessorInputView, virtio_wddm_video_destroy_video_processor_input_view) \
+    X(pfnCalcPrivateVideoProcessorOutputViewSize, virtio_wddm_video_calc_private_video_processor_output_view_size) \
+    X(pfnCreateVideoProcessorOutputView, virtio_wddm_video_create_video_processor_output_view) \
+    X(pfnDestroyVideoProcessorOutputView, virtio_wddm_video_destroy_video_processor_output_view) \
+    X(pfnVideoProcessorInputViewReadAfterWriteHazard, virtio_wddm_video_video_processor_input_view_read_after_write_hazard) \
+    X(pfnGetContentProtectionCaps, virtio_wddm_video_get_content_protection_caps) \
+    X(pfnGetCryptoKeyExchangeType, virtio_wddm_video_get_crypto_key_exchange_type) \
+    X(pfnCalcPrivateCryptoSessionSize, virtio_wddm_video_calc_private_crypto_session_size) \
+    X(pfnCreateCryptoSession, virtio_wddm_video_create_crypto_session) \
+    X(pfnDestroyCryptoSession, virtio_wddm_video_destroy_crypto_session) \
+    X(pfnGetCertificateSize, virtio_wddm_video_get_certificate_size) \
+    X(pfnGetCertificate, virtio_wddm_video_get_certificate) \
+    X(pfnNegotiateCryptoSessionKeyExchange, virtio_wddm_video_negotiate_crypto_session_key_exchange) \
+    X(pfnEncryptionBlt, virtio_wddm_video_encryption_blt) \
+    X(pfnDecryptionBlt, virtio_wddm_video_decryption_blt) \
+    X(pfnStartSessionKeyRefresh, virtio_wddm_video_start_session_key_refresh) \
+    X(pfnFinishSessionKeyRefresh, virtio_wddm_video_finish_session_key_refresh) \
+    X(pfnGetEncryptionBltKey, virtio_wddm_video_get_encryption_blt_key) \
+    X(pfnCalcPrivateAuthenticatedChannelSize, virtio_wddm_video_calc_private_authenticated_channel_size) \
+    X(pfnCreateAuthenticatedChannel, virtio_wddm_video_create_authenticated_channel) \
+    X(pfnDestroyAuthenticatedChannel, virtio_wddm_video_destroy_authenticated_channel) \
+    X(pfnNegotiateAuthenticatedChannelKeyExchange, virtio_wddm_video_negotiate_authenticated_channel_key_exchange) \
+    X(pfnQueryAuthenticatedChannel, virtio_wddm_video_query_authenticated_channel) \
+    X(pfnConfigureAuthenticatedChannel, virtio_wddm_video_configure_authenticated_channel) \
+    X(pfnVideoDecoderGetHandle, virtio_wddm_video_video_decoder_get_handle) \
+    X(pfnCryptoSessionGetHandle, virtio_wddm_video_crypto_session_get_handle) \
+    X(pfnVideoProcessorSetStreamRotation, virtio_wddm_video_set_stream_rotation) \
+    X(pfnGetCaptureHandle, virtio_wddm_video_get_capture_handle)
+
+/* Catch-all for the entries WDDM2.0/2.1 append after the 11.1 block. Never
+ * reads its arguments, so it is safe to place in slots whose exact prototype it
+ * does not have: those are decoder sub-sample mapping, crypto-session status,
+ * HDR metadata and mirroring, none of which M1 implements. */
+typedef HRESULT (APIENTRY *VIRTIO_WDDM_UnimplementedFunc)(void);
+
+static HRESULT APIENTRY virtio_wddm_video_unimplemented(void) {
+    return E_NOTIMPL;
+}
+
+/* `table` is the runtime's copy of one of the video tables, `table_size` its
+ * sizeof(). The 11.1 table is a prefix of the 2.0 and 2.1 tables (same members,
+ * same order: d3d10umddi.h:3959-4039 vs 4299-4379 and 4435-...), so filling the
+ * 11.1 view and stubbing the 2.0/2.1-only tail covers all three. */
+static void fill_video_table(D3D11_1DDI_VIDEODEVICEFUNCS *table, SIZE_T table_size) {
+    D3D11_1DDI_VIDEODEVICEFUNCS *view = table;
+#define ASSIGN(name, func) view->name = func;
+    VIRTIO_WDDM_VIDEO_FUNCS(ASSIGN)
+#undef ASSIGN
+
+    const SIZE_T prefix = sizeof(D3D11_1DDI_VIDEODEVICEFUNCS);
+    if (table_size <= prefix)
+        return;
+
+    const SIZE_T slots = (table_size - prefix) / sizeof(VIRTIO_WDDM_UnimplementedFunc);
+    VIRTIO_WDDM_UnimplementedFunc *tail =
+        (VIRTIO_WDDM_UnimplementedFunc *)((char *)table + prefix);
+    for (SIZE_T i = 0; i < slots; i++)
+        tail[i] = virtio_wddm_video_unimplemented;
+}
+
+/* PFND3D10DDI_RETRIEVESUBOBJECT (d3d10umddi.h:7097). The runtime calls *this*,
+ * not the other way round: CreateDevice's ppfnRetrieveSubObject is an output
+ * slot the driver stores its callback in, and the call happens later, when an
+ * application first asks for ID3D11VideoDevice. SubDeviceID identifies the table
+ * version, so the ID the runtime passes is authoritative.
+ *
+ * Parameter shapes (d3d10umddi.h:4042 / 4397 / 4537): pParams is an input
+ * struct { BOOL Relocate; VIDEODEVICEFUNCS *p...VideoDeviceFuncs; } whose
+ * pointer member addresses the table the runtime allocated and wants filled
+ * (Relocate is TRUE when the runtime moved that table and wants it rewritten).
+ * The matching OUTPUT struct is a lone "UINT8 Reserved" placeholder, which is
+ * why the table normally cannot travel through pOutputParamsBuffer; that buffer
+ * is still honoured if a runtime passes one large enough, and both are filled
+ * when both are usable. */
+static HRESULT APIENTRY virtio_wddm_retrieve_subobject(
+    D3D10DDI_HDEVICE hDevice,
+    UINT32 SubDeviceID,
+    SIZE_T ParamSize,
+    void *pParams,
+    SIZE_T OutputParamSize,
+    void *pOutputParamsBuffer) {
+    (void)hDevice;
+
+    SIZE_T need;
+    switch (SubDeviceID) {
+    case D3D11_1DDI_VIDEO_FUNCTIONS:
+        need = sizeof(D3D11_1DDI_VIDEODEVICEFUNCS);
+        break;
+    case D3DWDDM2_0DDI_VIDEO_FUNCTIONS:
+        need = sizeof(D3DWDDM2_0DDI_VIDEODEVICEFUNCS);
+        break;
+    case D3DWDDM2_1DDI_VIDEO_FUNCTIONS:
+        need = sizeof(D3DWDDM2_1DDI_VIDEODEVICEFUNCS);
+        break;
+    default:
+        /* 6/7 are the WDDM2.4 tables, which M1 does not implement: fail the
+         * request explicitly instead of handing back a table that would be read
+         * through the wrong layout. */
+        ERROR("%s: RetrieveSubObject(id=%u) is not a table we implement -> E_INVALIDARG",
+              __FUNCTION__, SubDeviceID);
+        return E_INVALIDARG;
+    }
+
+    /* The 2.0 / 2.1 inputs have the same two members in the same order as the
+     * 11.1 one, so this view reads all three correctly. */
+    D3D11_1DDI_VIDEO_INPUT *in = (D3D11_1DDI_VIDEO_INPUT *)pParams;
+    D3D11_1DDI_VIDEODEVICEFUNCS *table = NULL;
+    const char *via = "none";
+    BOOL relocate = FALSE;
+
+    if (pOutputParamsBuffer && OutputParamSize >= need) {
+        fill_video_table((D3D11_1DDI_VIDEODEVICEFUNCS *)pOutputParamsBuffer, need);
+        table = (D3D11_1DDI_VIDEODEVICEFUNCS *)pOutputParamsBuffer;
+        via = "output";
+    }
+    if (in && ParamSize >= sizeof(*in) && in->p11VideoDeviceFuncs) {
+        fill_video_table((D3D11_1DDI_VIDEODEVICEFUNCS *)in->p11VideoDeviceFuncs, need);
+        if (table) {
+            via = "output+input";
+        } else {
+            table = (D3D11_1DDI_VIDEODEVICEFUNCS *)in->p11VideoDeviceFuncs;
+            via = "input";
+        }
+        relocate = in->Relocate;
+    }
+
+    if (!table) {
+        ERROR("%s: RetrieveSubObject(id=%u) supplied no table buffer "
+              "(params=%p/%zu, output=%p/%zu) -> E_INVALIDARG",
+              __FUNCTION__, SubDeviceID, pParams, (size_t)ParamSize,
+              pOutputParamsBuffer, (size_t)OutputParamSize);
+        return E_INVALIDARG;
+    }
+
+    INFO("%s: RetrieveSubObject(id=%u) -> table=%p size=%zu via=%s relocate=%d",
+         __FUNCTION__, SubDeviceID, (void *)table, (size_t)need, via, (int)relocate);
+    INFO("%s: video DDI installed (id=%u size=%zu): decoder=none, "
+         "processor=input NV12/YUY2 -> output BGRA8, blit=DXVK video processor "
+         "(YCbCr->RGB + scale)", __FUNCTION__, SubDeviceID, (size_t)need);
+    return S_OK;
+}
+
+void virtio_wddm_fill_video_funcs(D3D10DDIARG_CREATEDEVICE *pArgs) {
+    switch (pArgs->Interface) {
+    case D3D11_0_DDI_INTERFACE_VERSION:
+        /* The video DDI arrived with 11.1; a 11.0 device has no video table. */
+        return;
+    case D3D11_1_DDI_INTERFACE_VERSION:
+    case D3DWDDM1_3_DDI_INTERFACE_VERSION:
+        /* D3DWDDM1.3 has no video table of its own in the WDK (there is no
+         * D3DWDDM1_3DDI_VIDEODEVICEFUNCS), it reuses the 11.1 one. */
+    case D3DWDDM2_0_DDI_INTERFACE_VERSION:
+    case D3DWDDM2_1_DDI_INTERFACE_VERSION:
+        break;
+    default:
+        /* 2.2 and later use their own video tables (sub-object 6/7) that M1
+         * does not fill. Say so instead of registering a callback that could
+         * only return E_INVALIDARG. */
+        INFO("%s: interface 0x%x has no video table in M1 (skipped)",
+             __FUNCTION__, pArgs->Interface);
+        return;
+    }
+
+    /* CreateDevice only has to store the function: *ppfn is the runtime's
+     * output slot and is NULL before the call. M1/M2 tested *ppfn here, which
+     * therefore always bailed out -- the video table was never reachable. */
+    if (!pArgs->ppfnRetrieveSubObject) {
+        INFO("%s: runtime passed no ppfnRetrieveSubObject slot; video DDI unavailable",
+             __FUNCTION__);
+        return;
+    }
+    *pArgs->ppfnRetrieveSubObject = virtio_wddm_retrieve_subobject;
+    INFO("%s: video RetrieveSubObject registered (fn=%p); tables for id=2/3/5",
+         __FUNCTION__, (void *)virtio_wddm_retrieve_subobject);
+}
