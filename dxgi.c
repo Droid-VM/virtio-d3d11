@@ -8,6 +8,7 @@
 
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #undef ERROR
 #include "adapter.h"
@@ -38,8 +39,86 @@ virtio_wddm_present() {
 }
 */
 
-static HRESULT virtio_wddm_sync_with_present_context(VIRTIO_WDDM_Device *device) {
+/* P3-5: present-path accounting.
+ *
+ * A present used to be an opaque 100-150 ms during a seek drag (E145 measured
+ * 8.8 presents/s while the decoder kept producing 24-30 frames/s) and nothing
+ * inside it was timed.  Everything below is QPC only: no allocation, no
+ * syscall, so enabling it does not perturb what it measures.  The log line in
+ * virtio_wddm_present splits one present into
+ *
+ *     flush   = Signal + ID3D11DeviceContext1_Flush (submit our own commands)
+ *     fence   = SetEventOnCompletion + WaitForSingleObject (wait for the GPU)
+ *     cb      = pfnPresentCb (the KMD/host present)
+ *     amort   = tritonPerformAmortizedProcessing (resource retirement)
+ *
+ * and the EndFrame line in d3d11_video.c splits the decode side into
+ * send/get/upload, so a frame's whole cost is accounted for. */
+static LONGLONG present_qpc_freq(void) {
+    static LONGLONG freq = 0;
+    if (freq == 0) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        freq = f.QuadPart ? f.QuadPart : 1;
+    }
+    return freq;
+}
+
+static LONGLONG present_qpc_now(void) {
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return c.QuadPart;
+}
+
+static double present_qpc_ms(LONGLONG start, LONGLONG end) {
+    return (double) (end - start) * 1000.0 / (double) present_qpc_freq();
+}
+
+/* How far behind the newest fence a present is allowed to wait, and for how
+ * long.  Defaults reproduce the pre-P3-5 behaviour exactly (wait for our own
+ * fence, 10 s cap); the drag experiments override them per process so a single
+ * build can measure "present blocks on its own frame" against "present only
+ * orders itself behind older work" back to back.
+ *
+ *   VIRTIO_WDDM_PRESENT_LAG      older fence values to wait for (default 0)
+ *   VIRTIO_WDDM_PRESENT_WAIT_MS  upper bound on that wait (default 10000) */
+static void present_wait_policy(uint64_t *lag, DWORD *budget_ms) {
+    static uint64_t cached_lag;
+    static DWORD cached_budget;
+    static LONG cached = 0;
+
+    if (cached == 0) {
+        char text[32] = {0};
+        uint64_t lag_value = 0;
+        DWORD budget = 10000;
+
+        if (GetEnvironmentVariableA("VIRTIO_WDDM_PRESENT_LAG", text, sizeof(text)) > 0)
+            lag_value = (uint64_t) _strtoui64(text, NULL, 10);
+        if (GetEnvironmentVariableA("VIRTIO_WDDM_PRESENT_WAIT_MS", text, sizeof(text)) > 0) {
+            unsigned long value = strtoul(text, NULL, 10);
+            if (value > 0 && value <= 600000ul)
+                budget = (DWORD) value;
+        }
+        cached_lag = lag_value;
+        cached_budget = budget;
+        InterlockedExchange(&cached, 1);
+        INFO("%s: present wait policy lag=%llu wait_ms=%lu%s", __FUNCTION__,
+             (unsigned long long) lag_value, (unsigned long) budget,
+             lag_value ? " (fence used for ordering only)" : " (wait for own fence)");
+    }
+    *lag = cached_lag;
+    *budget_ms = cached_budget;
+}
+
+static HRESULT virtio_wddm_sync_with_present_context(VIRTIO_WDDM_Device *device,
+                                                    double *out_flush_ms,
+                                                    double *out_fence_ms,
+                                                    BOOL *out_fence_pending) {
+    LONGLONG t_signal = present_qpc_now();
     uint64_t value = atomic_fetch_add_explicit((volatile _Atomic uint64_t *) &device->base.presentFenceValue, 1, memory_order_acq_rel);
+
+    if (out_fence_pending)
+        *out_fence_pending = FALSE;
 
     HRESULT hr = ID3D11DeviceContext4_Signal(device->base.pCtx4, device->base.pPresentFence, value);
     if (FAILED(hr)) {
@@ -47,19 +126,52 @@ static HRESULT virtio_wddm_sync_with_present_context(VIRTIO_WDDM_Device *device)
         return hr;
     }
     ID3D11DeviceContext1_Flush(device->base.pCtx1);
+    LONGLONG t_flushed = present_qpc_now();
 
-    HANDLE event = CreateEventA(NULL, TRUE, FALSE, NULL);
-    if (!event)
-        return HRESULT_FROM_WIN32(GetLastError());
-    hr = ID3D11Fence_SetEventOnCompletion(device->base.pPresentFence, value, event);
-    if (FAILED(hr)) {
+    /* The fence is what orders the KMD present (a different context/queue) after
+     * the Turnip/virtio-gpu work this UMD just submitted.  Waiting for `value`
+     * means waiting for *this* frame, which serialises present with the whole
+     * decode+upload queue in front of it; waiting for `value - lag` only keeps
+     * the queue from growing without bound. */
+    uint64_t lag = 0;
+    DWORD budget_ms = 10000;
+    present_wait_policy(&lag, &budget_ms);
+    uint64_t target = value > lag ? value - lag : 0;
+
+    HANDLE event = NULL;
+    DWORD wait = WAIT_OBJECT_0;
+    if (target != 0) {
+        event = CreateEventA(NULL, TRUE, FALSE, NULL);
+        if (!event)
+            return HRESULT_FROM_WIN32(GetLastError());
+        hr = ID3D11Fence_SetEventOnCompletion(device->base.pPresentFence, target, event);
+        if (FAILED(hr)) {
+            CloseHandle(event);
+            ERROR("%s: Failed to arm D3D11 fence event: 0x%08lx", __FUNCTION__, hr);
+            return hr;
+        }
+        wait = WaitForSingleObject(event, budget_ms);
         CloseHandle(event);
-        ERROR("%s: Failed to arm D3D11 fence event: 0x%08lx", __FUNCTION__, hr);
-        return hr;
     }
-    DWORD wait = WaitForSingleObject(event, 10000);
-    CloseHandle(event);
+    LONGLONG t_waited = present_qpc_now();
+
+    if (out_flush_ms)
+        *out_flush_ms = present_qpc_ms(t_signal, t_flushed);
+    if (out_fence_ms)
+        *out_fence_ms = present_qpc_ms(t_flushed, t_waited);
+
     if (wait != WAIT_OBJECT_0) {
+        /* P3-5: a bounded wait is not an error.  The present is still ordered
+         * behind the Signal above; only the CPU refuses to block past the
+         * budget, and the next present (which waits for a later fence value)
+         * catches the queue up.  The legacy policy (lag 0, 10 s cap) keeps its
+         * old failure behaviour so nothing changes unless it is opted into. */
+        device->present.fence_timeouts++;
+        if (lag != 0 || budget_ms < 10000) {
+            if (out_fence_pending)
+                *out_fence_pending = TRUE;
+            return S_OK;
+        }
         ERROR("%s: Timed out waiting for D3D11 fence: %lu", __FUNCTION__, wait);
         return E_FAIL;
     }
@@ -67,13 +179,19 @@ static HRESULT virtio_wddm_sync_with_present_context(VIRTIO_WDDM_Device *device)
 }
 
 HRESULT APIENTRY virtio_wddm_present(DXGI_DDI_ARG_PRESENT *pArgs) {
+    LONGLONG t_entry = present_qpc_now();
     TRACE();
     VIRTIO_WDDM_Device *device = (void *) pArgs->hDevice;
     VIRTIO_WDDM_Resource *src = (void *) pArgs->hSurfaceToPresent;
     HRESULT hr = S_OK;
+    double flush_ms = 0.0;
+    double fence_ms = 0.0;
+    double cb_ms = 0.0;
+    double amort_ms = 0.0;
+    BOOL fence_pending = FALSE;
 
     VERBOSE("present detail: src=%p kmalloc=0x%08x dst=0x%08x flags=0x%08x fence=%llu", src,
-         src ? src->base.hKMAllocation : 0, pArgs->hDstResource,
+         src ? src->base.hKMAllocation : 0, (unsigned) pArgs->hDstResource,
          pArgs->Flags.Value, (unsigned long long)device->base.presentFenceValue);
 
     // Looks like Blt could be zero for primaries
@@ -87,7 +205,8 @@ HRESULT APIENTRY virtio_wddm_present(DXGI_DDI_ARG_PRESENT *pArgs) {
         virtio_wddm_save_texture_to_ppm(device, src, name);
     }
 
-    hr = virtio_wddm_sync_with_present_context(device);
+    hr = virtio_wddm_sync_with_present_context(device, &flush_ms, &fence_ms, &fence_pending);
+    LONGLONG t_synced = present_qpc_now();
     VERBOSE("present sync result: hr=0x%08lx fence=%llu", hr,
          (unsigned long long)device->base.presentFenceValue);
     if (FAILED(hr)) {
@@ -102,6 +221,8 @@ HRESULT APIENTRY virtio_wddm_present(DXGI_DDI_ARG_PRESENT *pArgs) {
         .hContext = device->present.context,
     };
     hr = device->dxgi_callbacks->pfnPresentCb(device->base.hRTDevice.handle, &present);
+    LONGLONG t_presented = present_qpc_now();
+    cb_ms = present_qpc_ms(t_synced, t_presented);
     VERBOSE("present callback result: hr=0x%08lx src_km=0x%08x ctx=%p", hr,
          present.hSrcAllocation, present.hContext);
     if (FAILED(hr)) {
@@ -112,7 +233,19 @@ HRESULT APIENTRY virtio_wddm_present(DXGI_DDI_ARG_PRESENT *pArgs) {
     /* Present flushes the internal context directly, without entering the
      * Flush DDI. Let the D3D11 runtime retire released resources here too,
      * before it refreshes bindings for the next frame. */
+    LONGLONG t_before_amort = present_qpc_now();
     tritonPerformAmortizedProcessing(&device->base);
+    LONGLONG t_done = present_qpc_now();
+    amort_ms = present_qpc_ms(t_before_amort, t_done);
+
+    device->present.count++;
+    INFO("present #%llu t=%lld: flush=%.3f fence=%.3f cb=%.3f amort=%.3f sync=%.3f total=%.3f ms "
+         "(fence=%llu lag_pending=%d timeouts=%llu src_km=0x%x)",
+         (unsigned long long) device->present.count, (long long) t_entry,
+         flush_ms, fence_ms, cb_ms, amort_ms,
+         present_qpc_ms(t_entry, t_synced), present_qpc_ms(t_entry, t_done),
+         (unsigned long long) device->base.presentFenceValue, (int) fence_pending,
+         (unsigned long long) device->present.fence_timeouts, src->base.hKMAllocation);
 
     return S_OK;
 }
@@ -313,11 +446,21 @@ HRESULT APIENTRY virtio_wddm_blt1(DXGI_DDI_ARG_BLT1 *pArgs) {
     }
 
     if (pArgs->Flags.Present) {
-        HRESULT hr = virtio_wddm_sync_with_present_context(device);
+        double flush_ms = 0.0;
+        double fence_ms = 0.0;
+        BOOL fence_pending = FALSE;
+        LONGLONG t_present = present_qpc_now();
+        HRESULT hr = virtio_wddm_sync_with_present_context(device, &flush_ms, &fence_ms,
+                                                           &fence_pending);
         if (FAILED(hr)) {
             ERROR("%s: Failed to flush: 0x%08lx", __FUNCTION__, hr);
             return hr;
         }
+        device->present.blt_presents++;
+        INFO("blt1 #%llu (Present flag): flush=%.3f fence=%.3f total=%.3f ms "
+             "(fence=%llu lag_pending=%d)", (unsigned long long) device->present.blt_presents,
+             flush_ms, fence_ms, present_qpc_ms(t_present, present_qpc_now()),
+             (unsigned long long) device->base.presentFenceValue, (int) fence_pending);
     }
 
     return S_OK;

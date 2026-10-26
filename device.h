@@ -41,6 +41,13 @@ typedef struct {
 
     struct {
         HANDLE context;
+        /* P3-5: present-path counters.  count / blt_presents tell which DDI the
+         * application actually presents through (a seek drag is diagnosed from
+         * that, and a zero count means the stall is not in this DDI at all);
+         * fence_timeouts counts bounded waits that gave up. */
+        UINT64 count;
+        UINT64 blt_presents;
+        UINT64 fence_timeouts;
     } present;
 
     /* Kept alive for the lifetime of the instance: vkCreateInstance chains it

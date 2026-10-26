@@ -47,7 +47,14 @@ clean:
 
 DXVK_LIBS=$(BUILD_DIR)/dxvk-d3d11.a $(BUILD_DIR)/dxvk-dxgi.a $(BUILD_DIR)/dxvk.a
 
-UMD_DLL_OBJS=$(addprefix $(BUILD_DIR)/,adapter.o device.o dxgi.o resource.o vk_bootstrap.o dxvk.o)
+UMD_DLL_OBJS=$(addprefix $(BUILD_DIR)/,adapter.o d3d11_video.o d3d11_video_dxvk.o device.o dxgi.o resource.o vk_bootstrap.o dxvk.o vmedia_client.o)
+
+# P2-2a: the virtio-media client is compiled into the UMD, not linked as
+# vmedia_client.dll. VMEDIA_CLIENT_STATIC keeps its vm_* symbols out of the
+# export table (which stays OpenAdapter10_2-only), avoids a runtime DLL
+# dependency for every D3D11 process on the system, and makes the declarations
+# in d3d11_video.c plain C instead of dllimport (there is no import library).
+$(BUILD_DIR)/vmedia_client.o $(BUILD_DIR)/d3d11_video.o: CFLAGS += -DVMEDIA_CLIENT_STATIC
 
 $(BUILD_DIR)/$(UMD_NAME).dll: $(UMD_DLL_OBJS) $(UMD_NAME).def $(DXVK_LIBS) $(BUILD_DIR)/triton.a | $(BUILD_DIR)
 	$(CXX) $(CFLAGS) -shared -o $@ $(UMD_DLL_OBJS) $(DXVK_LIBS) $(BUILD_DIR)/triton.a -Wl,$(UMD_NAME).def $(LDFLAGS)

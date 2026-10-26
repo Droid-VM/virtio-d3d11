@@ -1,10 +1,15 @@
 # Windows on ARM: 32-bit D3D10/11 and OpenGL
 
-Build with `bash win3d/virtio-d3d11/x86/build.sh`. This uses llvm-mingw's
-`i686-w64-mingw32` target, separate build directories, and the Mesa x86
-cross-file shared with `virtio-d3d12/x86`. The top-level `build_opengl.sh`
-accepts `ARCH=x86`. The existing x86 D3D12/Turnip/loader chain must also be
-present in the base package; build it with `virtio-d3d12/x86/build.sh` if needed.
+Build with `bash win3d/build.sh d3d11 opengl --arch x86`. This uses llvm-mingw's
+`i686-w64-mingw32` target, separate build directories, and `win3d/mesa` with the
+Mesa x86 cross-file shared with `virtio-d3d12/x86`. Build the accompanying
+D3D12/Turnip/loader chain with `bash win3d/build.sh d3d12 turnip loader --arch x86`.
+The old x86 build entry points forward to this unified builder.
+
+For a base package that already declares the x86 files, append `--package` to
+the unified build command to replace only the selected architectures and sign
+the complete package. The manual helper below is for introducing x86 entries
+into an older base package.
 
 Create a new uninstalled package with `new-gpu-driver.sh --no-sign --no-zip
 --allow-unchanged`, then run:
