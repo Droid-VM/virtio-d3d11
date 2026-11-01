@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright 2026 Turing Software LLC
  * SPDX-License-Identifier: MIT
  *
@@ -16,6 +16,7 @@
 
 #ifndef TRITON_BUILD_COMMON_TRANSLATION_LAYER
 #include "npt_common.h"
+#include "../../../../../../include/context_protection.h"
 /* npt_log for the DestroyDevice drain timeout: unbuffered WriteFile, so the
  * report survives a run with no debugger attached and output redirected. */
 #include "tritonPresent.h"
@@ -916,6 +917,18 @@ static HRESULT APIENTRY tritonCreateDevice(D3D10DDI_HADAPTER hAdapter,
         if (raw_dev) ID3D11Device_Release(raw_dev);
         if (raw_ctx) ID3D11DeviceContext_Release(raw_ctx);
         return FAILED(hr) ? hr : E_FAIL;
+    }
+    /* Independent Neptune build only; the common UMD excludes this factory.
+     * Apply the same always-on policy before publishing pDev/pCtx aliases. */
+    ContextProtectionState protection;
+    hr = protect_internal_context(raw_ctx, &protection);
+    TR_LOG("internal context protection QI=0x%08lx before=%d previous=%d after=%d hr=0x%08lx",
+           protection.query_hr, protection.before, protection.previous, protection.after, hr);
+    if (FAILED(hr)) {
+        TR_LOG("CreateDevice: required context protection failed 0x%08lx", hr);
+        ID3D11DeviceContext_Release(raw_ctx);
+        ID3D11Device_Release(raw_dev);
+        return hr;
     }
     hr = ID3D11Device_QueryInterface(raw_dev, &IID_ID3D11Device1,
                                      (void **)&p->pDev1);

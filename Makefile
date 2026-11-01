@@ -10,7 +10,14 @@ OBJCOPY=$(PREFIX)-objcopy
 STRIP=$(PREFIX)-strip
 
 INCLUDES=$(BUILD_DIR) include/winddk include
-DEFINES=VK_USE_PLATFORM_WIN32_KHR
+# SERIAL (2026-10-25): 0 = one EndFrame runs send -> fetch -> upload on the DDI
+# thread (the P4-13 behaviour, default), 1 = the two-stage pipeline of
+# 04-测试记录/10-流水线.md.  The pipeline source stays in the tree either way;
+# this only selects which path DecoderEndFrame takes.  The runtime
+# VIRTIO_WDDM_PIPELINE environment variable can still opt out of a 1 build, but
+# it can no longer opt INTO a 0 build.
+VIRTIO_WDDM_PIPELINE?=0
+DEFINES=VK_USE_PLATFORM_WIN32_KHR VIRTIO_WDDM_PIPELINE=$(VIRTIO_WDDM_PIPELINE)
 LIBS=version gdi32
 CFLAGS=-std=gnu23 -O2 -fpic -ffunction-sections -fdata-sections -g -MMD -MP $(LTO) -ffile-prefix-map=$(PWD)=./
 CXXFLAGS=-std=gnu++17

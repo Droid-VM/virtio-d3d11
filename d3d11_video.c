@@ -1,3 +1,5 @@
+#include "media_life_state.h"
+#include "media_admission.h"
 /* D3D11 video DDI: decoder decode + processor blit.
  *
  * What this file does:
@@ -110,6 +112,28 @@
  * headers and only the tile payloads, so the host (stateful) decoder gets the
  * OBU stream rebuilt here. */
 #include "av1_params.h"
+/* AV1 STATEFUL PORT (2026-10-27): the DPB + one-frame lookahead builder (port of
+ * libva-v4l2 src/stateful/av1_bitstream.cc).  Everything the AV1 EndFrame path
+ * needs -- submit returning 0..N temporal units, the exact refresh mask derived
+ * from the NEXT picture's reference map, and flush() -- lives there. */
+#include "av1_dpb.h"
+
+/* AV1 STATEFUL PORT (2026-10-27): build switch for the OLD composition path.
+ *
+ *   0 (default) -- av1_dpb.h drives the AV1 EndFrame path: DPB mirror with slot
+ *                  textures, exact refresh masks derived from the next picture's
+ *                  reference map, reference remap, choose_refresh_flags, and a
+ *                  submit() that may return 0..N temporal units.
+ *   1           -- the previous code path (the ad-hoc av1_prev_* deferral that
+ *                  round 28 measured), kept as the fallback: build with
+ *                  `make VIRTIO_WDDM_AV1_LEGACY_BUILD=1` (or -DVIRTIO_WDDM_AV1_
+ *                  LEGACY_BUILD=1) and the old block is compiled instead.
+ *
+ * Both paths share the writers in av1_params.h and the pipeline/serial plumbing.
+ * Nothing else in the file depends on the choice. */
+#ifndef VIRTIO_WDDM_AV1_LEGACY_BUILD
+#define VIRTIO_WDDM_AV1_LEGACY_BUILD 0
+#endif
 
 #include <winddk_compat.h>
 #include <virtio_wddm_uapi.h>
@@ -123,6 +147,9 @@
 #include "device.h"
 #include "resource.h"
 #include "d3d11_video_dxvk.h"
+/* VP_IDENTITY_DIAG_BEGIN */
+#include "vp_identity_trace.h"
+/* VP_IDENTITY_DIAG_END */
 /* The virtio-media user-mode client is the only code that speaks the driver's
  * IOCTL protocol (deliverables/p2-1a/client). P2-2a compiles it into this DLL
  * with VMEDIA_CLIENT_STATIC instead of re-implementing CreateFileW /
@@ -217,6 +244,9 @@ typedef struct {
     UINT first_array_slice;
     UINT array_size;
     void *dxvk_view; /* ID3D11VideoProcessorInputView * */
+    /* Strong COM refs; no dependency on the enumerator DDI wrapper lifetime. */
+    void *refresh_device;
+    void *refresh_enum;
 } VIRTIO_WDDM_VideoProcessorInputView;
 
 typedef struct {
@@ -226,6 +256,9 @@ typedef struct {
     UINT first_array_slice;
     UINT array_size;
     void *dxvk_view; /* ID3D11VideoProcessorOutputView * */
+    /* Strong COM refs; no dependency on the enumerator DDI wrapper lifetime. */
+    void *refresh_device;
+    void *refresh_enum;
 } VIRTIO_WDDM_VideoProcessorOutputView;
 
 /* ------------------------------------------------------------------------- */
@@ -305,8 +338,34 @@ static BOOL decoder_output_format_supported(DXGI_FORMAT format) {
 #define VIRTIO_WDDM_VIDEO_MAGIC_DECODE 0x56444543u /* 'VDEC' */
 #define VIRTIO_WDDM_VIDEO_MAGIC_DECOUT 0x56444F56u /* 'VDOV' */
 
+/* §7 P3 (round 28, show_existing_frame): a snapshot of the output view a queued
+ * access unit writes its picture into.
+ *
+ * A pipeline job normally targets object->output_view -- the view of the
+ * BeginFrame that is open at EndFrame time.  That is correct for every picture
+ * the client asked to decode, because it reads the view it named in its own
+ * BeginFrame.  The show_existing_frame picture is different: it belongs to the
+ * HIDDEN picture that the UMD deferred one frame earlier, i.e. to the output
+ * view of an EndFrame that has already returned.  The job therefore has to
+ * carry that older target, snapshotted here field by field (the same numbers
+ * pipeline_submit() copies out of the view/resource). */
 typedef struct {
+    ID3D11Resource *texture; /* borrowed; pipeline_submit() takes its own ref */
+    UINT subresource;
+    UINT mip_slice;
+    UINT first_array_slice;
+    UINT array_size;
+    UINT mips;
+    UINT tex_width;
+    UINT tex_height;
+    DXGI_FORMAT tex_format;
+} VIRTIO_WDDM_PipelineTarget;
+
+typedef struct VIRTIO_WDDM_VideoDecoder {
     UINT magic;
+    BOOL life_snapshot; /* heap worker/read view, never a runtime TLS key */
+    BOOL life_requested; /* Explicit TAG_LIFE request; retains AV1 prerequisites. */
+    BOOL async_lifetime; /* Immutable after heap ownership commit; not a runtime pin. */
     D3D11_1DDI_VIDEO_DECODER_DESC desc;
     D3D11_1DDI_VIDEO_DECODER_CONFIG config;
     UINT codec; /* VIRTIO_WDDM_CODEC_H264 / _VP9: which decode path runs */
@@ -380,17 +439,29 @@ typedef struct {
     BOOL direct_active;
     BOOL direct_ok;
     UINT64 direct_frames; /* frames uploaded straight out of the mapped pool */
-    /* VP9FIX (2026-10-25): MAP_FRAME/RELEASE_FRAME pairing audit.  The driver
-     * holds at most ONE mapped frame per session and refuses the next
-     * MAP_FRAME until it is released ("previous frame was never released"), so
-     * every successful map must be paired on every path -- success, failure and
-     * a superframe member that is not the picture.  direct_maps - direct_releases
-     * is the number of buffers currently checked out of the device; at
-     * DestroyVideoDecoder it must be 0, and the summary says so. */
+    /* VP9FIX (2026-10-25): MAP_FRAME/RELEASE_FRAME pairing audit.  Driver
+     * 1.0.0.22 maps per capture buffer (1.0.0.21 and older allowed exactly one
+     * mapping per session and refused the next MAP_FRAME with "previous frame was
+     * never released"), so every successful map must be paired on every path --
+     * success, failure and a superframe member that is not the picture.
+     * direct_maps - direct_releases is the number of buffers currently checked
+     * out of the device; at DestroyVideoDecoder it must be 0, and the summary
+     * says so. */
     UINT64 direct_maps;
     UINT64 direct_releases;
     UINT64 direct_release_failures;
     UINT64 direct_pairing_fixes;   /* stale mapping released before a remap */
+    /* CONCURRENT-MAPPING (2026-10-25, driver 1.0.0.22): RELEASE_FRAME is a
+     * per-capture-buffer operation now, so a refusal can be retried on the next
+     * picture *for that same index* instead of being forgotten.  Until this round
+     * decoder_drop_direct() cleared `direct_active` even when the release failed,
+     * which lost the index: the driver kept the capture buffer checked out, the
+     * next MAP_FRAME answered err=22 and the UMD blamed the mapping route (the
+     * residual risk recorded in 04-测试记录/19-串行回退.md §2).  `streak` counts
+     * consecutive refusals of the same index, `blocked` counts pictures that were
+     * sent down the staged path because the previous buffer was still out. */
+    UINT direct_release_streak;
+    UINT64 direct_release_blocked;
     UINT64 direct_member_releases; /* superframe members released unconsumed */
     /* AV1FIX (2026-10-25): "a timeout is not a refusal", and "a failed frame
      * must still give the capture buffer back".
@@ -414,6 +485,11 @@ typedef struct {
     UINT direct_fail_streak;    /* consecutive non-timeout MAP_FRAME failures */
     UINT64 stray_releases;      /* RELEASE_FRAME(0xFFFFFFFF) that DID requeue */
     UINT64 stray_release_empty; /* ... that found nothing mapped (normal case) */
+    /* MAPPINGONE (2026-10-25): the stray release was NOT sent because a pipeline
+     * job (or the DDI thread) still owned the session's one mapping -- see
+     * pipeline_mapping_owned_locked().  Releasing somebody else's mapping here
+     * is what pulls the pool pages out from under a pending upload. */
+    UINT64 stray_release_skipped;
     /* AV1FIX: where a frame's time went.  vm_get_frame() does the host wait and
      * the NV12 copy inside one ioctl, so the split only exists when the frame is
      * fetched with TimeoutMs = 0 polls (VM_GET_FRAME_IN documents 0 = poll once).
@@ -463,6 +539,7 @@ typedef struct {
      *     too, without waiting for it to re-send an IDR.  POC is deliberately not
      *     used: B frames / reference reordering make it non-monotone in decode
      *     order, while frame_num obeys a simple rule (H.264 7.4.3). */
+    UINT media_token; /* tag identity token from OPEN/FLUSH */
     UINT driver_version;       /* VM_OPEN_OUT.DriverVersion; flush needs >= 0x1000B */
     BOOL pic_this_frame;       /* PICTURE_PARAMETERS arrived for the open frame */
     BOOL prev_frame_num_valid; /* prev_frame_num describes the previous AU */
@@ -498,6 +575,9 @@ typedef struct {
     Vp9AccessUnit vp9_unit;
     UINT64 vp9_frames;      /* VP9 pictures sent+decoded (superframe members too) */
     UINT64 vp9_superframes; /* access units that carried more than one frame */
+    /* VP9FIX (round 25): pictures with show_frame=0 that were sent to the host
+     * and deliberately not fetched (the host emits no CAPTURE buffer for them). */
+    UINT64 vp9_hidden_frames;
     UINT64 vp9_keyframes;   /* sequence starts seen */
     UINT64 vp9_bad_headers; /* frames whose header did not parse (sent anyway) */
     UINT vp9_header_logs;   /* first few headers are INFO, then VERBOSE */
@@ -590,11 +670,78 @@ typedef struct {
     UINT8 *av1_prev_tile_group;
     UINT av1_prev_tile_group_size;
     UINT av1_prev_tile_group_cap;
+    BOOL av1_prev_single; /* the stored group is a bare 1-tile payload */
+    /* §7 P3 (round 28, show_existing_frame): the second half of the one-frame
+     * lookahead.  The deferral above exists because DXVA does not carry
+     * refresh_frame_flags; the price used to be that a hidden (show_frame=0)
+     * picture reached the host with its true mask but was NEVER DISPLAYED -- the
+     * host decodes it and emits no CAPTURE buffer, so the 49.7% of the source's
+     * temporal units that are show_existing_frame had no counterpart on the wire
+     * at all.  Now, when the next picture reveals the mask, the UMD sends
+     *     1. the hidden catch-up ACCESS UNIT (no picture expected), and
+     *     2. a show_existing_frame temporal unit for a slot of that mask
+     *        (av1_show_existing_tu()), whose picture is the hidden picture the
+     *        client decoded one EndFrame earlier.
+     * av1_prev_hidden records that the deferred picture was show_frame=0 (only
+     * those are missing a display; a shown picture was sent normally and the
+     * host already owes it a CAPTURE buffer), and av1_prev_target is the output
+     * view of that earlier EndFrame -- the picture must land in the surface the
+     * client's own BeginFrame named, not in the current one. */
+    BOOL av1_prev_hidden;
+    BOOL av1_prev_target_valid;
+    VIRTIO_WDDM_PipelineTarget av1_prev_target;
+    UINT64 av1_show_existing;         /* show_existing TUs queued                 */
+    UINT64 av1_show_existing_skipped; /* mask 0 / no view / no pipeline / grain   */
+    UINT64 av1_show_existing_far;     /* slot not in the derived mask (never)     */
     UINT64 av1_frames;
     UINT64 av1_key_frames;
+    UINT64 av1_hidden_frames; /* show_frame=0 pictures: sent, no picture expected */
     UINT64 av1_catchups;      /* hidden DPB catch-up frames re-sent */
     UINT64 av1_masks_derived; /* refresh masks recovered from a successor */
     UINT64 av1_bad_tile_records;
+
+    /* AV1 STATEFUL PORT (2026-10-27): the DPB + one-frame lookahead builder.
+     * It OWNS the refresh-mask derivation, the DPB mirror, the deferred picture
+     * and the exact-mask catch-up (see av1_dpb.h); the fields above are what the
+     * legacy build (VIRTIO_WDDM_AV1_LEGACY_BUILD=1) still uses. */
+    Av1Builder av1_builder;
+    /* Per-picture TAG -> the output view that picture must land in.  A deferred
+     * picture produces its frame during the NEXT EndFrame, when output_view
+     * already names a different surface, so the view is snapshotted here (the
+     * reference's `tag`).  Small rotating table: at most one picture is held. */
+    struct {
+        VIRTIO_WDDM_PipelineTarget target;
+        UINT width, height;
+        BOOL valid;
+    } av1_tag_slot[8];
+    UINT64 av1_tag_next;
+    UINT64 av1_dpb_deferred;   /* submits that produced NO temporal unit (0..N) */
+    UINT64 av1_dpb_flushed;    /* pictures emitted by flush(close/seek/error)   */
+    UINT64 av1_dpb_catchups;   /* hidden catch-ups the builder emitted         */
+    UINT64 av1_dpb_provisional;/* pictures emitted with mask 0 and caught up   */
+    UINT64 av1_dpb_aborted;    /* error paths that dropped the held picture    */
+    LONGLONG av1_feed_prev_qpc;/* QPC of the previous AU, for the feed-interval log */
+    /* 2026-10-27 (round 46): cost of the three decode DDIs, measured at the DDI
+     * table entry so every return path is covered.  One summary line each at the
+     * 60th call (see decoder_ddi_note). */
+    UINT64 ddi_n[3];
+    double ddi_sum[3];
+    double ddi_max[3];
+
+    /* P4-13 REQFIX (2026-10-25, ported onto the pipeline): send-failure
+     * bookkeeping (see decoder_decode_unit and pipeline_worker).
+     *   capture_count    - REQBUFS CAPTURE granted, as the driver reports it
+     *                      (VM_SEND_OUT.CaptureCount); 0 until the first send
+     *                      succeeds.  Logged once per session.
+     *   send_fail_streak - consecutive vm_send() failures, reset on success;
+     *                      drives the backoff that keeps a refusing host from
+     *                      being asked 30 times a second.
+     *   send_fail_total  - lifetime counter for the destroy summary.
+     * Both send points feed them (the serial decoder_decode_unit and the
+     * pipeline worker), so one summary covers either path. */
+    UINT capture_count;
+    UINT send_fail_streak;
+    UINT64 send_fail_total;
 
     /* PIPELINE (2026-10-25): the decode pipeline (send/fetch on a worker thread
      * while the DDI thread uploads the previous picture).  NULL means the serial
@@ -602,7 +749,153 @@ typedef struct {
      * the driver version.  See the pipeline block for the whole story. */
     struct VIRTIO_WDDM_DecodePipeline *pipeline;
 
+    /* §5.4 (round 23): the global registry decoder_texture_sync() walks -- a
+     * D3D11 texture has no back-pointer to the video decoder that decodes into
+     * it, so the sync hook has to ask every live decoder "is this yours?".
+     * Guarded by g_video_decoders_lock; linked in CreateVideoDecoder and
+     * unlinked in DestroyVideoDecoder before the pipeline (and the object) go
+     * away. */
+    struct VIRTIO_WDDM_VideoDecoder *live_next;
+    BOOL live_linked;
+
 } VIRTIO_WDDM_VideoDecoder;
+
+/* §7 P3 (round 28, show_existing_frame): drop the deferred hidden picture's
+ * output-view snapshot.  The decoder owns one reference on the texture while the
+ * picture waits for its show_existing unit; pipeline_submit() takes the job's own
+ * reference, so this runs as soon as the unit is queued -- and on reset/destroy,
+ * where a snapshot can still be pending.  Clearing av1_prev_hidden keeps a stale
+ * "this picture owes a display" flag from leaking into the next picture. */
+static void av1_prev_target_release(VIRTIO_WDDM_VideoDecoder *object) {
+    if (!object)
+        return;
+    if (object->av1_prev_target.texture) {
+        object->av1_prev_target.texture->lpVtbl->Release(object->av1_prev_target.texture);
+        object->av1_prev_target.texture = NULL;
+    }
+    memset(&object->av1_prev_target, 0, sizeof(object->av1_prev_target));
+    object->av1_prev_target_valid = FALSE;
+    object->av1_prev_hidden = FALSE;
+}
+
+/* ------------------------------------------------------------------------- */
+/* AV1 STATEFUL PORT (2026-10-27): tag table + builder boundaries             */
+/* ------------------------------------------------------------------------- */
+
+/* Defined with the pipeline (line ~5500); declared here because a deferred AV1
+ * picture snapshots its output view long before that. */
+static struct VIRTIO_WDDM_DecodePipeline *decoder_ctx_access(VIRTIO_WDDM_VideoDecoder *o);
+static BOOL pipeline_capture_target_ex(VIRTIO_WDDM_VideoDecoder *object,
+                                       VIRTIO_WDDM_PipelineTarget *out, BOOL loud);
+
+/* A picture held for the lookahead produces its frame during a LATER EndFrame,
+ * when object->output_view already names a different surface, so the output view
+ * it was submitted with is snapshotted here under a small rotating tag -- the
+ * reference implementation's per-frame `tag` (av1_bitstream.h ReadyFrame).  One
+ * picture is held at a time, so 8 slots are more than enough; a tag is reused
+ * only after its slot was released. */
+static void av1_tag_release_slot(VIRTIO_WDDM_VideoDecoder *object, UINT tag) {
+    VIRTIO_WDDM_PipelineTarget *t;
+
+    if (!object || tag >= 8u)
+        return;
+    t = &object->av1_tag_slot[tag].target;
+    if (t->texture) {
+        t->texture->lpVtbl->Release(t->texture);
+        t->texture = NULL;
+    }
+    memset(&object->av1_tag_slot[tag], 0, sizeof(object->av1_tag_slot[tag]));
+}
+
+static void av1_tag_release_all(VIRTIO_WDDM_VideoDecoder *object) {
+    UINT i;
+
+    for (i = 0; i < 8u; i++)
+        av1_tag_release_slot(object, i);
+    object->av1_tag_next = 0;
+}
+
+/* Snapshot the output view this EndFrame named for `tag`.  Only the pipeline can
+ * defer a picture, so a serial-path call is a no-op (the picture is sent from
+ * this very EndFrame and lands in the current output view). */
+static BOOL av1_tag_store(VIRTIO_WDDM_VideoDecoder *object, UINT tag, UINT width,
+                          UINT height) {
+    if (!object || tag >= 8u)
+        return FALSE;
+    av1_tag_release_slot(object, tag);
+    if (!decoder_ctx_access(object))
+        return TRUE;
+    if (!pipeline_capture_target_ex(object, &object->av1_tag_slot[tag].target, FALSE)) {
+        memset(&object->av1_tag_slot[tag], 0, sizeof(object->av1_tag_slot[tag]));
+        return FALSE;
+    }
+    object->av1_tag_slot[tag].target.texture->lpVtbl->AddRef(
+        object->av1_tag_slot[tag].target.texture);
+    object->av1_tag_slot[tag].width = width;
+    object->av1_tag_slot[tag].height = height;
+    object->av1_tag_slot[tag].valid = TRUE;
+    return TRUE;
+}
+
+static BOOL av1_tag_target(VIRTIO_WDDM_VideoDecoder *object, UINT tag,
+                           VIRTIO_WDDM_PipelineTarget *out) {
+    if (!object || tag >= 8u || !object->av1_tag_slot[tag].valid ||
+        !object->av1_tag_slot[tag].target.texture)
+        return FALSE;
+    *out = object->av1_tag_slot[tag].target;
+    return TRUE;
+}
+
+/* AV1 STATEFUL PORT (2026-10-27): the flush boundaries the D3D11 DDI can see.
+ *
+ * av1_dpb.h implements the reference's flush(): emit whatever the builder still
+ * holds with refresh_frame_flags = 0 (there is no successor any more, so the
+ * exact mask is unreachable and 0 is the only non-destructive choice).  WHO
+ * consumes those units is the problem: D3D11 has no EOS signal (it is a D3D9
+ * DXVA2 / D3D12 concept), so every boundary we can hook -- DestroyVideoDecoder,
+ * the seek flush, an error -- is followed IMMEDIATELY by the output view and the
+ * host session going away.  A unit sent there would be decoded into a surface
+ * nobody reads, and it would be decoded AFTER the boundary the client left --
+ * exactly what pipeline_quiesce() refuses to do for the queued jobs.  So the
+ * units are counted and logged, not sent; the "0..N outputs" behaviour of the
+ * port lives in submit() (see av1_dpb.h difference 4). */
+static void av1_flush_builder(VIRTIO_WDDM_VideoDecoder *object, const char *reason) {
+    Av1ReadyFrame ready[3];
+    unsigned n, i;
+
+    if (!object)
+        return;
+    n = av1_builder_flush(&object->av1_builder, ready, 3);
+    for (i = 0; i < n; i++) {
+        object->av1_dpb_flushed++;
+        INFO("%s: AV1 flush(%s): the picture held for the lookahead (tag %u, %u B, "
+             "refresh=0x%02x, order_hint=%u) is emitted with refresh_frame_flags=0 "
+             "and dropped -- the output view it was submitted with belongs to a "
+             "boundary the client has left",
+             __FUNCTION__, reason, ready[i].tag, ready[i].au_size,
+             ready[i].refresh_frame_flags, ready[i].order_hint);
+    }
+    if (object->av1_builder.provisional.valid) {
+        object->av1_dpb_flushed++;
+        INFO("%s: AV1 flush(%s): a provisionally sent picture (tag %u) never got its "
+             "successor, so its exact refresh mask is unknown -- dropped",
+             __FUNCTION__, reason, object->av1_builder.provisional.tag);
+    }
+    av1_builder_reset(&object->av1_builder);
+    av1_tag_release_all(object);
+}
+
+/* ERROR path: drop the accumulator and every held picture but KEEP the DPB
+ * mirror (the client may continue on the same session after a rejected AU). */
+static void av1_abort_picture(VIRTIO_WDDM_VideoDecoder *object) {
+    if (!object)
+        return;
+    object->av1_builder.has_picture = 0;
+    object->av1_builder.cur_size = 0;
+    av1_held_release(&object->av1_builder.pending);
+    av1_held_release(&object->av1_builder.provisional);
+    object->av1_dpb_aborted++;
+}
 
 /* Output view: the runtime creates one per NV12/P010 surface the application
  * decodes into (ID3D11VideoDevice::CreateVideoDecoderOutputView). BeginFrame
@@ -639,6 +932,33 @@ static void decoder_drop_direct(VIRTIO_WDDM_VideoDecoder *object);
  * every failed frame acquisition (see its definition). */
 static void decoder_release_stray_frame(VIRTIO_WDDM_VideoDecoder *object);
 
+/* SERIAL (2026-10-25): the two-stage decode pipeline is a COMPILE-TIME opt-in.
+ *
+ * The 2026-10-25 full-verify run showed every video case wedging on its second
+ * picture while the host logcat stayed healthy ("2 bitstream buffers in, 2
+ * frames out"): the pipeline's stage 2 waits for the capture buffer of the
+ * previous job, and the DDI thread never drained it, so the DDI thread stopped
+ * after the second access unit.  The pipeline code is kept (that is what
+ * VIRTIO_WDDM_PIPELINE=1 builds) but the default is now the strict serial
+ * send -> fetch -> upload round trip of P4-13, byte for byte the code path that
+ * measured 23.7 fps on 2026-10-25 13:39.
+ *
+ *   make ...                 -> -DVIRTIO_WDDM_PIPELINE=0  (serial, default)
+ *   make ... VIRTIO_WDDM_PIPELINE=1 -> the pipeline back, for a dedicated debug
+ *                                      session
+ *
+ * Everything that is NOT the concurrency model stays on both paths: the VP9
+ * parse/access-unit fix, the AV1 staged fallback and polled acquisition, the
+ * HEVC Main10 + P010 caps, and the P4-13 REQFIX semantics (1450 does not reopen
+ * the session, send_fail_streak, the "granted N capture buffer(s)" line) are
+ * shared code, not pipeline code. */
+#ifndef VIRTIO_WDDM_PIPELINE
+#define VIRTIO_WDDM_PIPELINE 0
+#endif
+#if (VIRTIO_WDDM_PIPELINE != 0) && (VIRTIO_WDDM_PIPELINE != 1)
+#error "VIRTIO_WDDM_PIPELINE must be 0 (serial) or 1 (two-stage pipeline)"
+#endif
+
 /* PIPELINE (2026-10-25): the decode pipeline lives in its own struct next to
  * the helpers it needs (~line 3300); the decoder object only carries a pointer,
  * NULL meaning "the serial path".  These four are used by code that is defined
@@ -646,8 +966,18 @@ static void decoder_release_stray_frame(VIRTIO_WDDM_VideoDecoder *object);
  * stops it, decoder_flush_session quiesces it, and decoder_drop_direct tells it
  * that a capture buffer came back. */
 static BOOL pipeline_create(VIRTIO_WDDM_VideoDecoder *object);
+static BOOL pipeline_admission_terminal(VIRTIO_WDDM_VideoDecoder *object);
+static BOOL decoder_stream_started(VIRTIO_WDDM_VideoDecoder *object);
+static void pipeline_fail_admission(VIRTIO_WDDM_VideoDecoder *object);
+static BOOL pipeline_life_admitted(VIRTIO_WDDM_VideoDecoder *object);
+static BOOL pipeline_env_flag(const char *name, BOOL fallback);
 static void pipeline_destroy(VIRTIO_WDDM_VideoDecoder *object);
+static BOOL pipeline_life_detach(VIRTIO_WDDM_VideoDecoder *object);
 static void pipeline_quiesce(VIRTIO_WDDM_VideoDecoder *object, const char *reason);
+static BOOL pipeline_tag_flush_safe(VIRTIO_WDDM_VideoDecoder *object);
+static BOOL decoder_life_flush(VIRTIO_WDDM_VideoDecoder *runtime, const char *reason);
+static VM_SESSION *decoder_session_borrow(VIRTIO_WDDM_VideoDecoder *object);
+static BOOL runtime_is_life(VIRTIO_WDDM_VideoDecoder *object);
 static void pipeline_on_mapping_freed(VIRTIO_WDDM_VideoDecoder *object);
 /* Every session call the DDI thread makes in pipeline mode goes through these
  * two, so the worker's vm_send/vm_map_frame and the DDI's vm_release_frame can
@@ -656,6 +986,63 @@ static void pipeline_on_mapping_freed(VIRTIO_WDDM_VideoDecoder *object);
  * pipeline is not armed. */
 static void pipeline_session_lock(VIRTIO_WDDM_VideoDecoder *object);
 static void pipeline_session_unlock(VIRTIO_WDDM_VideoDecoder *object);
+/* MAPPINGONE (2026-10-25): "does this session still have a capture buffer
+ * checked out of the driver?".  The driver allows exactly ONE mapping per
+ * session, and two different owners can hold it (the DDI thread while it
+ * uploads, and the worker itself while a READY job waits to be drained), so
+ * every path that is about to map or to release "whatever is mapped" asks this
+ * one question instead of looking at one flag.  Must be called with the
+ * pipeline lock held (it also works without a pipeline: serial path). */
+static BOOL pipeline_mapping_owned_locked(VIRTIO_WDDM_VideoDecoder *object);
+/* §5.4b (2026-10-25, round 24): the ONE drain -- wait for a job's picture,
+ * upload it into the subresource that job's own BeginFrame named, release its
+ * capture buffer and its ring slot.  TWO callers share this exact function:
+ *   - pipeline_submit(), when every slot is taken (capacity backpressure),
+ *   - pipeline_sync(), before a read of the texture (the §5.4 read path).
+ * There is no second copy of the wait/upload/release sequence.  Filter:
+ * `texture == NULL` matches every job of the current generation (capacity
+ * drain); otherwise jobs whose target is (texture, subresource), or the whole
+ * texture when `whole`.  Oldest seq first.  Idempotent: S_OK + *drained == FALSE
+ * when nothing matches.  A timeout returns VIRTIO_WDDM_E_PIPELINE_TIMEOUT, never
+ * S_OK (author §5.4: "a timeout is a failed job, not a successful one").
+ *
+ * §7 P3 (round 27): `nonblocking` is the AV1 capacity-drain form -- look at the
+ * oldest job ONCE, upload/retire it if it is READY or dead, and return
+ * immediately (S_OK, *drained == FALSE) when its picture is not there yet.  It is
+ * still the same function, the same selection, the same upload and the same
+ * retire; only the "wait for the worker" branch is skipped, because the AV1
+ * submit is not allowed to sleep for a picture the host has not produced. */
+static HRESULT pipeline_drain_one(VIRTIO_WDDM_VideoDecoder *object,
+                                  ID3D11Resource *texture, UINT subresource,
+                                  BOOL whole, LONGLONG t_start, LONGLONG deadline,
+                                  BOOL *drained, BOOL nonblocking);
+
+/* §5.4 DEFERRED (2026-10-25, round 23): the ONE place a read of a decoder output
+ * texture waits for the media + the upload.  Called from every entry point that
+ * can read such a texture -- VideoProcessorBlt's input views, Map,
+ * CopyResource / CopySubresourceRegion / ResolveSubresource, the two
+ * read-after-write hazard callbacks and an SRV read -- through Triton's texture
+ * sync hook (tritonSetTextureSyncHook).  `whole` means "every subresource of
+ * this texture".  Returns S_OK when everything that targets the given
+ * (texture, subresource) has been uploaded (or there was nothing pending, which
+ * is the idempotent case), E_FAIL when a job failed or timed out. */
+static HRESULT decoder_texture_sync(void *texture, UINT subresource, BOOL whole);
+static HRESULT decoder_texture_sync_hook(void *texture, UINT subresource, BOOL whole, UINT action, UINT64 *ticket);
+
+/* §5.4 DEFERRED: the decoder registry CreateVideoDecoder/DestroyVideoDecoder
+ * maintain, and Triton's read-path hook setter (defined in tritonResource.c).
+ * Declared here rather than by including triton.h: this is the only Triton symbol
+ * the video DDI needs, and triton.a is linked into the same DLL. */
+static void decoder_register_live(VIRTIO_WDDM_VideoDecoder *object);
+static void decoder_unregister_live(VIRTIO_WDDM_VideoDecoder *object);
+typedef HRESULT (*VIRTIO_WDDM_TextureSyncHook)(void *resource, UINT subresource, BOOL whole, UINT action, UINT64 *ticket);
+extern void tritonSetTextureSyncHook(VIRTIO_WDDM_TextureSyncHook hook);
+
+/* CONCURRENT-MAPPING (2026-10-25): the one place a capture buffer is handed back
+ * to the driver.  Defined next to decoder_drop_direct() but used by the frame
+ * acquisition path above it (the unusable-mapping branch). */
+static BOOL decoder_release_index(VIRTIO_WDDM_VideoDecoder *object, UINT32 index,
+                                  const char *why);
 
 /* The decode profiles this UMD advertises.
  *
@@ -1399,6 +1786,7 @@ static HRESULT APIENTRY virtio_wddm_video_create_video_decoder(
     object->bit_depth = profile->bit_depth;
     object->session = session;
     object->session_id = open_out.SessionId;
+    object->media_token = open_out.SessionToken;
     object->driver_version = open_out.DriverVersion;
     object->device = hDevice.pDrvPrivate;
     /* P-BATCH ZEROCOPY: the direct-mapped frame path is opt-out by environment
@@ -1420,7 +1808,40 @@ static HRESULT APIENTRY virtio_wddm_video_create_video_decoder(
      * itself (and logs why) for VP9, for a driver that predates VM_IOCTL_FLUSH,
      * and when VIRTIO_WDDM_PIPELINE=0, in which case every frame takes the exact
      * serial path this UMD shipped before. */
-    (void)pipeline_create(object);
+    object->life_requested = pipeline_env_flag("VIRTIO_WDDM_TAG_LIFE_EXPERIMENT", FALSE);
+    BOOL pipeline_ok = pipeline_create(object);
+    if ((object->life_requested || object->async_lifetime) &&
+        (!pipeline_ok || !pipeline_life_admitted(object))) {
+        ERROR("explicit LIFE initialization failed; refusing decoder, no serial fallback");
+        if (!pipeline_life_detach(object)) {
+            pipeline_destroy(object);
+            if (object->session) { vm_close(object->session); object->session = NULL; }
+        }
+        object->magic = 0;
+        return E_FAIL;
+    }
+    /* §5.4 DEFERRED (2026-10-25, round 23): make this decoder visible to
+     * decoder_texture_sync(), and install Triton's read-path hook once so that
+     * every "read this texture" DDI entry (Map, CopyResource,
+     * CopySubresourceRegion, ResolveSubresource, the read-after-write hazards,
+     * an SRV read) waits for the media + upload of the pixels it is about to
+     * read.  The hook answers immediately for a texture no decoder owns, so a
+     * process with no video decoder pays one function call per Map/copy. */
+    decoder_register_live(object);
+    if ((object->life_requested || object->async_lifetime) && !pipeline_life_admitted(object)) {
+        decoder_unregister_live(object);
+        pipeline_life_detach(object);
+        object->magic = 0;
+        ERROR("explicit LIFE registry admission failed; decoder rejected");
+        return E_FAIL;
+    }
+    {
+        static BOOL sync_hook_installed = FALSE;
+        if (!sync_hook_installed) {
+            sync_hook_installed = TRUE;
+            tritonSetTextureSyncHook(decoder_texture_sync_hook);
+        }
+    }
     return S_OK;
 }
 
@@ -1439,7 +1860,8 @@ static BOOL decoder_flush_session(VIRTIO_WDDM_VideoDecoder *object, const char *
     VM_FLUSH_OUT fout;
     UINT old_session;
 
-    if (!object || !object->session)
+    if (runtime_is_life(object)) return decoder_life_flush(object, reason);
+    if (!object || !decoder_session_borrow(object))
         return FALSE;
     if (object->driver_version < VMEDIA_FLUSH_MIN_DRIVER_VERSION) {
         VERBOSE("%s: driver 0x%08x predates VM_IOCTL_FLUSH (needs 0x%08x) -> not flushing (%s)",
@@ -1453,6 +1875,7 @@ static BOOL decoder_flush_session(VIRTIO_WDDM_VideoDecoder *object, const char *
      * any capture buffer the worker is holding, and bump the generation so the
      * worker abandons what it is doing before the session is replaced. */
     pipeline_quiesce(object, reason);
+    if (!pipeline_tag_flush_safe(object)) return FALSE;
     old_session = object->session_id;
     memset(&fout, 0, sizeof(fout));
     if (!vm_flush(object->session, &fout)) {
@@ -1463,6 +1886,7 @@ static BOOL decoder_flush_session(VIRTIO_WDDM_VideoDecoder *object, const char *
     object->flushes++;
     object->aus_dropped += fout.DroppedAu;
     object->frames_dropped += fout.DroppedFrames;
+    object->media_token = fout.SessionToken;
     object->session_id = fout.SessionId;
     INFO("%s: FLUSH (%s): dropped %u AU / %u frame(s), session %u -> %u "
          "(%llu flush(es))", __FUNCTION__, reason, fout.DroppedAu, fout.DroppedFrames,
@@ -1475,6 +1899,15 @@ static BOOL decoder_flush_session(VIRTIO_WDDM_VideoDecoder *object, const char *
         av1_dpb_reset(&object->av1_dpb);
         object->av1_prev_pending = FALSE;
         object->av1_seq_emitted = FALSE;
+        /* §7 P3 (round 28): the flushed session's DPB is gone, so a held hidden
+         * picture has no slot left to display and its snapshot must go too. */
+        av1_prev_target_release(object);
+        /* AV1 STATEFUL PORT (2026-10-27): SEEK.  A picture held for the lookahead
+         * belongs BEFORE this boundary, so it must never be written after it
+         * (the same rule pipeline_quiesce() follows for the queued jobs): the
+         * builder's flush() counts it and drops it, and reset() forgets the DPB
+         * and the sequence header for the session that comes next. */
+        av1_flush_builder(object, "seek");
     }
     return TRUE;
 }
@@ -1487,7 +1920,13 @@ static VOID APIENTRY virtio_wddm_video_destroy_video_decoder(
                           (void *)object, object ? object->magic : 0);
     if (!object || object->magic != VIRTIO_WDDM_VIDEO_MAGIC_DECODE)
         return;
+    pipeline_life_detach(object); /* transfers session; never closes on DDI */
     if (object->session) {
+        /* §5.4 DEFERRED: unlink from the sync registry FIRST (under its own lock,
+         * which decoder_texture_sync holds while it waits), so no consumer can be
+         * inside this object's pipeline while the worker and the session are torn
+         * down below. */
+        decoder_unregister_live(object);
         /* PIPELINE (2026-10-25): stop the worker before anything below touches
          * the session or the decoder's scratch buffers.  A job still in flight
          * is dropped (its subresource is never written); the summary says how
@@ -1517,7 +1956,8 @@ static VOID APIENTRY virtio_wddm_video_destroy_video_decoder(
         INFO("%s: closed vm session=%u after %llu submit(s) / %llu frame(s) / %llu byte(s) "
              "/ %llu reopen(s) / %llu SPS-PPS injection(s) (%llu synthesised from "
              "PICTURE_PARAMETERS) / %llu dropped frame(s) / %llu flush(es) "
-             "(%llu AU / %llu frame(s) dropped by the flushes)",
+             "(%llu AU / %llu frame(s) dropped by the flushes) / %llu send failure(s) "
+             "/ %u capture buffer(s) granted",
              __FUNCTION__, object->session_id, (unsigned long long)object->submits,
              (unsigned long long)object->frames, (unsigned long long)object->bytes_sent,
              (unsigned long long)object->reopens,
@@ -1526,14 +1966,18 @@ static VOID APIENTRY virtio_wddm_video_destroy_video_decoder(
              (unsigned long long)object->decode_failures,
              (unsigned long long)object->flushes,
              (unsigned long long)object->aus_dropped,
-             (unsigned long long)object->frames_dropped);
+             (unsigned long long)object->frames_dropped,
+             (unsigned long long)object->send_fail_total,
+             object->capture_count);
         if (object->codec == VIRTIO_WDDM_CODEC_VP9) {
             INFO("%s: VP9 summary: %llu picture(s) decoded / %llu key frame(s) / "
+                 "%llu hidden show_frame=0 picture(s) sent without waiting / "
                  "%llu superframe(s) / %llu unparsable header(s) / %llu "
                  "PICTURE_PARAMETERS buffer(s) / %llu frame(s) refused by the "
                  "VP9FIX boundary checks / %u PicParams warning(s)",
                  __FUNCTION__, (unsigned long long)object->vp9_frames,
                  (unsigned long long)object->vp9_keyframes,
+                 (unsigned long long)object->vp9_hidden_frames,
                  (unsigned long long)object->vp9_superframes,
                  (unsigned long long)object->vp9_bad_headers,
                  (unsigned long long)object->vp9_pic_buffers,
@@ -1549,7 +1993,8 @@ static VOID APIENTRY virtio_wddm_video_destroy_video_decoder(
              "%llu release failure(s) / %llu pairing fix(es) / %llu superframe "
              "member(s) released unconsumed / outstanding=%lld / %llu timeout(s) / "
              "%llu refusal(s) / %llu other failure(s) / %llu stray release(s) "
-             "(%llu found nothing mapped)",
+             "(%llu found nothing mapped, %llu skipped: a pipeline job owned the "
+             "mapping) / %llu picture(s) blocked by an unreleased buffer",
              __FUNCTION__, (unsigned long long)object->direct_maps,
              (unsigned long long)object->direct_releases,
              (unsigned long long)object->direct_release_failures,
@@ -1560,7 +2005,9 @@ static VOID APIENTRY virtio_wddm_video_destroy_video_decoder(
              (unsigned long long)object->direct_refusals,
              (unsigned long long)object->direct_other_failures,
              (unsigned long long)object->stray_releases,
-             (unsigned long long)object->stray_release_empty);
+             (unsigned long long)object->stray_release_empty,
+             (unsigned long long)object->stray_release_skipped,
+             (unsigned long long)object->direct_release_blocked);
         if (object->codec == VIRTIO_WDDM_CODEC_HEVC) {
             INFO("%s: HEVC summary: %llu picture(s) decoded / %llu IRAP(s) / "
                  "%llu VPS-SPS-PPS synthesised from PICTURE_PARAMETERS / %llu "
@@ -1575,20 +2022,47 @@ static VOID APIENTRY virtio_wddm_video_destroy_video_decoder(
                  (unsigned long long)object->hevc_slice_controls);
         }
         if (object->codec == VIRTIO_WDDM_CODEC_AV1) {
-            INFO("%s: AV1 summary: %llu picture(s) decoded / %llu key frame(s) / "
-                 "%llu refresh mask(s) derived from the next picture / %llu hidden "
-                 "DPB catch-up frame(s) / %llu PICTURE_PARAMETERS buffer(s) / %llu "
-                 "SLICE_CONTROL buffer(s) / %llu GET_FRAME timeout(s) / %llu tile "
-                 "record refusal(s) / segmented timing %s",
+            INFO("%s: AV1 summary: %llu picture(s) submitted / %llu uploaded / "
+                 "%llu key frame(s) / %llu hidden show_frame=0 picture(s) sent "
+                 "without waiting / %llu refresh mask(s) derived from the next "
+                 "picture / %llu hidden DPB catch-up frame(s) / %llu "
+                 "show_existing_frame unit(s) (%llu skipped) / %llu "
+                 "PICTURE_PARAMETERS buffer(s) / %llu SLICE_CONTROL buffer(s) / "
+                 "%llu GET_FRAME timeout(s) / %llu tile record refusal(s) / "
+                 "segmented timing %s",
                  __FUNCTION__, (unsigned long long)object->av1_frames,
+                 (unsigned long long)object->frames,
                  (unsigned long long)object->av1_key_frames,
+                 (unsigned long long)object->av1_hidden_frames,
                  (unsigned long long)object->av1_masks_derived,
                  (unsigned long long)object->av1_catchups,
+                 (unsigned long long)object->av1_show_existing,
+                 (unsigned long long)object->av1_show_existing_skipped,
                  (unsigned long long)object->av1_pic_buffers,
                  (unsigned long long)object->av1_slice_controls,
                  (unsigned long long)object->frame_get_timeouts,
                  (unsigned long long)object->av1_bad_tile_records,
                  object->frame_get_segmented ? "armed" : "not needed");
+            /* AV1 STATEFUL PORT (2026-10-27): the builder's own accounting.  The
+             * split that matters is "how many submits produced no unit" (the
+             * lookahead working) versus "how many units the catch-up path had to
+             * re-decode" (the lookahead being off). */
+            INFO("%s: AV1 DPB builder: %u submit(s) / %u key frame(s) / %u picture(s) "
+                 "HELD (0 units out) / %u picture(s) emitted with mask 0 and caught up "
+                 "later / %u hidden catch-up unit(s) / %u picture(s) dropped by a "
+                 "flush / %u rejected by the builder",
+                 __FUNCTION__, object->av1_builder.n_submit,
+                 object->av1_builder.n_key, object->av1_builder.n_deferred,
+                 object->av1_builder.n_provisional, object->av1_builder.n_catchup,
+                 object->av1_builder.n_flushed, object->av1_builder.n_failed);
+            INFO("%s: AV1 lookahead: %llu EndFrame(s) produced NO temporal unit / "
+                 "%llu flush(es) dropped a held picture / %llu catch-up unit(s) / "
+                 "%llu picture(s) re-encoded for the DPB / %llu error-path drop(s)",
+                 __FUNCTION__, (unsigned long long)object->av1_dpb_deferred,
+                 (unsigned long long)object->av1_dpb_flushed,
+                 (unsigned long long)object->av1_dpb_catchups,
+                 (unsigned long long)object->av1_dpb_provisional,
+                 (unsigned long long)object->av1_dpb_aborted);
         }
     }
     if (object->bitstream)
@@ -1617,6 +2091,13 @@ static VOID APIENTRY virtio_wddm_video_destroy_video_decoder(
         HeapFree(GetProcessHeap(), 0, object->av1_au);
     if (object->av1_prev_tile_group)
         HeapFree(GetProcessHeap(), 0, object->av1_prev_tile_group);
+    av1_prev_target_release(object);
+    /* AV1 STATEFUL PORT (2026-10-27): the builder owns four buffers (the
+     * accumulator, the held picture, the provisional picture and the AU staging
+     * area) and the tag table owns one texture reference per held picture. */
+    av1_flush_builder(object, "destroy");
+    av1_builder_free(&object->av1_builder);
+    av1_tag_release_all(object);
     memset(object, 0, sizeof(*object));
 }
 
@@ -1761,6 +2242,8 @@ static BOOL decoder_convert_420(const UINT8 *src, UINT src_stride, BOOL src_p010
 static void decoder_fail_frame(VIRTIO_WDDM_VideoDecoder *object, HRESULT hr) {
     if (!object)
         return;
+    if (object->codec == VIRTIO_WDDM_CODEC_AV1)
+        pipeline_fail_admission(object);
     object->decode_failures++;
     if (object->pending_error == S_OK)
         object->pending_error = hr;
@@ -1960,6 +2443,10 @@ static void video_ddi_exit(const char *kind, VIRTIO_WDDM_DdiStamp stamp) {
  * 1.0.0.7 is one rejected IOCTL plus the per-frame setup P2-1 measured at
  * 127.6 ms, i.e. roughly 8 frames/s at 720p until the driver is extended. */
 static BOOL decoder_reopen_session(VIRTIO_WDDM_VideoDecoder *object) {
+    if (runtime_is_life(object)) {
+        pipeline_fail_admission(object); /* heap owner cannot be replaced by runtime reopen */
+        return FALSE;
+    }
     VM_OPEN_OUT open_out;
     VM_SESSION *session;
     UINT open_codec;
@@ -2006,6 +2493,14 @@ static BOOL decoder_reopen_session(VIRTIO_WDDM_VideoDecoder *object) {
         av1_dpb_reset(&object->av1_dpb);
         object->av1_prev_pending = FALSE;
         object->av1_seq_emitted = FALSE;
+        av1_prev_target_release(object);
+        /* AV1 STATEFUL PORT (2026-10-27): the builder's DPB mirror and its
+         * have_sequence flag described the session that just went away, so both
+         * are forgotten here as well -- otherwise the next access unit would go
+         * out WITHOUT a sequence header (the dedup would think the new session
+         * already has one) and the reference remap would resolve slots against a
+         * DPB the host no longer holds. */
+        av1_flush_builder(object, "reopen");
         ERROR("%s: AV1 host session reopened -> decoder DPB lost; the next "
               "access unit must be a key frame (sequence header will be "
               "re-emitted)", __FUNCTION__);
@@ -2014,6 +2509,24 @@ static BOOL decoder_reopen_session(VIRTIO_WDDM_VideoDecoder *object) {
             open_out.SessionId, (unsigned long long)object->reopens,
             decoder_codec_name(object->codec));
     return TRUE;
+}
+
+/* P4-13 REQFIX: backoff after a refused vm_send().
+ *
+ * A refused configure is not free for the host -- the driver has to run S_FMT +
+ * REQBUFS + rollback for every attempt, and a player offers ~30 access units per
+ * second.  A short sleep once the failure is clearly not a one-off keeps the
+ * guest from hammering a host that is out of buffers (P4-13 measured 3,471
+ * failed sends in 116 s without it).
+ *
+ * Both send points call this with object->send_fail_streak: the serial
+ * decoder_decode_unit() (which is the DDI thread) and pipeline_worker() (which
+ * calls it OUTSIDE pipe->lock, so the DDI thread never inherits the sleep). */
+static void decoder_send_backoff(UINT streak) {
+    if (streak >= 30u)
+        Sleep(50);
+    else if (streak >= 8u)
+        Sleep(10);
 }
 
 /* Minimum standard level that covers a frame of `mbs` macroblocks, with one
@@ -2480,6 +2993,134 @@ static void decoder_hevc_update_parameter_sets(VIRTIO_WDDM_VideoDecoder *object,
 /* P-BATCH AV1: DXVA_PicParams_AV1 -> the field sets av1_params.h consumes    */
 /* ------------------------------------------------------------------------- */
 
+/* AV1DUMP (2026-10-26, round 26; round 47 added the flag form, the per-unit
+ * metadata and the 200-unit budget): byte-level evidence for the OBU synthesis.
+ *
+ * VIRTIO_WDDM_AV1_DUMP=<path>  every temporal unit the UMD assembles is appended
+ *                              to <path> (the pre-round-47 form).
+ * VIRTIO_WDDM_AV1_DUMP=1       same, to VIRTIO_WDDM_AV1_DUMP_DEFAULT (the form
+ *                              the round-47 task book asks for).
+ * unset, or "0"                OFF.  The lookup is cached in a static, so a
+ *                              normal session pays one predictable branch per
+ *                              unit and never touches the filesystem (same rule
+ *                              as VIRTIO_WDDM_LOG_FILE, ENV 16).
+ *
+ * At most VIRTIO_WDDM_AV1_DUMP_UNITS units are written per PROCESS: the point is
+ * to hand ffmpeg a finite, ordered prefix of the stream we actually send, so the
+ * dump stops writing (and stops opening the file) once the budget is spent.
+ *
+ * Record format, one per unit, in decode/send order:
+ *     TU <tag> <size>[ <meta>]\n
+ *     <size> raw bytes of the temporal unit
+ * i.e. "read a line, read `size` bytes, repeat"; lines starting with '#' are
+ * comments (the first one names the cap). */
+#define VIRTIO_WDDM_AV1_DUMP_UNITS 200u
+#define VIRTIO_WDDM_AV1_DUMP_DEFAULT "C:\\DroidVM\\av1dump\\our-av1.obu"
+
+static int decoder_av1_dump_enabled(void) {
+    static int cached = -1;
+
+    if (cached < 0) {
+        char probe[8];
+        DWORD n = GetEnvironmentVariableA("VIRTIO_WDDM_AV1_DUMP", probe,
+                                          (DWORD)sizeof(probe));
+        /* An explicit "0" turns it off; a path never starts with a lone 0. */
+        cached = (n > 0 && !(n == 1 && probe[0] == '0')) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Where to write: the variable itself when it is a path, the default path when
+ * it is the flag "1".  Resolved once; FALSE = no usable path. */
+static int decoder_av1_dump_path(char *out, DWORD cap) {
+    static char resolved[MAX_PATH];
+    static int state; /* 0 unresolved, 1 have a path, -1 no path */
+    DWORD n;
+
+    if (state == 0) {
+        n = GetEnvironmentVariableA("VIRTIO_WDDM_AV1_DUMP", resolved,
+                                    (DWORD)sizeof(resolved));
+        if (n == 0 || n >= (DWORD)sizeof(resolved)) {
+            state = -1;
+        } else {
+            if (n == 1 && resolved[0] == '1')
+                lstrcpynA(resolved, VIRTIO_WDDM_AV1_DUMP_DEFAULT,
+                          (int)sizeof(resolved));
+            state = 1;
+        }
+    }
+    if (state < 0)
+        return 0;
+    lstrcpynA(out, resolved, (int)cap);
+    return 1;
+}
+
+/* Diagnostic sendwire copy: caller holds the process dump lock.  Builder and
+ * worker records share the original 200-record budget, including non-AU records. */
+static void decoder_av1_dump_meta_locked(const char *tag, const void *data, UINT size,
+                                         const char *meta) {
+    static unsigned units;    /* process-wide budget, shared by all decoders */
+    static int state = -1;    /* -1 unknown, 1 writing, 0 gave up              */
+    char path[MAX_PATH];
+    char head[256];
+    DWORD written = 0;
+    HANDLE file;
+    int len;
+
+    if (!data || size == 0 || !decoder_av1_dump_enabled())
+        return;
+    if (units >= VIRTIO_WDDM_AV1_DUMP_UNITS)
+        return;
+    if (state < 0) {
+        state = decoder_av1_dump_path(path, (DWORD)sizeof(path)) ? 1 : 0;
+        if (state > 0)
+            INFO("%s: AV1 AU dump ON -> %s (at most %u unit(s) per process)",
+                 __FUNCTION__, path, (unsigned)VIRTIO_WDDM_AV1_DUMP_UNITS);
+    }
+    if (state != 1 || !decoder_av1_dump_path(path, (DWORD)sizeof(path)))
+        return;
+    file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                       NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        INFO("%s: AV1 AU dump cannot open %s (err=%lu) -> dump off", __FUNCTION__,
+             path, (unsigned long)GetLastError());
+        state = 0;
+        return;
+    }
+    if (units == 0) {
+        len = snprintf(head, sizeof(head), "# av1-audump v1 max_units=%u first=%s\n",
+                       (unsigned)VIRTIO_WDDM_AV1_DUMP_UNITS, tag);
+        if (len > 0)
+            WriteFile(file, head, (DWORD)len, &written, NULL);
+    }
+    len = snprintf(head, sizeof(head), "TU %s %u%s%s\n", tag, size,
+                   (meta && meta[0]) ? " " : "", (meta && meta[0]) ? meta : "");
+    if (len > 0)
+        WriteFile(file, head, (DWORD)len, &written, NULL);
+    WriteFile(file, data, size, &written, NULL);
+    CloseHandle(file);
+    units++;
+    if (units == VIRTIO_WDDM_AV1_DUMP_UNITS)
+        INFO("%s: AV1 AU dump complete (%u unit(s)) -> %s", __FUNCTION__, units,
+             path);
+}
+
+/* Serialize path/cache/budget and the complete header+payload append across
+ * decoder workers and DDI builders.  Preserve Win32 last-error for callers. */
+static void decoder_av1_dump_meta(const char *tag, const void *data, UINT size,
+                                  const char *meta) {
+    static SRWLOCK dump_lock = SRWLOCK_INIT;
+    DWORD saved_error = GetLastError();
+    AcquireSRWLockExclusive(&dump_lock);
+    decoder_av1_dump_meta_locked(tag, data, size, meta);
+    ReleaseSRWLockExclusive(&dump_lock);
+    SetLastError(saved_error);
+}
+
+static void decoder_av1_dump(const char *tag, const void *data, UINT size) {
+    decoder_av1_dump_meta(tag, data, size, NULL);
+}
+
 /* Fill the sequence parameters from the client's parsed header.  FALSE = the
  * picture is outside the profile this UMD advertises (AV1 VLD Profile 0, 8-bit
  * 4:2:0), or the struct does not describe a usable sequence.  Called once per
@@ -2540,6 +3181,20 @@ static BOOL av1_seq_from_pic(Av1SeqParams *seq, const DXVA_PicParams_AV1 *p) {
     seq->enable_cdef = p->coding.cdef;
     seq->enable_restoration = p->coding.restoration;
     seq->film_grain_params_present = p->coding.film_grain;
+    /* AV1FIX (2026-10-26, round 26): the two sequence-header flags DXVA does not
+     * carry are DERIVED from the picture instead of hardcoded to 1.  Hardcoding
+     * them cost 2 bits in every frame header and made our temporal units differ
+     * from the source stream for no reason (ffmpeg on t6_av1.mkv: the source has
+     * enable_superres=0 and separate_uv_delta_q=0, and so does every frame).
+     * If a stream does need either, the value changes, av1_seq_same() notices and
+     * the sequence header is re-emitted with it set. */
+    seq->enable_superres =
+        (p->superres_denom != 0 && p->superres_denom != AV1_SUPERRES_NUM) ? 1u : 0u;
+    seq->separate_uv_delta_q =
+        (p->quantization.u_dc_delta_q != p->quantization.v_dc_delta_q ||
+         p->quantization.u_ac_delta_q != p->quantization.v_ac_delta_q)
+            ? 1u
+            : 0u;
     /* DXVA carries no colour range; studio (0) is what every 8-bit 4:2:0
      * browser stream uses and it does not change the decoded samples. */
     seq->color_range = 0;
@@ -2565,11 +3220,22 @@ static BOOL av1_frame_from_pic(Av1FrameParams *f, const DXVA_PicParams_AV1 *p,
               f->frame_type);
         return FALSE;
     }
-    /* Forced: the host is a stateful V4L2 decoder and only produces a CAPTURE
-     * frame for a shown picture, while D3D11 calls EndFrame once per submitted
-     * picture and expects a decoded surface back.  Decoding is identical for a
-     * shown and a hidden picture (libva-v4l2 makes the same choice). */
-    f->show_frame = 1;
+    /* AV1FIX (2026-10-26, round 26): the CLIENT's show_frame/showable_frame.
+     *
+     * These used to be forced to 1 ("a stateful V4L2 decoder only produces a
+     * CAPTURE frame for a shown picture").  Round 25's own numbers disprove that
+     * trade: 62 AUs in 60 s = 0.97 s per AU, i.e. exactly one MAP_FRAME timeout
+     * each, and the host still produced one picture -- because half of an AV1
+     * stream is hidden alt-ref pictures, and the vendor decoder will not invent
+     * a CAPTURE buffer for them however the header is worded.  With the client's
+     * value the UMD does what the VP9 path already proved out: hidden frame ->
+     * send only, no picture expected, no timeout; shown frame -> send, wait,
+     * upload.  ffmpeg on t6_av1.mkv: 32 hidden / 32 shown in the first 64 coded
+     * pictures, so this is not a corner case. */
+    f->show_frame = p->format.show_frame ? 1u : 0u;
+    f->showable_frame = p->format.showable_frame ? 1u : 0u;
+    if (f->show_frame)
+        f->showable_frame = (f->frame_type == AV1_FRAME_KEY) ? 0u : 1u;
     /* DXVA_PicParams_AV1 carries no error_resilient_mode bit.  The common
      * browser streams use 0 for inter pictures; a shown key frame infers 1
      * from the syntax.  This is a documented limit of the D3D11 AV1 interface
@@ -2580,6 +3246,16 @@ static BOOL av1_frame_from_pic(Av1FrameParams *f, const DXVA_PicParams_AV1 *p,
     f->force_integer_mv = p->coding.integer_mv;
     f->order_hint = p->order_hint;
     f->primary_ref_frame = p->primary_ref_frame;
+    /* AV1 STATEFUL PORT (2026-10-27): the DPB identity the refresh-mask
+     * derivation and the reference remap are expressed in.  DXVA names every
+     * picture by a texture index:
+     *   CurrPicTextureIndex              -- this picture
+     *   RefFrameMapTextureIndex[0..7]    -- the client's DPB BEFORE this picture
+     * Both are UINT8 in dxva.h and 0xFF means "no picture in that slot", which is
+     * exactly the VA_INVALID_SURFACE the reference compares against. */
+    f->texture = p->CurrPicTextureIndex;
+    for (i = 0; i < AV1_NUM_REF_FRAMES; i++)
+        f->ref_texture[i] = p->RefFrameMapTextureIndex[i];
     f->width = p->width ? p->width : surface_w;
     f->height = p->height ? p->height : surface_h;
     if (f->width == 0 || f->height == 0 || f->width > surface_w ||
@@ -2671,8 +3347,10 @@ static BOOL av1_frame_from_pic(Av1FrameParams *f, const DXVA_PicParams_AV1 *p,
     f->cdef_damping = (p->cdef.ControlFlags & 3u) + 3u;
     f->cdef_bits = (p->cdef.ControlFlags >> 2) & 3u;
     for (i = 0; i < 8; i++) {
-        f->cdef_y_strengths[i] = p->cdef.y_strengths[i].combined;
-        f->cdef_uv_strengths[i] = p->cdef.uv_strengths[i].combined;
+        f->cdef_y_strengths[i] = av1_cdef_pack_dxva(
+            p->cdef.y_strengths[i].primary, p->cdef.y_strengths[i].secondary);
+        f->cdef_uv_strengths[i] = av1_cdef_pack_dxva(
+            p->cdef.uv_strengths[i].primary, p->cdef.uv_strengths[i].secondary);
     }
 
     f->tx_mode = p->coding.tx_mode;
@@ -2751,6 +3429,7 @@ static HRESULT APIENTRY virtio_wddm_video_video_decoder_begin_frame(
               (void *)object, (void *)pArgs);
         return E_INVALIDARG;
     }
+    if (pipeline_admission_terminal(object)) return E_FAIL;
     /* P2-2i: surface the previous EndFrame's dropped frame. This is the only
      * HRESULT-bearing DDI in the decode sequence, so the failure reaches the
      * application here instead of through pfnSetErrorCb, which would remove the
@@ -3384,6 +4063,26 @@ static BOOL decoder_zerocopy_enabled(VIRTIO_WDDM_VideoDecoder *object) {
     return TRUE;
 }
 
+/* VP9FIX2 (2026-10-25): the texture readback is a diagnostic, not part of the
+ * decode, and it is what stopped VP9: with the stage probe in place the log ends
+ * at
+ *     dx11um tex_stats: map returned pitch=1920 pData=...
+ * and never reaches `tex_stats: done`, while the DDI thread sits in
+ * Wait:UserRequest with ~0 % CPU and PotPlayer stays alive (no AV, no WER
+ * event).  The readback copies the whole 1920x1088 NV12 slice into a staging
+ * texture and then walks it byte by byte -- the UV loop also walked the plane
+ * with the wrong row index (see the fix in d3d11_video_dxvk.cpp), i.e. it read
+ * ~1 MB past the mapped slice.  Neither is needed to show a picture, so the
+ * probe is off unless VIRTIO_WDDM_TEXSTATS=1 asks for it. */
+static BOOL decoder_texstats_enabled(void) {
+    char value[8];
+    DWORD n = GetEnvironmentVariableA("VIRTIO_WDDM_TEXSTATS", value, (DWORD)sizeof(value));
+    if (n == 0 || n >= (DWORD)sizeof(value))
+        return FALSE;
+    return (value[0] == '1' || value[0] == 'y' || value[0] == 'Y' ||
+            value[0] == 't' || value[0] == 'T');
+}
+
 /* P-BATCH ZEROCOPY: fetch the next decoded frame straight out of the media
  * pool.  On success `info` describes it and `object->direct_active` says the
  * capture buffer is checked out (EndFrame must release it, on every path).
@@ -3435,10 +4134,24 @@ static BOOL decoder_try_direct_frame(VIRTIO_WDDM_VideoDecoder *object, VM_FRAME_
               object->direct_map.Index, object->direct_map.MappedLength,
               (unsigned long long)object->direct_pairing_fixes);
         decoder_drop_direct(object);
+        if (object->direct_active) {
+            /* CONCURRENT-MAPPING (2026-10-25): the retry above did not take that
+             * buffer back, so it is still checked out *and* still ours.  Mapping
+             * another index now would leave this one behind (the pre-1.0.0.22
+             * driver would have answered err=22; a 1.0.0.22 driver would happily
+             * map and slowly consume the pool).  Fail this picture instead: it
+             * goes down the staged path, which still has the other buffers. */
+            object->direct_release_blocked++;
+            ERROR("%s: the previous capture buffer (index %u) is still checked out "
+                  "-> not mapping another one for this picture (blocked #%llu)",
+                  __FUNCTION__, object->direct_map.Index,
+                  (unsigned long long)object->direct_release_blocked);
+            return FALSE;
+        }
     }
     memset(&map, 0, sizeof(map));
     t0 = decoder_qpc_now();
-    if (vm_map_frame(object->session, &map, 1000)) {
+    if (vm_map_frame(decoder_session_borrow(object), &map, 1000)) {
         need = (UINT64)map.Size;
         if (map.UserVa == 0 || map.MappedLength == 0 || need == 0 ||
             (UINT64)map.MappedLength < need) {
@@ -3446,7 +4159,9 @@ static BOOL decoder_try_direct_frame(VIRTIO_WDDM_VideoDecoder *object, VM_FRAME_
                   "size=%u, index %u) -> released, staged GET_FRAME for the rest "
                   "of this session", __FUNCTION__, (unsigned long long)map.UserVa,
                   map.MappedLength, map.Size, map.Index);
-            (void)vm_release_frame(object->session, map.Index);
+            /* CONCURRENT-MAPPING: give the index back through the checked helper,
+             * so a refusal is counted with its index instead of being dropped. */
+            (void)decoder_release_index(object, map.Index, "unusable mapping");
             object->direct_ok = FALSE;
             object->direct_refusals++;
             return FALSE;
@@ -3509,35 +4224,78 @@ static BOOL decoder_try_direct_frame(VIRTIO_WDDM_VideoDecoder *object, VM_FRAME_
     return FALSE;
 }
 
+/* CONCURRENT-MAPPING (2026-10-25): how many times the same capture-buffer index
+ * may be retried before the route is given up.  A driver refusal that persists
+ * across three pictures is not transient. */
+#define VIRTIO_WDDM_RELEASE_RETRY_MAX 3u
+
+/* CONCURRENT-MAPPING (2026-10-25): give exactly one capture buffer back.
+ *
+ * Driver 1.0.0.22 keeps one mapping per capture-buffer index, so RELEASE_FRAME
+ * is a per-index operation and its answer is meaningful: TRUE = the buffer is in
+ * the device's queue again, FALSE = it is still checked out and the caller still
+ * owns that index.  Every release in this file goes through here, so a failure
+ * is always counted *with its index* instead of being dropped -- `maps - releases`
+ * in the destroy audit stays the number of buffers the device is still missing. */
+static BOOL decoder_release_index(VIRTIO_WDDM_VideoDecoder *object, UINT32 index,
+                                  const char *why) {
+    if (!object || !decoder_session_borrow(object))
+        return FALSE;
+    if (!vm_release_frame(decoder_session_borrow(object), index)) {
+        object->direct_release_failures++;
+        ERROR("%s: RELEASE_FRAME(index %u, %s) failed err=%u -> the capture buffer "
+              "is still checked out of the device (release failure #%llu)",
+              __FUNCTION__, index, why, vm_last_error(),
+              (unsigned long long)object->direct_release_failures);
+        return FALSE;
+    }
+    object->direct_releases++;
+    return TRUE;
+}
+
 /* P-BATCH ZEROCOPY: unmap the frame and give its capture buffer back to the
  * device.  Must run on every path that got a frame from
  * decoder_try_direct_frame(), including the failures -- otherwise the buffer
  * stays out of the capture queue and the decoder starves.
  *
  * VP9FIX: the pairing is counted (maps vs releases) so the decoder summary can
- * prove that no buffer was left checked out; a failed RELEASE_FRAME is an ERROR
- * once and counted, not silently ignored. */
+ * prove that no buffer was left checked out.
+ *
+ * CONCURRENT-MAPPING (2026-10-25): `direct_active` is cleared only AFTER the
+ * driver took the buffer back.  Clearing it on a failed release (the pre-1.0.0.22
+ * behaviour) forgot an index the driver still had checked out; the next
+ * MAP_FRAME then hit the driver's "that buffer is still mapped" state and the
+ * route was blamed for what was a lost release.  Keeping the flag set makes the
+ * next decoder_try_direct_frame() retry this exact index first. */
 static void decoder_drop_direct(VIRTIO_WDDM_VideoDecoder *object) {
     if (!object->direct_active)
         return;
     /* PIPELINE (2026-10-25): the same lock the worker takes around its ioctls,
      * so RELEASE_FRAME and the next MAP_FRAME cannot overlap. */
     pipeline_session_lock(object);
-    object->direct_active = FALSE;
-    if (!vm_release_frame(object->session, object->direct_map.Index)) {
-        object->direct_release_failures++;
+    if (!decoder_release_index(object, object->direct_map.Index, "drop direct")) {
+        object->direct_release_streak++;
+        if (object->direct_release_streak >= VIRTIO_WDDM_RELEASE_RETRY_MAX) {
+            /* Three refusals for the same index: stop retrying, but say exactly
+             * what is lost (the index stays checked out until the session ends). */
+            ERROR("%s: index %u could not be released %u time(s) in a row (last "
+                  "err=%u) -> abandoning the mapping and the direct route for this "
+                  "session; the staged path keeps decoding with one capture slot "
+                  "missing", __FUNCTION__, object->direct_map.Index,
+                  object->direct_release_streak, vm_last_error());
+            object->direct_active = FALSE;
+            object->direct_ok = FALSE;
+            object->direct_release_streak = 0;
+        }
         pipeline_session_unlock(object);
-        ERROR("%s: vm_release_frame(index %u) failed err=%u (release failure #%llu)",
-              __FUNCTION__, object->direct_map.Index, vm_last_error(),
-              (unsigned long long)object->direct_release_failures);
-        pipeline_on_mapping_freed(object);
         return;
     }
+    object->direct_release_streak = 0;
+    object->direct_active = FALSE;
     object->direct_frames++;
-    object->direct_releases++;
     pipeline_session_unlock(object);
-    /* The driver keeps at most one mapping per session, so the worker cannot map
-     * the next frame until this one is back. */
+    /* The driver keeps one mapping per capture buffer (1.0.0.22), so this only
+     * wakes the worker; a session may have several buffers out at once. */
     pipeline_on_mapping_freed(object);
 }
 
@@ -3554,20 +4312,45 @@ static void decoder_drop_direct(VIRTIO_WDDM_VideoDecoder *object) {
  * answers ST_INVALID_DEVICE_STATE when nothing is, so calling it after every
  * failed acquisition is a cheap *proof* that the queue is intact, and a repair
  * when it is not.  Both outcomes are counted: `stray_releases > 0` in the
- * summary means the queue really was short and this call is what fixed it. */
+ * summary means the queue really was short and this call is what fixed it.
+ *
+ * CONCURRENT-MAPPING (2026-10-25): on driver 1.0.0.22 this probe is a *proof*,
+ * not a repair: the driver releases per index, so a buffer can only be left out
+ * if this file lost an index -- which the per-index bookkeeping above makes
+ * visible instead.  The probe therefore runs only when this decoder owns **no**
+ * mapping at all (`pipeline_mapping_owned_locked` below); `VM_RELEASE_ALL_INDEX`
+ * would otherwise throw away a mapping a job (or the DDI thread) is still
+ * reading.  With an empty table the driver answers ST_INVALID_DEVICE_STATE and
+ * nothing is touched, which is the normal outcome and is counted as
+ * `stray_release_empty`. */
 static void decoder_release_stray_frame(VIRTIO_WDDM_VideoDecoder *object) {
     BOOL released;
 
-    if (!object || !object->session)
+    if (!object || !decoder_session_borrow(object))
         return;
     pipeline_session_lock(object);
-    released = vm_release_frame(object->session, 0xFFFFFFFFu) ? TRUE : FALSE;
+    /* MAPPINGONE (2026-10-25): Index 0xFFFFFFFF means "release whatever is
+     * mapped", and in pipeline mode that can be a capture buffer a *job* still
+     * owns -- a frame the worker mapped and marked READY but the DDI thread has
+     * not drained yet.  Releasing it here would unmap the pages the pending
+     * upload is about to read (the exact case the full-verify AV1 log shows:
+     * "stray release #1" right after the failed job-2 MAP_FRAME) and leave that
+     * job's index stale.  The owner hands its own mapping back through
+     * decoder_drop_direct(), so skip instead of stealing.  With per-buffer
+     * mappings (1.0.0.22) that rule is what keeps a *multi*-frame client safe. */
+    if (pipeline_mapping_owned_locked(object)) {
+        object->stray_release_skipped++;
+        pipeline_session_unlock(object);
+        return;
+    }
+    released = vm_release_frame(decoder_session_borrow(object), VM_RELEASE_ALL_INDEX) ? TRUE : FALSE;
     pipeline_session_unlock(object);
     if (released) {
         object->stray_releases++;
-        INFO("%s: RELEASE_FRAME(0xFFFFFFFF) requeued a capture buffer that was "
-             "still checked out of the device -- the CAPTURE queue was short by "
-             "one until this call (stray release #%llu)", __FUNCTION__,
+        INFO("%s: RELEASE_FRAME(VM_RELEASE_ALL_INDEX) requeued a capture buffer "
+             "that was still checked out of the device while this decoder owned "
+             "no mapping -- the CAPTURE queue was short until this call (stray "
+             "release #%llu)", __FUNCTION__,
              (unsigned long long)object->stray_releases);
     } else {
         object->stray_release_empty++;
@@ -3660,7 +4443,77 @@ static void decoder_release_stray_frame(VIRTIO_WDDM_VideoDecoder *object) {
  *    session.
  */
 
-#define VIRTIO_WDDM_PIPELINE_JOBS 2u
+/* §5.4 DEFERRED (2026-10-25, round 23): the ring is no longer "two slots, the
+ * older one drained by the very EndFrame that submits the newer one".  That
+ * form blocked DecoderEndFrame on the worker and deadlocked the first frame
+ * (04-测试记录/22-并发mapping-上机.md §4.2).  Now DecoderEndFrame only queues;
+ * the picture is uploaded by decoder_sync_texture() when the application is
+ * about to READ that texture/subresource.  A player runs its renderer 17-21
+ * frames behind its decoder (PotPlayer rotates 22 slices), so the ring has to
+ * hold that many jobs.  §5.4b (round 24) no longer depends on that: a submit that
+ * finds the ring full drains the oldest job itself (pipeline_drain_one), so a
+ * small ring costs uploads on the submit thread, not a deadlock.  Default 32 is
+ * one order of magnitude above the 18 capture buffers 1.0.0.22 grants, so the
+ * capacity path stays rare in practice.  Sized at runtime
+ * (VIRTIO_WDDM_PIPELINE_JOBS, 4..96) because it is a memory/queue trade-off, not
+ * a protocol constant. */
+#define VIRTIO_WDDM_PIPELINE_JOBS_DEFAULT 32u
+#define VIRTIO_WDDM_PIPELINE_JOBS_MAX 96u
+
+/* §7 P3 AV1 ASYNC COLLECT (2026-10-26, round 27): the host AV1 decoder
+ * (c2.qti.av1.decoder) keeps ~18 decoded pictures inside itself before it emits
+ * the first CAPTURE buffer -- Codec2 logs "updating output delay 11 -> 17" and
+ * REQBUFS CAPTURE grants 18.  "One EndFrame = one picture, now" therefore cannot
+ * work for AV1: round 26's worker sent one AU and immediately fetched, so the
+ * first 18 fetches each waited their whole 1000 ms budget for a picture that was
+ * still inside the decoder, failed (err=121), and the decode thread was paced to
+ * ~1 AU/s (19 AUs in 20 s, 1 frame out).
+ *
+ * AV1 instead keeps a constant lag of `av1_lag` access units in the host before
+ * it fetches anything (author doc §5.4: "no blocking DecoderEndFrame as general
+ * synchronisation" -- the sender never waits for the picture of the frame it just
+ * sent).  The lag must be >= the host's output delay; 20 > the measured 18, it is
+ * raised to `granted + 2` the moment the host reports its capture depth, and
+ * VIRTIO_WDDM_AV1_LAG overrides it for experiments.
+ *
+ * The collect itself is still the one and only pipeline_drain_one() -- nothing
+ * here duplicates the wait/upload/retire sequence. */
+/* §7 P3 (round 28): 20 -> 24.  The host's output depth is 18 (REQBUFS granted 18,
+ * CCodec "output delay 11 -> 17"); a lag of 20 leaves only two access units of
+ * margin, and with the show_existing_frame unit every hidden picture now also
+ * spends one CAPTURE buffer, so the send side must be able to stay ahead of the
+ * fetch side by more than the host's own depth or the collector turns every send
+ * into a 300 ms failed fetch.  24 = granted + 6. */
+#define VIRTIO_WDDM_AV1_LAG_DEFAULT 24u
+/* §7 P3 (round 27): one AV1 fetch attempt is short.  The worker must never sit in
+ * a fetch for the 1-3 s the host needs at start-up: while it waits it cannot send
+ * the access units that would make the host produce the picture (and the submit
+ * ring fills behind it).  300 ms is long enough for a picture that is already
+ * due, and a miss is retried -- the job keeps its place in the host output order
+ * -- up to VIRTIO_WDDM_AV1_FETCH_TRIES times before §5.4's "timeout fails the
+ * job" applies. */
+#define VIRTIO_WDDM_AV1_FETCH_MS_DEFAULT 300u
+/* §7 P3 (round 28): 10 -> 60.  A miss now only happens when the host's output
+ * delay model says the picture should exist (see av1_host_delay), so a miss is
+ * a real "the host is slower than its own declared delay", not the guaranteed
+ * miss round 27 wasted 10 tries on.  At 300 ms each this is 18 s before a job is
+ * declared failed, which is the §5.4 rule ("every wait has a timeout") without
+ * failing a picture that is merely late. */
+#define VIRTIO_WDDM_AV1_FETCH_TRIES 60u
+/* 2026-10-27 (round 1027b): the AV1 EndFrame NEVER waits.  This is the whole
+ * budget it may spend on pipe->lock and on the ring; when it cannot get either it
+ * drops the AU (counted) instead of stalling the application.  5 ms is below one
+ * host frame at any refresh rate, so the feed rate is the application's, not the
+ * decoder's. */
+#define VIRTIO_WDDM_AV1_NOWAIT_MS 5u
+
+/* §5.4b (2026-10-25, round 24): a drain/backpressure timeout gets its own code.
+ * The author's §5.4 says a timeout is a FAILED job, not a success, and it has to
+ * be tellable apart from a broken texture or a host decode error: everything in
+ * this file used to collapse to E_FAIL, which made a wedged host look like a bad
+ * resource in the application's HRESULT.  HRESULT_FROM_WIN32(ERROR_TIMEOUT) is
+ * 0x800705B4 "the wait operation timed out". */
+#define VIRTIO_WDDM_E_PIPELINE_TIMEOUT HRESULT_FROM_WIN32(ERROR_TIMEOUT)
 
 /* A job is a ring slot.  The states are the worker's and the DDI thread's
  * shared vocabulary; every transition happens under pipe->lock. */
@@ -3670,8 +4523,35 @@ static void decoder_release_stray_frame(VIRTIO_WDDM_VideoDecoder *object) {
 #define VIRTIO_WDDM_JOB_FETCHING 3u /* worker is inside map/get                    */
 #define VIRTIO_WDDM_JOB_READY 4u    /* pixels available, waiting for the DDI       */
 #define VIRTIO_WDDM_JOB_FAILED 5u   /* a stage failed; see failure/error           */
+/* P4-13 REQFIX: the host refused THIS access unit with ERROR_NO_SYSTEM_RESOURCES
+ * (1450), i.e. it could not allocate a buffer for this AU -- the session itself
+ * is intact.  Distinct from FAILED on purpose: FAILED means "the send may have
+ * left the session in an unknown state" and makes pipeline_frame() quiesce +
+ * flush (which throws the decoder DPB away and demands a key frame).  A DROPPED
+ * job is retired like any other slot -- generation untouched, session kept --
+ * and only its picture is lost. */
+#define VIRTIO_WDDM_JOB_DROPPED 6u  /* AU refused err=1450; session still valid    */
+/* §5.4: one consumer thread is inside the upload of this job (the picture is
+ * being copied into the D3D11 texture, outside pipe->lock).  A second reader of
+ * the same subresource waits for it instead of uploading twice. */
+#define VIRTIO_WDDM_JOB_UPLOADING 7u
+/* §7 P3 AV1 ASYNC COLLECT (round 27): the access unit is on the wire and the job
+ * is WAITING for its picture -- the host has not produced it yet.  This is the
+ * state that makes "one EndFrame = one picture, now" impossible for AV1: the
+ * picture of AU N only exists after the host has consumed ~18 more pictures.  A
+ * SENT job is owned by nobody (no ioctl is running for it), so a drain may fail
+ * it on timeout and a capacity drain may simply skip it; the worker fetches it
+ * once `av1_lag` access units are in the host.  Only AV1 ever enters this state. */
+#define VIRTIO_WDDM_JOB_SENT 8u
+
+#include "media_tag_match.h"
+#include "media_read_state.h"
+#include "media_upload_scratch.h"
 
 typedef struct {
+    UINT read_ticket;
+    UINT64 read_version;
+    MT_JOB identity;
     UINT state;
     UINT64 seq;        /* 1-based submission order */
     UINT64 generation; /* pipe->generation at submit time */
@@ -3713,6 +4593,31 @@ typedef struct {
     UINT8 *slot;
     UINT slot_cap;
     BOOL using_slot;
+    /* §7 P3 (round 27): does this access unit owe the DDI thread a picture?  TRUE
+     * for every H.264/HEVC/VP9 AU and for every SHOWN AV1 picture; FALSE for the
+     * hidden AV1 DPB catch-up, which the host decodes without emitting a CAPTURE
+     * buffer (measured: "Skipping empty output buffer" == hidden sends).  A FALSE
+     * job is retired by the worker right after its send, never fetched. */
+    BOOL produces_picture;
+    /* 2026-10-27 (round 46): the worker is inside a host ioctl for this job
+     * (SENDING/FETCHING) and a flush/destroy/eviction asked for the slot.  The
+     * slot MUST NOT be freed while that ioctl still reads job->au or writes
+     * job->map, so the release only marks it and the worker retires it the
+     * moment the call returns. */
+    BOOL dead;
+    /* TRUE exactly while this job's host ioctl (vm_send / vm_map_frame /
+     * vm_get_frame) is running without pipe->lock.  Only then may the slot not be
+     * freed -- see pipeline_job_release_locked(). */
+    BOOL in_ioctl;
+    /* §7 P3 (round 27): how many short AV1 fetch attempts this job already spent
+     * without a picture.  A miss does not fail the job (it keeps its place in the
+     * host's output order); only the VIRTIO_WDDM_AV1_FETCH_TRIES-th miss does. */
+    UINT fetch_tries;
+    /* §7 P3 (round 28): which stage-1 send this job was (1-based).  The host
+     * emits the picture of input N only after it has consumed
+     * N + pipe->av1_host_delay inputs, so the collector can decide whether a
+     * fetch attempt has any chance before it spends the budget. */
+    UINT64 input_ordinal;
 
     double send_ms;
     double fetch_ms;
@@ -3722,31 +4627,179 @@ typedef struct {
 
 typedef struct VIRTIO_WDDM_DecodePipeline {
     VIRTIO_WDDM_VideoDecoder *object;
+    /* LIFE: object points at a zeroed heap snapshot with an explicit whitelist.
+     * It never points at runtime private storage when life_mode is set. */
+    BOOL life_mode;
+    VM_SESSION *owned_session; /* LIFE sole owner; snapshot/runtime session are NULL */
+    volatile LONG life_refs, detached, quarantined;
+    volatile LONG flushing, maintenance_owner;
+    LONG worker_active, reader_active; /* pipe lock: entire task/read lifetime, not just IOCTL */
+    volatile LONG runtime_owner; /* 0=idle, thread id=one active DDI; no permanent affinity */
+    volatile LONG stream_started; /* sticky accepted input history, independent of upload count */
+    SRWLOCK ref_lock;
+    ML_MAP_LEASE orphan_lease;
+    HANDLE cleanup_thread, refs_changed;
+    ID3D11DeviceContext1 *upload_context; /* independent COM lease */
+    BOOL unresolved_map;
+    VM_FRAME_MAP orphan_map; /* failed late MAP release retains ownership */
+    UINT orphan_token;
+    UINT64 orphan_generation;
     CRITICAL_SECTION lock; /* the jobs *and* every session call */
+    BOOL strict_read;
+    BOOL tag_mode, tag_paused, tag_fetching;
+    HANDLE collector;
+    HANDLE tag_wake;
     HANDLE thread;
     DWORD thread_id;
     HANDLE wake;  /* auto-reset: work for the worker / state changed        */
     HANDLE ready; /* auto-reset: a job left SENDING/FETCHING                */
     BOOL started;
-    BOOL stop;
-    BOOL broken; /* a stage timed out: the session cannot be trusted any more */
-    BOOL defer;  /* FALSE = PIPELINE_DEPTH 1: drain the job just submitted   */
+    volatile LONG stop;
+    BOOL broken; /* protected stage state */
+    MA_TERMINAL admission_terminal; /* Interlocked only; never reset by flush. */
     UINT timeout_ms;
+    /* §5.4b (round 24): how long the worker may poll the host for one frame.  The
+     * application's decode thread legitimately runs seconds ahead of the host's
+     * real-time decoder, so this is separate from (and larger than) timeout_ms --
+     * the budget for a *fetch* is not the budget for a queue/gate wait. */
+    UINT fetch_timeout_ms;
     UINT64 generation;
     UINT64 submit_seq;
     UINT64 drain_seq;
+    /* §5.4: the ring is allocated by pipeline_create() (job_count entries).
+     * jobs_in_flight counts QUEUED..UPLOADING slots. */
+    UINT job_count;
     UINT jobs_in_flight;
-    VIRTIO_WDDM_PipelineJob jobs[VIRTIO_WDDM_PIPELINE_JOBS];
-    /* The capture buffer currently checked out of the device by a job whose
-     * pixels were handed to the DDI thread.  The worker may not map the next
-     * frame until it is back. */
-    BOOL mapping_out;
-    UINT64 mapping_out_seq;
-    /* The neutral black picture written by the fill EndFrame. */
+    /* §5.4b (round 24): how many jobs may be outstanding before pipeline_submit
+     * itself drains the oldest one.  This is the backpressure that keeps the
+     * worker from running tens of frames ahead of the host's real-time decoder --
+     * a lead of ~30 frames made MAP_FRAME wait ~1 s and held pipe->lock for that
+     * second, stalling the renderer.  Ring depth (job_count) stays large; this cap
+     * is the throttle.  Correctness does not depend on it (a full ring still
+     * drains), only latency does. */
+    UINT max_inflight;
+    /* §7 P3 AV1 ASYNC COLLECT (round 27).  AV1 does not pair "this EndFrame" with
+     * "the picture that is ready now": the host holds ~18 pictures, so the
+     * pipeline sends `av1_lag` access units first and only then starts fetching,
+     * oldest first.  `av1_outstanding` is the number of SENT jobs whose picture
+     * the host has not produced yet; the worker sends while it is below the lag
+     * and fetches while it is at/above it.  `av1_cap_skips` counts the submits
+     * that went over max_inflight because the opportunistic drain found no
+     * picture -- the "skip it and keep enqueueing" rule that keeps the AV1
+     * decode thread off the host's output delay. */
+    BOOL av1_async;
+    UINT av1_lag;
+    UINT av1_outstanding;
+    /* §7 P3 (round 28): the show_existing_frame experiment is OFF by default.
+     *
+     * The temporal unit is right -- ffmpeg's AV1 decoder plays a 6-packet prefix
+     * of t6_av1.mkv plus the UMD's own 5 bytes ({12 00 1a 01 80|slot<<4}) and
+     * outputs one MORE frame than without it (verify-showex-ffmpeg.py: 6 -> 7),
+     * and the slot is the one the source's own show_existing names (derived
+     * refresh mask == the encoder's refresh_frame_flags for every alt-ref:
+     * 0x01/0x08/0x20/0x40).  The HOST, however, answers a show_existing unit
+     * with an EMPTY output buffer, exactly like a hidden frame: round 28's
+     * a28 run sent 4 hidden catch-ups + 4 show_existing units in the first
+     * second and the host emitted 8 "Skipping empty output buffer" and no
+     * CAPTURE buffer for any of them, while the key frame's job did become
+     * READY.  So c2.qti.av1.decoder (through crosvm's QC2 wrapper) does not
+     * turn a show_existing unit into a picture we can map.  Keep the code (the
+     * VIRTIO_WDDM_AV1_SHOW_EXISTING=1 A/B switch) but do not spend a host input
+     * on it by default. */
+    BOOL av1_show_existing;
+    /* §7 P3 (round 28): send a hidden (show_frame=0) picture SHOWN at its own
+     * EndFrame instead of deferring it to a show_existing unit.  Default on: the
+     * host's output delay is counted in INPUTS, and extra inputs are what makes
+     * the first picture appear while the client is still starved. */
+    BOOL av1_shown_always;
+    /* AV1 STATEFUL PORT (2026-10-27): allow submit() to produce NO temporal unit
+     * for an inter picture (the reference's one-frame lookahead).  OFF by
+     * default: with the pipeline off the DDI must hand the client a decoded
+     * picture before EndFrame returns, and a deferred picture can only be routed
+     * to its own output view through a queued job.  VIRTIO_WDDM_AV1_LOOKAHEAD=1
+     * with VIRTIO_WDDM_PIPELINE=1 turns on the reference behaviour: inter frames
+     * go out ONE EndFrame late, with the exact derived refresh mask, and are not
+     * re-decoded as a hidden catch-up. */
+    BOOL av1_lookahead;
+    /* §7 P3 (round 28): the host's output delay, in INPUT buffers.  Round 28
+     * measured it directly: 27 inputs in the a28 run produced exactly 10
+     * outputs (1 picture + 9 empty) -- CCodec's "updating output delay 17" is
+     * 17 inputs, and from input 18 on the host emits one output per input, in
+     * input order.  The collector uses it to avoid spending a 300 ms fetch
+     * attempt on a picture the host cannot have produced yet. */
+    UINT av1_host_delay;
+    /* Every stage-1 send, picture or not.  A job's picture becomes available
+     * only after (job->input_ordinal + av1_host_delay) inputs went in. */
+    UINT64 av1_inputs_sent;
+    /* §7 P3 (round 27): QPC of the newest submit.  The AV1 collector only fetches
+     * before the lag is reached when the source has gone quiet (pause/EOF), so it
+     * needs to know how long ago the last access unit arrived. */
+    LONGLONG last_submit_qpc;
+    UINT64 av1_sent;
+    UINT64 av1_produced;
+    UINT64 av1_catchup_jobs;
+    UINT64 av1_cap_skips;
+    UINT64 av1_drain_keeps;
+    /* 2026-10-27 (round 1027b): the "AV1 EndFrame never waits" accounting.
+     *   av1_slot_evictions - ring was full, the oldest job was released (no upload)
+     *   av1_feed_dropped   - an AU could not be enqueued at all and was skipped
+     *   av1_lock_skips     - pipe->lock was busy longer than NOWAIT_MS */
+    UINT64 av1_slot_evictions;
+    UINT64 av1_feed_dropped;
+    UINT64 av1_feed_waits;   /* round 46: a submit waited for a slot instead of dropping */
+    UINT64 av1_lock_skips;
+    UINT64 av1_drain_keeps_worker;
+    UINT64 av1_fetch_waits;
+    double av1_fetch_wait_sum;
+    double av1_fetch_wait_max;
+    UINT av1_fetch_ms; /* per-attempt AV1 fetch budget (short: see above)        */
+    /* 2026-10-27 (round 1027b): the worker only SENDS on the AV1 path; the read
+     * path / capacity drain collects.  On by default for the stateful builder,
+     * forced off for VIRTIO_WDDM_AV1_LEGACY_BUILD (that path has no read-side
+     * collector for its catch-up units). */
+    BOOL av1_send_only;
+    UINT64 av1_fetch_retries;         /* fetch attempts that found no picture yet  */
+    UINT64 av1_read_failures_swallowed; /* reads that would have returned E_FAIL  */
+    VIRTIO_WDDM_PipelineJob *jobs;
+    /* How many capture buffers this decoder has checked out of the device
+     * (job->mapped).  The stage-2 gate lets the worker map while this is below
+     * mapping_limit: 1 for a driver that maps one buffer per session (<=
+     * 1.0.0.21), capture_count for 1.0.0.22's per-index mapping.  In the
+     * deferred form a mapped job keeps its buffer until the consumer uploads
+     * the picture, so this is a real queue, not one in-flight buffer. */
+    UINT mappings_out;
+    UINT mapping_limit;
+    BOOL multi_mapping;
+    /* Signalled whenever a job is retired, so a submit that found the ring full
+     * can wake up (capacity backpressure only -- never a frame wait). */
+    HANDLE slot_free;
+    /* The neutral black picture, written once per (texture, subresource) that a
+     * consumer reads before any decoded picture landed in it: an uninitialised
+     * NV12 slice is flat green, not black (the P2-2J bug). */
     UINT8 *fill;
     UINT fill_cap;
     UINT fill_size;
     UINT fill_logged;
+    /* The (texture, subresource) pairs this generation has already written a
+     * picture into.  Only consulted when a read finds no pending job; cleared by
+     * quiesce, because a flush starts a new generation. */
+#define VIRTIO_WDDM_PIPELINE_UPLOADED_MAX 256u
+    struct {
+        ID3D11Resource *texture;
+        UINT subresource;
+    } uploaded[VIRTIO_WDDM_PIPELINE_UPLOADED_MAX];
+    UINT uploaded_next;
+    /* The textures this decoder has ever submitted a job for (weak pointers,
+     * recorded in pipeline_submit).  decoder_sync_texture() is called for EVERY
+     * resource the application reads -- Map, CopyResource, the read-after-write
+     * hazards, an SRV read -- so the first question has to be "is this even one
+     * of our output surfaces?".  Without this set the neutral fill below was
+     * offered to PotPlayer's own textures and DXVK answered E_INVALIDARG four
+     * times per session (0x80070057 in the first on-device run of this round).
+     * The fill only ever applies to a texture in this set. */
+#define VIRTIO_WDDM_PIPELINE_TARGETS_MAX 64u
+    ID3D11Resource *targets[VIRTIO_WDDM_PIPELINE_TARGETS_MAX];
+    UINT targets_next;
     /* diagnostics */
     UINT64 submitted;
     UINT64 produced;
@@ -3758,16 +4811,169 @@ typedef struct VIRTIO_WDDM_DecodePipeline {
     UINT64 fetch_failures;
     UINT64 send_retries;
     UINT64 failed_jobs;
+    /* P4-13 REQFIX: jobs whose access unit the host refused with err=1450 (the
+     * AU was dropped, the session was kept) and how often the worker slept
+     * instead of re-asking a host that is out of buffers. */
+    UINT64 au_dropped;
+    UINT64 send_backoffs;
     UINT64 drained_mapped;
     UINT64 drained_staged;
     UINT64 logged;
+    UINT64 backpressure;     /* submits that found the ring full               */
+    /* §5.4b (round 24): capacity backpressure is now a DRAIN, not a wait.
+     * drain_capacity counts the submits that found no free slot; every one of
+     * them retires the oldest job instead of waiting for a consumer.  selected /
+     * retired are the drain's own audit: every selected job must end retired
+     * (READY -> upload -> retire, FAILED/DROPPED -> retire, timeout while still
+     * QUEUED -> FAILED + retire).  A timeout with the worker inside send/fetch
+     * marks the pipeline broken instead (the ioctl may still write the slot). */
+    UINT64 drain_capacity;
+    UINT64 drain_selected;
+    UINT64 drain_retired;
+    UINT64 drain_timeouts;
+    UINT64 drain_failures;
+    /* §5.4b diagnostic: VIRTIO_WDDM_PIPELINE_TRACE=1 adds per-call lines (submit
+     * enter/enqueue, sync entry, blt entry, worker idle heartbeat).  Default off
+     * so a normal run pays nothing; the on-guest trace run uses it to find where
+     * a stall happens when no other log line is printed. */
+    BOOL trace;
+    UINT64 sync_wait_timeouts; /* consumers that gave up waiting for a picture  */
     double lead_sum;
-    double lead_max;   /* ready -> drain: how far ahead the worker was        */
+    double lead_max;   /* ready -> upload: how far ahead the worker was        */
     double queue_sum;  /* submit -> ready: the job's end-to-end latency        */
     double queue_max;
-    double wait_sum;   /* time the DDI thread spent waiting for a job          */
+    double wait_sum;   /* time a consumer thread spent in decoder_sync_texture */
     double wait_max;
+    double upload_sum; /* the DXVK upload itself (the 3.1 MB staging copy)     */
+    double upload_max;
 } VIRTIO_WDDM_DecodePipeline;
+
+/* Short publication lock only: never held over logging, IO, COM or waits.
+ * Runtime builder/scratch still requires external owner-operation serialization;
+ * ctx pins do NOT prove concurrent runtime Destroy safe. */
+static SRWLOCK g_runtime_ctx_lock = SRWLOCK_INIT;
+static void life_ref(VIRTIO_WDDM_DecodePipeline *p);
+static void life_unref(VIRTIO_WDDM_DecodePipeline *p);
+static VIRTIO_WDDM_DecodePipeline *runtime_ctx_pin(VIRTIO_WDDM_VideoDecoder *o) {
+    VIRTIO_WDDM_DecodePipeline *p = NULL;
+    AcquireSRWLockShared(&g_runtime_ctx_lock);
+    if (o && o->pipeline && o->pipeline->life_mode &&
+        !InterlockedCompareExchange(&o->pipeline->detached,0,0)) {
+        p=o->pipeline;
+        life_ref(p); /* pointer acquisition + ref are in the same slot lock */
+    }
+    ReleaseSRWLockShared(&g_runtime_ctx_lock);
+    return p;
+}
+static BOOL runtime_is_life(VIRTIO_WDDM_VideoDecoder *o) {
+    /* This immutable request marker also fails closed after slot revocation. */
+    return o && (o->life_requested || o->async_lifetime);
+}
+static VM_SESSION *life_owner_session(VIRTIO_WDDM_DecodePipeline *p) {
+    return p->owned_session; /* caller owns ctx reference or cleanup quiescence */
+}
+static VM_SESSION *runtime_ctx_borrow(VIRTIO_WDDM_DecodePipeline *pin) {
+    return pin ? life_owner_session(pin) : NULL;
+}
+/* A stack object owns no additional ref: timed wrapper owns exactly one pin.
+ * Scan by runtime key so reentrant calls into a different decoder cannot hide
+ * or steal an outer decoder's pin. Never ref a raw published pointer here. */
+typedef struct RUNTIME_CTX_SCOPE {
+    VIRTIO_WDDM_VideoDecoder *runtime;
+    VIRTIO_WDDM_DecodePipeline *pin;
+    struct RUNTIME_CTX_SCOPE *previous;
+} RUNTIME_CTX_SCOPE;
+static __thread RUNTIME_CTX_SCOPE *g_runtime_ctx_scope;
+static void runtime_scope_enter(RUNTIME_CTX_SCOPE *scope,
+                                VIRTIO_WDDM_VideoDecoder *runtime,
+                                VIRTIO_WDDM_DecodePipeline *pin) {
+    scope->runtime=runtime; scope->pin=pin;
+    scope->previous=g_runtime_ctx_scope; g_runtime_ctx_scope=scope;
+}
+static void runtime_scope_leave(RUNTIME_CTX_SCOPE *scope) {
+    g_runtime_ctx_scope=scope->previous;
+    if(scope->pin) life_unref(scope->pin);
+    scope->pin=NULL; /* wrapper exit consumes its sole pin exactly once */
+}
+static VIRTIO_WDDM_DecodePipeline *decoder_ctx_access(VIRTIO_WDDM_VideoDecoder *o) {
+    RUNTIME_CTX_SCOPE *scope;
+    if(!o) return NULL;
+    if(o->life_snapshot) return o->pipeline; /* independent heap-held view */
+    if(!runtime_is_life(o)) return o->pipeline;
+    for(scope=g_runtime_ctx_scope; scope; scope=scope->previous)
+        if(scope->runtime==o) return scope->pin;
+    return NULL; /* no scope: destroy/debug must not borrow a revoked/raw slot */
+}
+/* Terminal is per pipeline lifetime, deliberately not per flush generation.
+ * A refused compressed AU may already have advanced the producer DPB. Even a
+ * racing flush therefore cannot reopen this decoder; only recreation can. */
+/* Accepted input, rather than uploaded-picture count, establishes maintenance
+ * history: the host may already own reference state before any texture is read.
+ * Caller has a DDI context pin; this scalar never points back to runtime storage. */
+static BOOL decoder_stream_started(VIRTIO_WDDM_VideoDecoder *object) {
+    VIRTIO_WDDM_DecodePipeline *p=decoder_ctx_access(object);
+    return p && p->life_mode ? InterlockedCompareExchange(&p->stream_started,0,0)!=0
+                            : object && object->frames>0;
+}
+static BOOL pipeline_admission_terminal(VIRTIO_WDDM_VideoDecoder *object) {
+    VIRTIO_WDDM_DecodePipeline *p = decoder_ctx_access(object);
+    return p && ma_terminal(&p->admission_terminal);
+}
+static HRESULT pipeline_commit_read(VIRTIO_WDDM_VideoDecoder *object) {
+    VIRTIO_WDDM_DecodePipeline *p = decoder_ctx_access(object);
+    if (!p) return S_OK;
+    if (!ma_authorize(&p->admission_terminal)) return E_FAIL;
+    return ma_complete(&p->admission_terminal) ? S_OK : E_FAIL;
+}
+static void pipeline_fail_admission(VIRTIO_WDDM_VideoDecoder *object) {
+    VIRTIO_WDDM_DecodePipeline *p = decoder_ctx_access(object);
+    if (!p) return;
+    ma_fail(&p->admission_terminal);
+    if (p->wake) SetEvent(p->wake);
+    if (p->ready) SetEvent(p->ready);
+    if (p->slot_free) SetEvent(p->slot_free);
+    if (p->tag_wake) SetEvent(p->tag_wake);
+}
+static VM_SESSION *decoder_session_borrow(VIRTIO_WDDM_VideoDecoder *o) {
+    if(runtime_is_life(o)) return runtime_ctx_borrow(decoder_ctx_access(o));
+    return o ? o->session : NULL;
+}
+/* VOID End cannot return an HRESULT. Keep decoder-local failure policy without
+ * invoking the device-removing error callback, touching builder, or trying to
+ * release direct mappings through a missing scope. Runtime storage must still
+ * be alive under the external DDI/Destroy serialization contract. */
+static void decoder_end_pin_failed(VIRTIO_WDDM_VideoDecoder *runtime) {
+    runtime->decode_failures++;
+    if(runtime->pending_error==S_OK) runtime->pending_error=E_ABORT;
+    ERROR("LIFE EndFrame rejected: ctx pin unavailable; decoder failure E_ABORT; no builder mutation, no device error callback");
+}
+static BOOL life_runtime_enter(VIRTIO_WDDM_DecodePipeline *p) {
+    LONG tid=(LONG)GetCurrentThreadId();
+    /* One atomic word is both exclusion and active owner identity. Sequential
+     * calls may migrate threads; simultaneous calls and same-thread reentry are
+     * rejected. A separate active flag would permit leave to clear a new owner. */
+    if(InterlockedCompareExchange(&p->runtime_owner,tid,0)) return FALSE;
+    if(InterlockedCompareExchange(&p->flushing,0,0) || p->broken || InterlockedCompareExchange(&p->detached,0,0)) {
+        InterlockedCompareExchange(&p->runtime_owner,0,tid); return FALSE;
+    }
+    return TRUE;
+}
+static void life_runtime_leave(VIRTIO_WDDM_DecodePipeline *p) {
+    /* Final owner access: a different thread may enter as soon as this clears. */
+    if(p) InterlockedCompareExchange(&p->runtime_owner,0,(LONG)GetCurrentThreadId());
+}
+static void life_owner_transfer(VIRTIO_WDDM_DecodePipeline *p,
+                                VIRTIO_WDDM_VideoDecoder *runtime) {
+    p->owned_session=runtime->session;
+    runtime->session=NULL;
+}
+
+
+/* §7 P3 (round 27): retire a job whose AU was sent but that owes no picture (the
+ * hidden AV1 DPB catch-up).  Called by the worker right after such a send; the
+ * body lives with the other retire helpers, below the worker. */
+static void pipeline_retire_no_picture_locked(VIRTIO_WDDM_DecodePipeline *pipe,
+                                              VIRTIO_WDDM_PipelineJob *job);
 
 /* What pipeline_frame() hands back to DecoderEndFrame: everything the upload
  * tail needs, taken from the drained job rather than from the current
@@ -3775,6 +4981,10 @@ typedef struct VIRTIO_WDDM_DecodePipeline {
 typedef struct {
     BOOL fill;  /* the neutral picture, not a decoded frame */
     BOOL failed;
+    /* P4-13 REQFIX: the job was retired because the host refused its AU with
+     * err=1450.  `failed` is still set (the frame is lost), but the session is
+     * NOT suspect, so the caller must not quiesce/flush the pipeline. */
+    BOOL dropped_au;
     const UINT8 *src;
     UINT64 readable;
     VM_FRAME_INFO info;
@@ -3861,17 +5071,173 @@ static UINT pipeline_left_ms(LONGLONG deadline) {
     return (UINT)left;
 }
 
+/* §5.4 DEFERRED (2026-10-25, round 23): "does this decoder own a capture buffer
+ * that is checked out of the driver?".
+ *
+ * Owner (1) is a job: every job the worker mapped keeps its capture buffer until
+ * a consumer uploads the picture (decoder_sync_texture) or a flush/destroy drops
+ * the job.  Owner (2) is the serial path's object->direct_map.  The deferred
+ * pipeline maps several buffers at once -- driver 1.0.0.22 tracks a mapping per
+ * capture buffer -- so the pipeline side is a *count*, and the worker's stage-2
+ * gate compares that count against pipe->mapping_limit instead of waiting for
+ * "the" single buffer (the form that deadlocked: job 2 timed out 1250 ms waiting
+ * for a capture buffer that the consumer had not released yet).
+ *
+ * This predicate is now only used where the answer must be "no buffer at all is
+ * out" (the RELEASE_ALL_INDEX stray probe).  Must be called with the pipeline
+ * lock held (also works without a pipeline: serial path). */
+static BOOL pipeline_mapping_owned_locked(VIRTIO_WDDM_VideoDecoder *object) {
+    if (!object)
+        return FALSE;
+    if (object->direct_active)
+        return TRUE;
+    if (!decoder_ctx_access(object))
+        return FALSE;
+    return decoder_ctx_access(object)->mappings_out > 0;
+}
+
+/* Drop the per-job scratch buffers.  The staged copy is a ~3 MB heap block per
+ * job; keeping it at the ring's high-water mark (24 slots) would cost ~70 MB for
+ * a path that is only the fallback when MAP_FRAME is unavailable.  The AU buffer
+ * is kept: it is small and used by every frame.  Lock held. */
+static void pipeline_job_free_scratch_locked(VIRTIO_WDDM_PipelineJob *job) {
+    if (job->slot) {
+        HeapFree(GetProcessHeap(), 0, job->slot);
+        job->slot = NULL;
+        job->slot_cap = 0;
+    }
+}
+
 /* Release everything a job owns except its ring slot (the AU buffer is kept at
  * its high-water mark, exactly like the decoder's own scratch buffers).  Must
  * be called with the lock held. */
+
+#define READ_TARGET_MAX 1024u
+typedef struct {
+    ID3D11Resource *texture;
+    UINT subresource;
+    UINT read_pins;
+    BOOL destroy_requested;
+    VIRTIO_WDDM_DecodePipeline *pipe;
+    MR_STATE media;
+    LONGLONG deadline;
+} READ_TARGET;
+static SRWLOCK g_read_lock=SRWLOCK_INIT;
+static READ_TARGET g_read_targets[READ_TARGET_MAX];
+static MR_TICKET g_read_tickets[READ_TARGET_MAX];
+static UINT64 g_read_next_ticket;
+/* Lock order: pipe.lock -> read_lock; read_lock never waits for pipe/ioctl. */
+static BOOL read_reserve_locked(VIRTIO_WDDM_DecodePipeline *p,VIRTIO_WDDM_PipelineJob *j) {
+    UINT i,free_slot=READ_TARGET_MAX,match=READ_TARGET_MAX;
+    BOOL ok=FALSE,transfer=FALSE;
+    if(p->broken) return FALSE;
+    /* Temporary reference transfers only if a new persistent entry is installed. */
+    j->texture->lpVtbl->AddRef(j->texture);
+    AcquireSRWLockExclusive(&g_read_lock);
+    if(mr_resource_pinned(g_read_tickets,READ_TARGET_MAX,(uintptr_t)j->texture)) goto out;
+    for(i=0;i<READ_TARGET_MAX;++i) {
+        READ_TARGET *q=&g_read_targets[i];
+        if(!q->texture) { if(free_slot==READ_TARGET_MAX) free_slot=i; continue; }
+        if(q->texture!=j->texture) continue;
+        if(q->pipe!=p || q->read_pins) goto out;
+        if(q->subresource==j->subresource) match=i;
+    }
+    if(match!=READ_TARGET_MAX) free_slot=match;
+    if(free_slot==READ_TARGET_MAX) goto out;
+    {
+        READ_TARGET *q=&g_read_targets[free_slot];
+        UINT k;
+        for(k=0;k<p->job_count;++k) {
+            VIRTIO_WDDM_PipelineJob *old=&p->jobs[k];
+            if(old!=j && old->texture==j->texture && old->subresource==j->subresource &&
+               old->state!=VIRTIO_WDDM_JOB_FREE) goto out;
+        }
+        if(!mr_begin(&q->media,j->seq,j->generation,p->object->media_token)) goto out;
+        if(!q->texture) { q->texture=j->texture; transfer=TRUE; }
+        q->pipe=p; q->subresource=j->subresource;
+        q->deadline=j->submit_qpc+(LONGLONG)p->fetch_timeout_ms*decoder_qpc_freq()/1000;
+        j->read_ticket=free_slot+1; j->read_version=q->media.version;
+        ok=TRUE;
+    }
+out:
+    ReleaseSRWLockExclusive(&g_read_lock);
+    if(!transfer) j->texture->lpVtbl->Release(j->texture);
+    return ok;
+}
+static void read_update_locked(VIRTIO_WDDM_DecodePipeline *p,VIRTIO_WDDM_PipelineJob *j,
+                                UINT operation,HRESULT hr) {
+    READ_TARGET *q;
+    if(!p->strict_read || !j->read_ticket) return;
+    AcquireSRWLockExclusive(&g_read_lock);
+    q=&g_read_targets[j->read_ticket-1];
+    if(q->pipe==p && q->media.version==j->read_version &&
+       q->media.owner.seq==j->seq && q->media.owner.generation==j->generation) {
+        if(operation==0) q->media.owner=j->identity;
+        else if(operation==1 && mr_current(&q->media,&j->identity,j->read_version) &&
+                q->media.state==MR_PENDING) q->media.state=MR_MEDIA_READY;
+        else if(operation==2 || (operation==4 && q->media.state!=MR_QUEUED)) mr_fail(&q->media,hr);
+        else if(operation==3) {
+            if (ma_terminal(&p->admission_terminal)) hr=E_FAIL;
+            mr_publish(&q->media,&j->identity,j->read_version,hr);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_read_lock);
+}
+static BOOL read_upload_pin_locked(VIRTIO_WDDM_DecodePipeline *p,VIRTIO_WDDM_PipelineJob *j) {
+    BOOL ok;
+    if(!p->strict_read) return TRUE;
+    if(!j->read_ticket) return FALSE;
+    AcquireSRWLockExclusive(&g_read_lock);
+    ok=mr_pin(&g_read_targets[j->read_ticket-1].media,&j->identity,j->read_version);
+    ReleaseSRWLockExclusive(&g_read_lock);
+    return ok;
+}
+static void read_forget(VIRTIO_WDDM_DecodePipeline *p,BOOL destroy) {
+    UINT i,n=0;
+    ID3D11Resource *release[READ_TARGET_MAX];
+    AcquireSRWLockExclusive(&g_read_lock);
+    for(i=0;i<READ_TARGET_MAX;++i) if(g_read_targets[i].pipe==p) {
+        READ_TARGET *q=&g_read_targets[i];
+        if(destroy && q->destroy_requested) { release[n++]=q->texture; memset(q,0,sizeof(*q)); }
+        else if(destroy) {
+            if(q->media.state!=MR_QUEUED) mr_fail(&q->media,E_ABORT);
+            q->pipe=NULL; /* resource-lifetime tombstone, not a dangling pipe */
+        } else mr_fail(&q->media,E_ABORT);
+    }
+    ReleaseSRWLockExclusive(&g_read_lock);
+    for(i=0;i<n;++i) release[i]->lpVtbl->Release(release[i]);
+}
 static void pipeline_job_release_locked(VIRTIO_WDDM_DecodePipeline *pipe,
                                         VIRTIO_WDDM_PipelineJob *job,
                                         const char *why) {
+    /* 2026-10-27 (round 46): the worker now runs vm_send()/vm_map_frame()
+     * OUTSIDE this lock (holding it stalled every reader for 16.8 s).  While it
+     * is inside such a call the slot owns the AU buffer the call reads and the
+     * map it writes, so freeing it here would be a use-after-free.  Mark it dead
+     * and let the worker retire it when the ioctl returns. */
+    if (job->in_ioctl) {
+        if (!job->dead) {
+            job->dead = TRUE;
+            VERBOSE("%s: job %llu is inside an ioctl (state=%u), marked dead (%s)",
+                    __FUNCTION__, (unsigned long long)job->seq, job->state, why);
+        }
+        return;
+    }
+    read_update_locked(pipe,job,4,E_FAIL);
     if (job->mapped) {
-        /* A frame that was mapped but never handed to the DDI thread: the
-         * capture buffer can only come back through RELEASE_FRAME. */
+        /* A picture that was mapped but never uploaded: the capture buffer can
+         * only come back through RELEASE_FRAME. */
         job->mapped = FALSE;
-        if (!vm_release_frame(pipe->object->session, job->map.Index)) {
+        if (pipe->mappings_out)
+            pipe->mappings_out--;
+        if (!vm_release_frame(decoder_session_borrow(pipe->object), job->map.Index)) {
+            if (pipe->life_mode) {
+                job->mapped=TRUE;
+                pipe->unresolved_map=TRUE;
+                pipe->broken=TRUE;
+                if(pipe->mappings_out < pipe->job_count) pipe->mappings_out++;
+                return; /* ownership and COM/AU/slot remain live */
+            }
             pipe->object->direct_release_failures++;
             ERROR("%s: job %llu (%s) RELEASE_FRAME(index %u) failed err=%u",
                   __FUNCTION__, (unsigned long long)job->seq, why, job->map.Index,
@@ -3879,8 +5245,6 @@ static void pipeline_job_release_locked(VIRTIO_WDDM_DecodePipeline *pipe,
         } else {
             pipe->object->direct_releases++;
         }
-        if (pipe->mapping_out && pipe->mapping_out_seq == job->seq)
-            pipe->mapping_out = FALSE;
     }
     if (job->texture) {
         job->texture->lpVtbl->Release(job->texture);
@@ -3891,11 +5255,288 @@ static void pipeline_job_release_locked(VIRTIO_WDDM_DecodePipeline *pipe,
                 (unsigned long long)job->seq, job->state, why);
         pipe->dropped++;
     }
+    pipeline_job_free_scratch_locked(job);
+    job->identity.state = MT_EMPTY;
+    if(pipe->tag_mode) SetEvent(pipe->tag_wake);
     job->state = VIRTIO_WDDM_JOB_FREE;
     job->au_size = 0;
     job->using_slot = FALSE;
     job->error = 0;
     job->failure = NULL;
+    job->produces_picture = FALSE;
+    /* Capacity backpressure: a submit that found no free slot waits on this. */
+    SetEvent(pipe->slot_free);
+}
+
+/* §5.4b (2026-10-25, round 24): "the worker leaked pipe->lock" is exactly the
+ * failure mode that cost round 23 a whole test cycle.  A leaked lock turns every
+ * other thread into a silent EnterCriticalSection wait: no "queued job 2", no
+ * "sync #", no ERROR line -- indistinguishable from a host hang.  The worker is
+ * the only thread that takes this lock around blocking ioctls, so at a stage
+ * boundary it must hold it ZERO times.  TryEnterCriticalSection on a lock we
+ * already own succeeds recursively and exposes CRITICAL_SECTION.RecursionCount,
+ * so the guard can both detect the leak and give the lock back; a future missing
+ * LeaveCriticalSection then degrades to one loud ERROR instead of a deadlock. */
+static UINT pipeline_lock_owned_depth(VIRTIO_WDDM_DecodePipeline *pipe) {
+    LONG depth;
+
+    if (!TryEnterCriticalSection(&pipe->lock))
+        return 0; /* another thread owns it: not our leak */
+    depth = pipe->lock.RecursionCount - 1; /* discount the probe's own count */
+    LeaveCriticalSection(&pipe->lock);
+    return depth > 0 ? (UINT)depth : 0u;
+}
+
+/* §5.4b diagnostic (round 24): acquire pipe->lock, but never with an unbounded
+ * EnterCriticalSection.  A leaked or long-held lock is otherwise invisible: both
+ * DDI threads simply stop producing log lines.  If the lock is still held after
+ * 200 ms, say WHO holds it (CRITICAL_SECTION.OwningThread) and how deep; if the
+ * caller's deadline passes, return FALSE so the caller can fail its frame with a
+ * clear code instead of hanging the application.  `where` names the call site.
+ * Only used on the submit path; the read path times its own Enter (see
+ * pipeline_sync) because it must keep the frame semantics of a plain acquire. */
+static BOOL pipeline_lock_bounded(VIRTIO_WDDM_DecodePipeline *pipe, LONGLONG deadline,
+                                  const char *where) {
+    LONGLONG t0 = decoder_qpc_now();
+    BOOL warned = FALSE;
+
+    for (;;) {
+        LONGLONG owner;
+        LONG recursion;
+
+        if (ma_terminal(&pipe->admission_terminal) ||
+            InterlockedCompareExchange(&pipe->stop,0,0) ||
+            InterlockedCompareExchange(&pipe->flushing,0,0) ||
+            InterlockedCompareExchange(&pipe->detached,0,0)) return FALSE;
+        if (TryEnterCriticalSection(&pipe->lock))
+            return TRUE;
+        owner = (LONGLONG)(ULONG_PTR)pipe->lock.OwningThread;
+        recursion = pipe->lock.RecursionCount;
+        if (!warned && decoder_qpc_ms(t0, decoder_qpc_now()) > 200.0) {
+            ERROR("%s: pipe->lock is still held by thread 0x%llx (recursion=%ld) "
+                  "after %.0f ms -- waiting in %s (a leaked or blocking critical "
+                  "section; see 04-测试记录/24)", __FUNCTION__,
+                  (unsigned long long)owner, (long)recursion,
+                  decoder_qpc_ms(t0, decoder_qpc_now()), where);
+            warned = TRUE;
+        }
+        if (pipeline_left_ms(deadline) == 0) {
+            ERROR("%s: gave up on pipe->lock after %.0f ms (owner 0x%llx, "
+                  "recursion=%ld, %s) -> the caller fails this frame instead of "
+                  "hanging", __FUNCTION__, decoder_qpc_ms(t0, decoder_qpc_now()),
+                  (unsigned long long)owner, (long)recursion, where);
+            return FALSE;
+        }
+        Sleep(1);
+    }
+}
+
+/* Free ring slots for the trace lines.  Lock held. */
+static UINT pipeline_free_slots_locked(VIRTIO_WDDM_DecodePipeline *pipe) {
+    UINT free_slots = 0;
+    UINT i;
+
+    for (i = 0; i < pipe->job_count; i++) {
+        if (pipe->jobs[i].state == VIRTIO_WDDM_JOB_FREE)
+            free_slots++;
+    }
+    return free_slots;
+}
+
+/* Experimental tag harvester. session.cc stash/claim pattern: receive has no
+ * initiating job. timeout=0 is a bounded poll, NOT a readiness guarantee.
+ * Exponential idle backoff 10..160 ms; signal on sends; never poll without debt.
+ * Not deployed: historical short MAP polling froze the guest; .30 progress
+ * changes are not proof this scheduler is hardware-safe. */
+static void pipeline_tag_ready_locked(VIRTIO_WDDM_DecodePipeline *p,
+                                      VIRTIO_WDDM_PipelineJob *j) {
+    if (!ma_authorize(&p->admission_terminal)) {
+        j->state=VIRTIO_WDDM_JOB_FAILED;
+        read_update_locked(p,j,2,E_FAIL);
+        return;
+    }
+    if (!ma_complete(&p->admission_terminal)) {
+        j->state=VIRTIO_WDDM_JOB_FAILED;
+        read_update_locked(p,j,2,E_FAIL);
+        return;
+    }
+    read_update_locked(p,j,1,S_OK);
+    j->state = VIRTIO_WDDM_JOB_READY;
+    j->ready_qpc = decoder_qpc_now();
+    p->produced++; p->av1_produced++;
+    if (p->av1_outstanding) p->av1_outstanding--;
+}
+static DWORD WINAPI pipeline_tag_collector(LPVOID arg) {
+    VIRTIO_WDDM_DecodePipeline *p = arg;
+    UINT backoff = 10;
+    for (;;) {
+        VM_FRAME_MAP_TAG_OUT m;
+        VM_FRAME_TAG_OUT f;
+        UINT8 *pixels = NULL;
+        UINT cap = 0, i, error = 0, action = MT_RELEASE;
+        UINT64 generation;
+        BOOL ok = FALSE, mapped = FALSE, debt = FALSE;
+        VIRTIO_WDDM_PipelineJob *owner = NULL;
+        EnterCriticalSection(&p->lock);
+        if (p->stop) { LeaveCriticalSection(&p->lock); break; }
+        for (i=0; i<p->job_count; ++i)
+            if (p->jobs[i].identity.state==MT_SENT ||
+                p->jobs[i].identity.state==MT_SENDING) debt=TRUE;
+        if (InterlockedCompareExchange(&p->flushing,0,0) || p->tag_paused || !debt || p->mappings_out>=p->mapping_limit) {
+            LeaveCriticalSection(&p->lock);
+            WaitForSingleObject(p->tag_wake, 160); continue;
+        }
+        generation=p->generation;
+        p->tag_fetching=TRUE;
+        LeaveCriticalSection(&p->lock);
+        memset(&m,0,sizeof(m)); memset(&f,0,sizeof(f));
+        if (p->object->direct_ok) {
+            ok=vm_map_frame_tag(decoder_session_borrow(p->object),&m,0);
+            mapped=ok; error=ok ? 0 : vm_last_error();
+        } else {
+            UINT64 need=(UINT64)p->object->desc.SampleWidth *
+                        p->object->desc.SampleHeight * 3u + 0x10000u;
+            if (need <= 0x08000000u && decoder_reserve(&pixels,&cap,(UINT)need)) {
+                ok=vm_get_frame_tag(decoder_session_borrow(p->object),pixels,cap,&f,0);
+                error=ok ? 0 : vm_last_error();
+            } else error=ERROR_NOT_ENOUGH_MEMORY;
+        }
+        EnterCriticalSection(&p->lock);
+        if (ok) {
+            UINT64 tag=mapped ? m.Tag : f.Tag;
+            UINT token=mapped ? m.SessionToken : f.SessionToken;
+            for (i=0;i<p->job_count;++i)
+                if (p->jobs[i].identity.tag==tag &&
+                    p->jobs[i].identity.state!=MT_EMPTY) { owner=&p->jobs[i]; break; }
+            {
+                BOOL conflict=FALSE;
+                MT_LEASE leases[VIRTIO_WDDM_PIPELINE_JOBS_MAX];
+                int collision=-1;
+                for(i=0;i<p->job_count;++i) {
+                    leases[i].index=p->jobs[i].map.Index;
+                    leases[i].token=p->jobs[i].identity.token;
+                    leases[i].generation=p->jobs[i].generation;
+                    leases[i].owned=p->jobs[i].mapped;
+                }
+                if(mapped) collision=mt_lease_conflict(leases,p->job_count,m.Map.Index,token,generation);
+                if(collision>=0) {
+                    VIRTIO_WDDM_PipelineJob *lease=&p->jobs[collision];
+                    conflict=TRUE;
+                    ERROR("tag capture index conflict index=%u existing=%llu received=%llu token=%u generation=%llu",
+                          m.Map.Index,(unsigned long long)lease->identity.tag,
+                          (unsigned long long)tag,token,(unsigned long long)generation);
+                    if(owner && owner!=lease) {
+                        owner->identity.state=MT_FAILED;
+                        owner->state=VIRTIO_WDDM_JOB_FAILED;
+                        owner->failure="capture index conflicts with live lease";
+                        owner->error=ERROR_INVALID_DATA;
+                    }
+                    p->broken=TRUE; p->tag_paused=TRUE;
+                }
+                if(owner && p->strict_read && owner->read_ticket) {
+                    AcquireSRWLockShared(&g_read_lock);
+                    if(g_read_targets[owner->read_ticket-1].media.state==MR_FAILED)
+                        owner->identity.state=MT_FAILED;
+                    ReleaseSRWLockShared(&g_read_lock);
+                }
+                if (!conflict && !p->stop && generation==p->generation && !p->tag_paused)
+                    action=mt_capture(owner ? &owner->identity : NULL,tag,
+                                      p->generation,token);
+            }
+            if (mapped && (!m.Map.UserVa || !m.Map.Size ||
+                           m.Map.MappedLength<m.Map.Size)) {
+                if (owner && action!=MT_RELEASE) {
+                    owner->identity.state=MT_FAILED;
+                    owner->state=VIRTIO_WDDM_JOB_FAILED;
+                    owner->error=ERROR_INVALID_DATA;
+                    owner->failure="invalid tag mapping";
+                }
+                action=MT_RELEASE;
+            }
+            if (action!=MT_RELEASE) {
+                if (mapped) {
+                    owner->map=m.Map; owner->mapped=TRUE;
+                    memcpy(&owner->info,&m.Map,sizeof(owner->info));
+                    av1_note_tag_mapping(p->object ? &p->object->direct_maps : NULL,
+                                         &p->mappings_out);
+                } else {
+                    if (owner->slot) HeapFree(GetProcessHeap(),0,owner->slot);
+                    owner->slot=pixels; owner->slot_cap=cap; pixels=NULL;
+                    owner->info=f.Info; owner->using_slot=TRUE;
+                }
+                if (action==MT_CLAIM) pipeline_tag_ready_locked(p,owner);
+            } else {
+                ERROR("tag reject: tag=%llu token=%u generation=%llu owner=%p state=%u",
+                      (unsigned long long)tag,token,(unsigned long long)generation,
+                      owner,owner ? owner->identity.state : 0u);
+                if (mapped) {
+                    BOOL leased=FALSE;
+                    for (i=0;i<p->job_count;++i)
+                        if (!mt_should_release(m.Map.Index,p->jobs[i].map.Index,
+                                              p->jobs[i].mapped &&
+                                              p->jobs[i].identity.token==token &&
+                                              p->jobs[i].generation==generation)) leased=TRUE;
+                    if (leased) {
+                        ERROR("tag duplicate index=%u already leased; no second release",m.Map.Index);
+                    } else if (!vm_release_frame(decoder_session_borrow(p->object),m.Map.Index)) {
+                        if(p->life_mode) {
+                            p->unresolved_map=TRUE; p->orphan_map=m.Map;
+                            p->orphan_token=token; p->orphan_generation=generation;
+                            p->orphan_lease=(ML_MAP_LEASE){m.Map.Index,token,generation,1};
+                            (void)ml_release_result(&p->orphan_lease,0);
+                            p->tag_paused=TRUE;
+                        }
+                        p->broken=TRUE;
+                        ERROR("tag reject release failed err=%u",vm_last_error());
+                    }
+                }
+            }
+        } else if (error!=ERROR_SEM_TIMEOUT && error!=ERROR_NO_MORE_ITEMS) {
+            if(p->object->direct_ok && (error==ERROR_INVALID_FUNCTION ||
+               error==ERROR_NOT_SUPPORTED || error==ERROR_CALL_NOT_IMPLEMENTED)) {
+                p->object->direct_ok=FALSE;
+            } else {
+                /* A poisoned session is terminal, not an empty poll. */
+                p->broken=TRUE; p->tag_paused=TRUE;
+                for(i=0;i<p->job_count;++i) {
+                    VIRTIO_WDDM_PipelineJob *failed=&p->jobs[i];
+                    if(failed->identity.state==MT_SENT || failed->identity.state==MT_SENDING) {
+                        failed->identity.state=MT_FAILED;
+                        failed->state=VIRTIO_WDDM_JOB_FAILED;
+                        failed->error=error; failed->failure="tag receive terminal failure";
+                    }
+                }
+            }
+            /* Next supported-route attempt remains GET_TAG, never legacy GET. */
+            /* No legacy fallback, and no wildcard RELEASE on failed receive. */
+            ERROR("tag fetch failed err=%u; no FIFO fallback",error);
+        }
+        p->tag_fetching=FALSE;
+        LeaveCriticalSection(&p->lock);
+        if (pixels) HeapFree(GetProcessHeap(),0,pixels);
+        SetEvent(p->ready);
+        if(p->strict_read) {
+            BOOL drained=FALSE;
+            LONGLONG now=decoder_qpc_now();
+            pipeline_drain_one(p->object,NULL,0,TRUE,now,now,&drained,TRUE);
+        }
+        if (ok) backoff=10;
+        else if (backoff<160) backoff*=2;
+        WaitForSingleObject(p->tag_wake,backoff);
+    }
+    return 0;
+}
+static volatile LONG64 g_media_tag;
+static BOOL pipeline_tag_register(VIRTIO_WDDM_DecodePipeline *p,
+                                  VIRTIO_WDDM_PipelineJob *j) {
+    LONG64 old;
+    do {
+        old=InterlockedCompareExchange64(&g_media_tag,0,0);
+        if (old==INT64_MAX) return FALSE;
+    } while (InterlockedCompareExchange64(&g_media_tag,old+1,old)!=old);
+    if(!mt_register(&j->identity,(UINT64)(old+1),j->seq,j->generation,p->object->media_token)) return FALSE;
+    read_update_locked(p,j,0,S_OK);
+    return TRUE;
 }
 
 /* The worker: pick the oldest queued job of the current generation, send it,
@@ -3904,108 +5545,585 @@ static void pipeline_job_release_locked(VIRTIO_WDDM_DecodePipeline *pipe,
 static DWORD WINAPI pipeline_worker(LPVOID param) {
     VIRTIO_WDDM_DecodePipeline *pipe = (VIRTIO_WDDM_DecodePipeline *)param;
     VIRTIO_WDDM_VideoDecoder *object = pipe->object;
+    BOOL iteration_active = FALSE;
 
     for (;;) {
         VIRTIO_WDDM_PipelineJob *job = NULL;
         UINT64 generation;
         UINT i;
+        BOOL fetch_only = FALSE;
 
+        {
+            UINT leaked = pipeline_lock_owned_depth(pipe);
+
+            if (leaked) {
+                ERROR("%s: pipe->lock is still held by the worker at a stage "
+                      "boundary (recursion=%u) -- a missing LeaveCriticalSection "
+                      "would block every submit/sync with no other log line; "
+                      "releasing it now (see 04-测试记录/24)", __FUNCTION__, leaked);
+                while (leaked--)
+                    LeaveCriticalSection(&pipe->lock);
+            }
+        }
         EnterCriticalSection(&pipe->lock);
+        if (iteration_active) {
+            --pipe->worker_active;
+            iteration_active = FALSE;
+            SetEvent(pipe->ready);
+        }
         if (pipe->stop) {
             LeaveCriticalSection(&pipe->lock);
             break;
         }
-        for (i = 0; i < VIRTIO_WDDM_PIPELINE_JOBS; i++) {
-            VIRTIO_WDDM_PipelineJob *candidate = &pipe->jobs[i];
-            if (candidate->state != VIRTIO_WDDM_JOB_QUEUED)
-                continue;
-            if (candidate->generation != pipe->generation) {
-                pipeline_job_release_locked(pipe, candidate, "stale generation");
-                continue;
+        if (ma_terminal(&pipe->admission_terminal) ||
+            InterlockedCompareExchange(&pipe->flushing,0,0)) {
+            LeaveCriticalSection(&pipe->lock);
+            WaitForSingleObject(pipe->wake,20);
+            continue;
+        }
+        if (pipe->tag_mode) {
+            for (i=0;i<pipe->job_count;++i) {
+                VIRTIO_WDDM_PipelineJob *c=&pipe->jobs[i];
+                if (!InterlockedCompareExchange(&pipe->flushing,0,0) && !pipe->tag_paused && c->state==VIRTIO_WDDM_JOB_QUEUED && c->generation==pipe->generation &&
+                    (!job || c->seq<job->seq)) job=c;
             }
-            job = candidate;
-            break;
+        } else if (pipe->av1_async) {
+            /* §7 P3 AV1 ASYNC COLLECT (round 27): two kinds of work -- SEND the
+             * next queued AU (fill the host's output delay) and FETCH the picture
+             * of the oldest already-sent AU.  While fewer than `av1_lag` pictures
+             * are outstanding the worker only sends; after that it fetches one
+             * picture per send.  It never sends an AU and then blocks for THAT
+             * AU's picture -- that is the round 26 stall (1 s budget per AU, 19
+             * AUs in 20 s) this state machine exists to remove.
+             *
+             * Sends stay in seq order and pictures are fetched oldest first, so
+             * the host's output order maps 1:1 onto the jobs.  A no-picture job
+             * (hidden DPB catch-up) is retired right after its send (see below),
+             * so it never consumes a host picture slot. */
+            VIRTIO_WDDM_PipelineJob *queued = NULL;
+            VIRTIO_WDDM_PipelineJob *awaiting = NULL;
+            BOOL lag_reached;
+            BOOL tail = FALSE;
+            BOOL fetch_blocked = FALSE;
+
+            for (i = 0; i < pipe->job_count; i++) {
+                VIRTIO_WDDM_PipelineJob *candidate = &pipe->jobs[i];
+                if (candidate->state == VIRTIO_WDDM_JOB_FREE)
+                    continue;
+                if (candidate->generation != pipe->generation) {
+                    pipeline_job_release_locked(pipe, candidate, "stale generation");
+                    continue;
+                }
+                if (candidate->state == VIRTIO_WDDM_JOB_QUEUED) {
+                    if (!queued || candidate->seq < queued->seq)
+                        queued = candidate;
+                } else if (candidate->state == VIRTIO_WDDM_JOB_SENT) {
+                    if (!awaiting || candidate->seq < awaiting->seq)
+                        awaiting = candidate;
+                }
+            }
+            lag_reached = pipe->av1_outstanding >= pipe->av1_lag;
+            /* §7 P3 (round 27): while the host is still short of `av1_lag` access
+             * units it cannot have produced the oldest picture yet, so fetching
+             * would only burn the fetch budget (round 26: 1 s per AU, 19 AUs in
+             * 20 s).  The one exception is a source that has stopped submitting
+             * (pause / EOF / a client that feeds slower than the host's output
+             * delay): after 250 ms with no new AU, collect what is there so the
+             * tail of the stream is not stranded.
+             *
+             * §7 P3 (round 28): `lag` alone was NOT the real gate.  The host
+             * emits the picture of input N only after it has consumed
+             * N + av1_host_delay inputs (measured: 27 inputs -> 10 outputs, i.e.
+             * an output delay of 17 INPUTS, one output per input from #18 on).
+             * A fetch attempt for a job whose ordinal is newer than that is
+             * guaranteed to time out, and each miss costs the full 300 ms
+             * budget during which the worker cannot send -- which is exactly why
+             * round 27's AV1 sent only ~1.5 access units per second: the worker
+             * spent most of its time fetching pictures the host could not have
+             * produced yet.  So only fetch a job the host has had a chance to
+             * finish; otherwise keep sending.  The quiet tail is still allowed to
+             * fetch after 1 s (EOF/pause), even below the delay. */
+            if (!queued && awaiting && !lag_reached && pipe->last_submit_qpc &&
+                decoder_qpc_ms(pipe->last_submit_qpc, decoder_qpc_now()) >= 250.0)
+                tail = TRUE;
+            {
+                LONGLONG quiet_ms = pipe->last_submit_qpc
+                                        ? (LONGLONG)decoder_qpc_ms(pipe->last_submit_qpc,
+                                                                   decoder_qpc_now())
+                                        : 0;
+                /* `awaiting` is NULL until the first job is on the wire -- the
+                 * worker evaluates this on its very first iteration, before any
+                 * EndFrame, so it MUST be guarded: round 28's first build took an
+                 * access violation here (0xC0000005 in dx11um_virtio_arm64.dll at
+                 * BeginFrame #0). */
+                BOOL ready_by_delay =
+                    !awaiting ||
+                    (pipe->av1_inputs_sent >=
+                     awaiting->input_ordinal + (UINT64)pipe->av1_host_delay);
+
+                if (awaiting && !ready_by_delay && quiet_ms < 1000)
+                    fetch_blocked = TRUE; /* not yet possible: keep sending */
+
+                /* 2026-10-27 (round 1027b): SEND-ONLY worker.  The user's rule is
+                 * "feed the host, let the read path do the collecting".  Measured
+                 * before this: 16 stage-1 sends in 20 s because every send was
+                 * followed by a 300 ms fetch attempt that could not succeed yet
+                 * (the host needs 17+ inputs).  With send_only the worker never
+                 * fetches: it sends QUEUED jobs back to back, and a picture is
+                 * fetched+uploaded by the read path (decoder_texture_sync /
+                 * pipeline_drain_one) or by a capacity drain. */
+                if (pipe->av1_send_only && pipe->av1_async)
+                    fetch_blocked = TRUE;
+            }
+            /* 2026-10-27 (round 46b): FEED FIRST.  A QUEUED access unit always wins
+             * over a fetch.  Measured: a fetch-per-send worker sent 25 AUs in 20 s
+             * (the host needs 18 inputs before its first picture, so the early
+             * fetches were hopeless) and the feed collapsed.  With feed-first the
+             * worker sends every AU EndFrame hands it and collects one picture in
+             * the idle gap between two EndFrames.  Both ioctls run OUTSIDE
+             * pipe->lock (round 46), so a fetch can no longer stall the DDI thread
+             * or the renderer. */
+            {
+                LONGLONG quiet_now = pipe->last_submit_qpc
+                                         ? (LONGLONG)decoder_qpc_ms(pipe->last_submit_qpc,
+                                                                    decoder_qpc_now())
+                                         : 1000;
+                BOOL ready_now = awaiting &&
+                                 pipe->av1_inputs_sent >=
+                                     awaiting->input_ordinal + (UINT64)pipe->av1_host_delay;
+                /* round 46d: LAG-GATED priority, not unconditional feed-first.
+                 * Feed-first sent 35 AUs and then blocked inside vm_send because
+                 * the host's 30 capture buffers were all full (no consumer had
+                 * collected anything) -> an 18 s stall (measured a1cap32b).  Send
+                 * while the host still has room (outstanding < lag); once the lag
+                 * is reached and the OLDEST picture can already exist, collect it
+                 * first -- that retires a job, gives a capture buffer back and
+                 * makes room for the next send. */
+                if (queued && !(lag_reached && awaiting && !fetch_blocked && ready_now)) {
+                    job = queued;
+                } else if (awaiting && !fetch_blocked &&
+                           (ready_now || tail || quiet_now >= 250)) {
+                    job = awaiting;
+                    fetch_only = TRUE; /* already on the wire: skip stage 1 */
+                } else {
+                    job = NULL;
+                }
+            }
+        } else {
+            for (i = 0; i < pipe->job_count; i++) {
+                VIRTIO_WDDM_PipelineJob *candidate = &pipe->jobs[i];
+                if (candidate->state != VIRTIO_WDDM_JOB_QUEUED)
+                    continue;
+                if (candidate->generation != pipe->generation) {
+                    pipeline_job_release_locked(pipe, candidate, "stale generation");
+                    continue;
+                }
+                if (!job || candidate->seq < job->seq)
+                    job = candidate;
+            }
         }
         if (!job) {
             LeaveCriticalSection(&pipe->lock);
+            if (pipe->trace) {
+                /* §5.4b heartbeat: proves the worker is alive and what it is
+                 * waiting for when the two DDI threads have gone quiet. */
+                LONGLONG now = decoder_qpc_now();
+                static LONGLONG last_idle;
+
+                if (last_idle == 0 || decoder_qpc_ms(last_idle, now) >= 500.0) {
+                    last_idle = now;
+                    INFO("%s: idle t=%lld: %u job(s) in flight, mappings %u/%u, AV1 "
+                         "outstanding %u/%u", __FUNCTION__, (long long)now,
+                         (unsigned)pipe->jobs_in_flight, (unsigned)pipe->mappings_out,
+                         (unsigned)pipe->mapping_limit, (unsigned)pipe->av1_outstanding,
+                         (unsigned)pipe->av1_lag);
+                }
+            }
             WaitForSingleObject(pipe->wake, 50);
             continue;
         }
-        job->state = VIRTIO_WDDM_JOB_SENDING;
-        job->stage_qpc = decoder_qpc_now();
+        ++pipe->worker_active;
+        iteration_active = TRUE;
         job->failure = NULL;
         job->error = 0;
         generation = pipe->generation;
+        if (!fetch_only) {
+            if (pipe->tag_mode && !pipeline_tag_register(pipe,job)) {
+                job->state=VIRTIO_WDDM_JOB_FAILED; job->error=ERROR_ARITHMETIC_OVERFLOW;
+                job->failure="tag allocator exhausted/token unavailable";
+                LeaveCriticalSection(&pipe->lock); SetEvent(pipe->ready); continue;
+            }
+            job->state = VIRTIO_WDDM_JOB_SENDING;
+            if(pipe->tag_mode) job->in_ioctl=TRUE; /* pin AU across stage boundary */
+            job->stage_qpc = decoder_qpc_now();
+            if (job->seq <= 8u)
+                INFO("%s: job %llu stage 1 (vm_send) t=%lld: %u B %ux%u", __FUNCTION__,
+                     (unsigned long long)job->seq, (long long)job->stage_qpc,
+                     job->au_size, job->send_w, job->send_h);
+        }
         LeaveCriticalSection(&pipe->lock);
 
         /* ---- stage 1: hand the access unit to the host ---- */
-        {
+        if (!fetch_only) {
             BOOL ok;
+            BOOL first_grant = FALSE;
+            VM_SEND_OUT send_out;
             LONGLONG t0 = decoder_qpc_now();
 
+            memset(&send_out, 0, sizeof(send_out));
             EnterCriticalSection(&pipe->lock);
-            if (pipe->stop || generation != pipe->generation) {
+            if (ma_terminal(&pipe->admission_terminal)) {
+                /* No IO started. Preserve the unsent AU and its ownership until
+                 * explicit teardown; terminal is not a flush/generation event. */
+                job->in_ioctl=FALSE;
+                LeaveCriticalSection(&pipe->lock);
+                SetEvent(pipe->ready);
+                continue;
+            }
+            if (pipe->stop || generation != pipe->generation || (pipe->tag_mode && pipe->tag_paused)) {
+                if(pipe->tag_mode) job->in_ioctl=FALSE;
                 pipeline_job_release_locked(pipe, job, "generation changed before send");
                 LeaveCriticalSection(&pipe->lock);
                 SetEvent(pipe->ready);
                 continue;
             }
+            if (!ma_authorize(&pipe->admission_terminal)) {
+                job->in_ioctl=FALSE;
+                LeaveCriticalSection(&pipe->lock);
+                continue; /* preserve unsent AU; terminal is not flush */
+            }
             job->send_qpc = t0;
-            ok = vm_send(object->session, job->au, job->au_size, job->send_w,
-                         job->send_h, 0, NULL);
+            /* 2026-10-27 (round 46): NEVER call the host with pipe->lock held.
+             * vm_send() blocks while the host's input queue is full (measured:
+             * the whole pipeline froze for 16.8 s while this call sat under the
+             * lock -- "pipeline_sync: waited 16798 ms for pipe->lock").  in_ioctl
+             * keeps a flush/generation change from freeing the slot while the
+             * call still reads job->au. */
+            job->in_ioctl = TRUE;
+            LeaveCriticalSection(&pipe->lock);
+            /* sendwire diagnostic: only the AV1/tag sender records this AU.
+             * This is an ATTEMPT, even if SEND fails; correlate tag/seq/gen with
+             * the UMD result log.  Builder dpb-* records do not prove a SEND.
+             * fetch_only and the legacy/serial vm_send paths never enter here. */
+            if (pipe->tag_mode && object->codec == VIRTIO_WDDM_CODEC_AV1) {
+                char dump_meta[192];
+                snprintf(dump_meta, sizeof(dump_meta),
+                         "attempted=1 tag=%llu seq=%llu gen=%llu token=%u w=%u h=%u",
+                         (unsigned long long)job->identity.tag,
+                         (unsigned long long)job->seq,
+                         (unsigned long long)job->generation,
+                         job->identity.token, job->send_w, job->send_h);
+                decoder_av1_dump_meta("send", job->au, job->au_size, dump_meta);
+            }
+            ok = pipe->tag_mode
+                ? vm_send_tag(decoder_session_borrow(object),job->au,job->au_size,job->send_w,
+                              job->send_h,0,job->identity.tag,&send_out)
+                : vm_send(decoder_session_borrow(object), job->au, job->au_size, job->send_w,
+                          job->send_h, 0, &send_out);
             job->error = ok ? 0u : vm_last_error();
             job->send_ms = decoder_qpc_ms(t0, decoder_qpc_now());
+            EnterCriticalSection(&pipe->lock);
+            job->in_ioctl = FALSE;
+            if (!ma_complete(&pipe->admission_terminal)) {
+                /* Authorized before terminal, returned after terminal: IO may
+                 * have succeeded physically, but cannot publish logical success.
+                 * Keep any early map/slot and AU owned until explicit teardown. */
+                job->state=VIRTIO_WDDM_JOB_FAILED;
+                job->identity.state=MT_FAILED;
+                job->error=ERROR_OPERATION_ABORTED;
+                job->failure="terminal before SEND logical completion";
+                read_update_locked(pipe,job,2,E_FAIL);
+                LeaveCriticalSection(&pipe->lock);
+                SetEvent(pipe->ready);
+                continue;
+            }
+            if (pipe->tag_mode) {
+                BOOL early=job->identity.state==MT_EARLY;
+                unsigned action=mt_sent(&job->identity,ok);
+                if (ok && job->identity.state!=MT_FAILED && !job->dead && generation==pipe->generation) {
+                    job->input_ordinal=++pipe->av1_inputs_sent;
+                    if (!object->capture_count && send_out.CaptureCount)
+                        object->capture_count=send_out.CaptureCount;
+                    if (pipe->multi_mapping && object->capture_count)
+                        pipe->mapping_limit=object->capture_count;
+                    object->frame_sent=TRUE;
+                    pipe->av1_sent++; pipe->av1_outstanding++;
+                    if (!job->produces_picture) {
+                        if(pipe->av1_outstanding) pipe->av1_outstanding--;
+                        /* No-picture AU stays byte-identical, owes no capture. */
+                        pipeline_retire_no_picture_locked(pipe,job);
+                    } else {
+                        job->state=VIRTIO_WDDM_JOB_SENT;
+                        if (action==MT_CLAIM) pipeline_tag_ready_locked(pipe,job);
+                    }
+                } else {
+                    if (early && job->mapped) {
+                        if (!vm_release_frame(decoder_session_borrow(object),job->map.Index)) {
+                            pipe->broken=TRUE;
+                            if(pipe->life_mode) pipe->unresolved_map=TRUE;
+                            else job->mapped=FALSE;
+                        } else job->mapped=FALSE;
+                        if(!job->mapped && pipe->mappings_out) pipe->mappings_out--;
+                    }
+                    job->using_slot=FALSE;
+                    job->state=VIRTIO_WDDM_JOB_FAILED;
+                    pipeline_fail_admission(object);
+                    job->failure="vm_send_tag failed or generation invalid; no AU drop/FIFO fallback";
+                    pipe->failed_jobs++; pipe->send_failures++;
+                    if (job->dead || generation!=pipe->generation)
+                        pipeline_job_release_locked(pipe,job,"tag send cancelled");
+                }
+                LeaveCriticalSection(&pipe->lock);
+                SetEvent(pipe->tag_wake); SetEvent(pipe->ready);
+                continue;
+            }
+            if (job->dead) {
+                pipeline_job_release_locked(pipe, job, "dead after vm_send");
+                LeaveCriticalSection(&pipe->lock);
+                SetEvent(pipe->ready);
+                continue;
+            }
+            if (ok) {
+                /* §7 P3 (round 28): this input's ordinal in the host's queue.
+                 * The host emits one output per input and starts only after
+                 * av1_host_delay inputs, so job->input_ordinal +
+                 * av1_host_delay is the input count at which this picture can
+                 * first exist. */
+                job->input_ordinal = ++pipe->av1_inputs_sent;
+                object->send_fail_streak = 0;
+                /* P4-13 REQFIX: log the capture depth the host actually granted
+                 * (REQBUFS CAPTURE).  "asked 18 granted 1" is the failure P4-13
+                 * is about, and it was invisible in the UMD log until now. */
+                if (!object->capture_count && send_out.CaptureCount) {
+                    object->capture_count = send_out.CaptureCount;
+                    first_grant = TRUE;
+                }
+                /* §5.4: the granted capture depth is only known after the first
+                 * send (S_FMT/REQBUFS happen inside it), so the stage-2 gate can
+                 * only learn its real ceiling here.  Until then it is 1, which is
+                 * the correct conservative value for a driver that maps one
+                 * buffer per session and merely slows the deferred pipeline for a
+                 * few frames on 1.0.0.22. */
+                if (pipe->multi_mapping && object->capture_count &&
+                    pipe->mapping_limit != object->capture_count)
+                    pipe->mapping_limit = object->capture_count;
+                /* §7 P3 (round 27): the host's granted capture depth IS its output
+                 * depth for AV1 (18 on 1.0.0.22, matching Codec2's "updating output
+                 * delay 11 -> 17").  The lag was provisionally 20; once the real
+                 * number is known, keep two pictures of margin above it so a fetch
+                 * never asks for a picture the host has not decoded yet. */
+                if (pipe->av1_async && object->capture_count) {
+                    UINT want = object->capture_count + 2u;
+
+                    if (want > pipe->av1_lag && want <= pipe->job_count) {
+                        pipe->av1_lag = want;
+                        if (pipe->max_inflight < pipe->av1_lag)
+                            pipe->max_inflight = pipe->av1_lag;
+                        INFO("%s: AV1 lag raised to %u = granted %u + 2 (in-flight "
+                             "cap %u)", __FUNCTION__, pipe->av1_lag,
+                             object->capture_count, pipe->max_inflight);
+                    }
+                }
+            }
             LeaveCriticalSection(&pipe->lock);
 
+            if (first_grant) {
+                INFO("%s: session granted %u capture buffer(s) (capture sizeimage=%u "
+                     "stride=%u, output sizeimage=%u)", __FUNCTION__,
+                     object->capture_count, send_out.CaptureSizeImage,
+                     send_out.CaptureStride, send_out.OutputSizeImage);
+            }
+            if (job->seq <= 8u)
+                INFO("%s: job %llu stage 1 done: ok=%d send=%.2f ms err=%u t=%lld "
+                     "(mapping limit %u)", __FUNCTION__, (unsigned long long)job->seq,
+                     (int)ok, job->send_ms, job->error, (long long)decoder_qpc_now(),
+                     pipe->mapping_limit);
             if (!ok) {
+                if (pipe->tag_mode) {
+                    EnterCriticalSection(&pipe->lock);
+                    job->state=VIRTIO_WDDM_JOB_FAILED;
+                    job->failure="vm_send_tag failed; AU not silently dropped";
+                    pipe->failed_jobs++; pipe->send_failures++;
+                    LeaveCriticalSection(&pipe->lock); SetEvent(pipe->ready); continue;
+                }
+                if (job->error == ERROR_NO_SYSTEM_RESOURCES) {
+                    /* P4-13 REQFIX -- the pipeline port of the 1450 branch.
+                     *
+                     * ERROR_NO_SYSTEM_RESOURCES (Win32 1450) is the host saying it
+                     * could not allocate a buffer for THIS access unit, not that
+                     * the session is gone (P4-13: REQBUFS CAPTURE asked 18 granted
+                     * 1, REQBUFS OUTPUT refused -> configure rollback; the old
+                     * reopen-per-failure loop did 3,466 reopens and 3,471 failed
+                     * sends in 116 s and every reopen demanded a key frame, so no
+                     * picture ever came out = the green screen).
+                     *
+                     * So the AU is dropped and the job is retired as DROPPED: the
+                     * session stays, pipe->generation does NOT move, the slot goes
+                     * back to FREE at the drain, and the capture buffer of the
+                     * PREVIOUS job is untouched (this job never mapped one).  In
+                     * particular the FAILED path below must not be taken: it makes
+                     * pipeline_frame() quiesce + flush, which discards the host DPB
+                     * -- that is exactly the reopen storm this fix removes. */
+                    UINT streak;
+                    UINT64 total;
+
+                    EnterCriticalSection(&pipe->lock);
+                    object->send_fail_streak++;
+                    object->send_fail_total++;
+                    streak = object->send_fail_streak;
+                    total = object->send_fail_total;
+                    if (streak >= 8u)
+                        pipe->send_backoffs++;
+                    pipe->send_failures++;
+                    pipe->au_dropped++;
+                    job->failure = "vm_send err=1450 (host buffer allocation), AU dropped";
+                    if (generation == pipe->generation)
+                        job->state = VIRTIO_WDDM_JOB_DROPPED;
+                    else
+                        pipeline_job_release_locked(pipe, job, "generation changed");
+                    LeaveCriticalSection(&pipe->lock);
+                    ERROR("%s: job %llu: vm_send(%s, %u B, %ux%u) refused err=%u "
+                          "(host buffer allocation) after %.2f ms -> AU dropped, "
+                          "session and pipeline generation kept (streak=%u total=%llu, "
+                          "capture granted=%u)", __FUNCTION__,
+                          (unsigned long long)job->seq,
+                          decoder_codec_name(object->codec), job->au_size, job->send_w,
+                          job->send_h, job->error, job->send_ms, streak,
+                          (unsigned long long)total, object->capture_count);
+                    /* P4-13 REQFIX: backoff, outside pipe->lock so the DDI thread
+                     * does not inherit the sleep (see decoder_send_backoff). */
+                    decoder_send_backoff(streak);
+                    SetEvent(pipe->ready);
+                    continue;
+                }
                 pipe->send_failures++;
                 pipe->failed_jobs++;
                 job->failure = "vm_send";
-                EnterCriticalSection(&pipe->lock);
-                if (generation == pipe->generation)
-                    job->state = VIRTIO_WDDM_JOB_FAILED;
-                else
-                    pipeline_job_release_locked(pipe, job, "generation changed");
-                LeaveCriticalSection(&pipe->lock);
-                ERROR("%s: job %llu: vm_send(%s, %u B, %ux%u) failed err=%u after "
-                      "%.2f ms -> job failed, the DDI thread decides whether to "
-                      "reopen the session", __FUNCTION__,
-                      (unsigned long long)job->seq,
-                      decoder_codec_name(object->codec), job->au_size, job->send_w,
-                      job->send_h, job->error, job->send_ms);
+                {
+                    UINT streak;
+
+                    EnterCriticalSection(&pipe->lock);
+                    object->send_fail_streak++;
+                    object->send_fail_total++;
+                    streak = object->send_fail_streak;
+                    if (streak >= 8u)
+                        pipe->send_backoffs++;
+                    if (generation == pipe->generation)
+                        job->state = VIRTIO_WDDM_JOB_FAILED;
+                    else
+                        pipeline_job_release_locked(pipe, job, "generation changed");
+                    LeaveCriticalSection(&pipe->lock);
+                    ERROR("%s: job %llu: vm_send(%s, %u B, %ux%u) failed err=%u after "
+                          "%.2f ms -> job failed, the DDI thread decides whether to "
+                          "reopen the session (streak=%u total=%llu)", __FUNCTION__,
+                          (unsigned long long)job->seq,
+                          decoder_codec_name(object->codec), job->au_size, job->send_w,
+                          job->send_h, job->error, job->send_ms, streak,
+                          (unsigned long long)object->send_fail_total);
+                    decoder_send_backoff(streak);
+                }
                 SetEvent(pipe->ready);
                 continue;
             }
             object->frame_sent = TRUE;
         }
 
-        /* ---- stage 2: wait for the previous capture buffer to come back ---- */
+        /* ---- §7 P3 AV1 ASYNC COLLECT (round 27): the AU is on the wire, and the
+         * picture it will produce is NOT expected now.  A no-picture job (hidden
+         * DPB catch-up) is finished here -- it owes the DDI thread nothing.  A
+         * shown AU becomes SENT and is collected by a later iteration, once
+         * `av1_lag` access units are in the host.  No wait, no fetch, no upload on
+         * this iteration: that is the whole point.  Non-AV1 codecs skip this block
+         * and fall through to stage 2/3 unchanged.
+         *
+         * `!fetch_only` is essential: this block must only run for the iteration
+         * that just SENT the AU.  Running it again on the collect iteration would
+         * re-mark the same job SENT and increment the counters forever -- the
+         * worker would spin here and never fetch (measured in the first round 27
+         * run: 38,161,359 "AU sent", 0 pictures, 0 fetch attempts). */
+        if (pipe->av1_async && !fetch_only) {
+            EnterCriticalSection(&pipe->lock);
+            if (generation != pipe->generation) {
+                pipeline_job_release_locked(pipe, job, "generation changed after send");
+                LeaveCriticalSection(&pipe->lock);
+                SetEvent(pipe->ready);
+                continue;
+            }
+            if (!job->produces_picture) {
+                pipe->av1_catchup_jobs++;
+                /* §7 P3 (round 27): a catch-up is a CODED picture in the host, so it
+                 * counts toward the output delay like any other AU -- that is what
+                 * the host's "updates output delay 11 -> 17" counts.  It just owes no
+                 * CAPTURE buffer, so the job is retired without a fetch. */
+                pipe->av1_sent++;
+                pipe->av1_outstanding++;
+                pipeline_retire_no_picture_locked(pipe, job);
+                LeaveCriticalSection(&pipe->lock);
+                SetEvent(pipe->ready);
+                continue;
+            }
+            job->state = VIRTIO_WDDM_JOB_SENT;
+            pipe->av1_sent++;
+            pipe->av1_outstanding++;
+            if (pipe->tag_mode && job->identity.state==MT_READY)
+                pipeline_tag_ready_locked(pipe,job);
+            if (pipe->tag_mode) SetEvent(pipe->tag_wake);
+            LeaveCriticalSection(&pipe->lock);
+            SetEvent(pipe->ready);
+            continue;
+        }
+
+        /* ---- stage 2: is there a capture buffer left for this picture? ----
+         * §5.4 DEFERRED (round 23): the gate is a *capacity* test, not a frame
+         * wait.  A mapped job keeps its buffer until a consumer uploads the
+         * picture (that is where RELEASE_FRAME happens now), so the worker may
+         * have many buffers out at once -- as many as the device granted
+         * (capture_count, 18 for 1080p on 1.0.0.22).  Only a driver that maps one
+         * buffer per session (<= 1.0.0.21) still serialises here.
+         * The old form ("no mapping is owned at all") made job 2 time out after
+         * 1250 ms on the first frame of the deferred pipeline: job 1 was READY
+         * and held its buffer, and the consumer had not read the texture yet. */
         {
             BOOL abandon = FALSE;
-            LONGLONG deadline = decoder_qpc_now() + (LONGLONG)pipe->timeout_ms *
-                                                    decoder_qpc_freq() / 1000;
+            LONGLONG deadline = decoder_qpc_now() +
+                                (LONGLONG)pipe->fetch_timeout_ms *
+                                    decoder_qpc_freq() / 1000;
 
-            EnterCriticalSection(&pipe->lock);
-            job->state = VIRTIO_WDDM_JOB_FETCHING;
-            LeaveCriticalSection(&pipe->lock);
-
+            /* §7 P3 (round 27): the state stays as it was (SENDING / SENT) while
+             * this gate waits for a free capture buffer -- the worker is NOT inside
+             * an ioctl for this job yet, so a drain that times out must not treat
+             * the job as "the worker may still be writing its slot" and break the
+             * pipeline.  JOB_FETCHING is set below, immediately before the ioctl. */
             for (;;) {
+                BOOL have_buffer = FALSE;
                 UINT left;
 
                 EnterCriticalSection(&pipe->lock);
                 if (pipe->stop || generation != pipe->generation) {
                     pipeline_job_release_locked(pipe, job, "generation changed before fetch");
-                    LeaveCriticalSection(&pipe->lock);
                     abandon = TRUE;
-                    break;
+                } else if (InterlockedCompareExchange(&pipe->flushing,0,0)) {
+                    /* Maintenance owns retirement. Preserve this SENT job and
+                     * leave the whole worker iteration before flush releases maps. */
+                    abandon = TRUE;
+                } else if (pipe->mappings_out < pipe->mapping_limit) {
+                    have_buffer = TRUE; /* the device still has a capture buffer for us */
                 }
-                if (!pipe->mapping_out)
-                    break; /* no capture buffer is checked out of the device */
+                /* §5.4b (round 24): the success path used to `break` out of this
+                 * loop with pipe->lock still held.  That one missing Leave is why
+                 * round 23's deferred build showed 0 frames: the first job went
+                 * READY, the worker kept the lock, and EndFrame #2 then blocked in
+                 * pipeline_submit() (and every consumer in pipeline_sync()) with no
+                 * log line at all.  Leave on EVERY path. */
                 LeaveCriticalSection(&pipe->lock);
+                if (abandon)
+                    break;
+                if (have_buffer)
+                    break;
                 if (pipeline_left_ms(deadline) == 0) {
                     abandon = TRUE;
                     job->error = ERROR_SEM_TIMEOUT;
-                    job->failure = "capture buffer of the previous job never came back";
+                    job->failure = "the previous mapping never came back";
                     pipe->timeouts++;
                     pipe->failed_jobs++;
                     EnterCriticalSection(&pipe->lock);
@@ -4014,12 +6132,12 @@ static DWORD WINAPI pipeline_worker(LPVOID param) {
                     else
                         job->state = VIRTIO_WDDM_JOB_FAILED;
                     LeaveCriticalSection(&pipe->lock);
-                    ERROR("%s: job %llu: timed out after %u ms waiting for the "
-                          "capture buffer of job %llu to be released (mapping_out=%d) "
+                    ERROR("%s: job %llu: timed out after %u ms waiting for a capture "
+                          "buffer to come back (mappings_out=%u/%u, direct_active=%d) "
                           "-> job failed", __FUNCTION__,
-                          (unsigned long long)job->seq, pipe->timeout_ms,
-                          (unsigned long long)pipe->mapping_out_seq,
-                          (int)pipe->mapping_out);
+                          (unsigned long long)job->seq, pipe->fetch_timeout_ms,
+                          pipe->mappings_out, pipe->mapping_limit,
+                          (int)object->direct_active);
                     break;
                 }
                 left = pipeline_left_ms(deadline);
@@ -4031,37 +6149,136 @@ static DWORD WINAPI pipeline_worker(LPVOID param) {
             }
         }
 
-        /* ---- stage 3: fetch the decoded frame ---- */
+        /* ---- stage 3: fetch the decoded frame ----
+         *
+         * §5.4b (2026-10-25, round 24): the fetch is ONE blocking ioctl with the
+         * job's send budget, exactly as in round 23.  A "poll MAP_FRAME every 5 ms
+         * to keep the lock free" variant was tried and is REJECTED here: on the
+         * guest it froze the VM (0-byte UMD log, desktop dead, force restart), so
+         * this driver must not be hammered with short-timeout map calls.  The
+         * renderer stall that variant was meant to fix is instead prevented by
+         * pacing the producer: pipeline_submit() drains the oldest job as soon as
+         * max_inflight frames are outstanding, so the worker never runs more than
+         * a few frames ahead of the host's real-time decoder and its MAP_FRAME
+         * wait stays short.  See the note in 04-测试记录/24.
+         *
+         * §7 P3 (round 27): on the AV1 async path the job was sent `av1_lag`
+         * pictures ago, so its picture is already inside the host's output queue
+         * and this call returns at the host's decode pace.  Its budget is counted
+         * from the FETCH, not from the send (the queue wait must not eat it), and
+         * VIRTIO_WDDM_PIPELINE_FETCH_MS (3 s) is the ceiling rather than the 1 s
+         * queue budget -- one slow picture must not fail a job that is merely
+         * waiting its turn. */
+        EnterCriticalSection(&pipe->lock);
+        if (generation == pipe->generation && !pipe->stop)
+            job->state = VIRTIO_WDDM_JOB_FETCHING; /* from here the ioctl may write */
+        LeaveCriticalSection(&pipe->lock);
         {
             BOOL ok = FALSE;
             BOOL refused_route = FALSE;
             UINT error = 0;
-            LONGLONG deadline = job->stage_qpc + (LONGLONG)pipe->timeout_ms *
-                                                     decoder_qpc_freq() / 1000;
+            LONGLONG deadline = pipe->av1_async
+                                    ? decoder_qpc_now() +
+                                          (LONGLONG)pipe->av1_fetch_ms *
+                                              decoder_qpc_freq() / 1000
+                                    : job->stage_qpc +
+                                          (LONGLONG)pipe->timeout_ms *
+                                              decoder_qpc_freq() / 1000;
             LONGLONG t0;
+            LONGLONG t_fetch0 = decoder_qpc_now();
             BOOL abandon = FALSE;
 
             memset(&job->info, 0, sizeof(job->info));
             memset(&job->map, 0, sizeof(job->map));
 
             if (object->direct_ok) {
-                EnterCriticalSection(&pipe->lock);
-                if (pipe->stop || generation != pipe->generation) {
-                    pipeline_job_release_locked(pipe, job, "generation changed before map");
+                for (;;) {
+                    UINT left;
+
+                    EnterCriticalSection(&pipe->lock);
+                    if (pipe->stop || generation != pipe->generation) {
+                        pipeline_job_release_locked(pipe, job, "generation changed before map");
+                        LeaveCriticalSection(&pipe->lock);
+                        abandon = TRUE;
+                        break;
+                    }
+                    left = pipeline_left_ms(deadline);
+                    if (left == 0) {
+                        LeaveCriticalSection(&pipe->lock);
+                        error = ERROR_SEM_TIMEOUT; /* budget spent before the call */
+                        break;
+                    }
+                    /* 2026-10-27 (round 46): the map is a BLOCKING ioctl (up to
+                     * `left` ms) and now runs with pipe->lock RELEASED.  Holding
+                     * the lock across it is what made every reader wait 16.8 s.
+                     * `in_ioctl` prevents a concurrent release from freeing this
+                     * slot while the ioctl still writes job->map. */
+                    job->in_ioctl = TRUE;
                     LeaveCriticalSection(&pipe->lock);
-                    abandon = TRUE;
-                } else {
-                    UINT left = pipeline_left_ms(deadline);
                     t0 = decoder_qpc_now();
-                    ok = vm_map_frame(object->session, &job->map,
-                                      left ? left : 1u) ? TRUE : FALSE;
+                    ok = vm_map_frame(decoder_session_borrow(object), &job->map, left) ? TRUE : FALSE;
                     error = ok ? 0u : vm_last_error();
-                    job->fetch_ms = decoder_qpc_ms(t0, decoder_qpc_now());
+                    job->fetch_ms = decoder_qpc_ms(t_fetch0, decoder_qpc_now());
+                    EnterCriticalSection(&pipe->lock);
+                    job->in_ioctl = FALSE;
+                    if (ok) {
+                        job->mapped=TRUE;
+                        pipe->mappings_out++;
+                        object->direct_maps++;
+                    }
+                    if (job->dead) {
+                        pipeline_job_release_locked(pipe, job, "dead after vm_map_frame");
+                        LeaveCriticalSection(&pipe->lock);
+                        abandon = TRUE;
+                        break;
+                    }
                     LeaveCriticalSection(&pipe->lock);
+                    if (ok)
+                        break;
+                    object->direct_timeouts++;
+                    break; /* one blocking call: classify a timeout as this job's failure */
                 }
-                if (abandon) {
-                    SetEvent(pipe->ready);
-                    continue;
+                if (!ok && !abandon) {
+                    if (error == ERROR_SEM_TIMEOUT) {
+                        /* §5.4: the wait hit its budget.  This fails the job (and
+                         * only this job); the direct route stays enabled because a
+                         * timeout is not a refusal. */
+                        if (object->direct_timeouts <= 4u)
+                            INFO("%s: job %llu: MAP_FRAME had no frame after %.2f ms "
+                                 "(err=%u) -> job fails, route stays enabled",
+                                 __FUNCTION__, (unsigned long long)job->seq,
+                                 job->fetch_ms, error);
+                    } else if (error == ERROR_INVALID_FUNCTION || error == ERROR_NOT_SUPPORTED ||
+                               error == ERROR_CALL_NOT_IMPLEMENTED ||
+                               error == ERROR_INVALID_PARAMETER || error == ERROR_INVALID_DATA ||
+                               error == ERROR_PROC_NOT_FOUND) {
+                        EnterCriticalSection(&pipe->lock);
+                        object->direct_refusals++;
+                        object->direct_ok = FALSE;
+                        LeaveCriticalSection(&pipe->lock);
+                        refused_route = TRUE;
+                        INFO("%s: job %llu: direct-mapped frame refused err=%u after "
+                             "%.2f ms -> staged GET_FRAME for the rest of this session",
+                             __FUNCTION__, (unsigned long long)job->seq, error,
+                             job->fetch_ms);
+                    } else {
+                        EnterCriticalSection(&pipe->lock);
+                        object->direct_other_failures++;
+                        object->direct_fail_streak++;
+                        if (object->direct_fail_streak >= VIRTIO_WDDM_DIRECT_FAIL_STREAK_MAX) {
+                            object->direct_ok = FALSE;
+                            INFO("%s: job %llu: MAP_FRAME failed %u time(s) in a row "
+                                 "(last err=%u) -> staged GET_FRAME for the rest of this "
+                                 "session", __FUNCTION__, (unsigned long long)job->seq,
+                                 object->direct_fail_streak, error);
+                        } else if (object->direct_other_failures <= 4u) {
+                            INFO("%s: job %llu: MAP_FRAME failed err=%u after %.2f ms "
+                                 "(streak %u) -> staged path for this picture only",
+                                 __FUNCTION__, (unsigned long long)job->seq, error,
+                                 job->fetch_ms, object->direct_fail_streak);
+                        }
+                        LeaveCriticalSection(&pipe->lock);
+                    }
                 }
                 if (ok) {
                     UINT64 need = (UINT64)job->map.Size;
@@ -4075,16 +6292,32 @@ static DWORD WINAPI pipeline_worker(LPVOID param) {
                               (unsigned long long)job->map.UserVa,
                               job->map.MappedLength, job->map.Size, job->map.Index);
                         EnterCriticalSection(&pipe->lock);
-                        (void)vm_release_frame(object->session, job->map.Index);
+                        if (!vm_release_frame(decoder_session_borrow(object), job->map.Index)) {
+                            /* Keep exact owner/index: failed release never permits
+                             * a staged fallback or scratch/slot reuse. */
+                            pipe->unresolved_map=TRUE;
+                            pipeline_fail_admission(object);
+                            job->state=VIRTIO_WDDM_JOB_FAILED;
+                            job->error=vm_last_error();
+                            job->failure="invalid MAP release failed; lease retained";
+                            read_update_locked(pipe,job,2,E_FAIL);
+                            LeaveCriticalSection(&pipe->lock);
+                            abandon=TRUE; ok=FALSE;
+                            SetEvent(pipe->ready);
+                            continue; /* outer worker: terminal gate preserves lease */
+                        }
+                        job->mapped=FALSE;
+                        if (pipe->mappings_out) pipe->mappings_out--;
+                        object->direct_releases++;
                         object->direct_refusals++;
                         object->direct_ok = FALSE;
                         LeaveCriticalSection(&pipe->lock);
                         refused_route = TRUE;
+                        ok = FALSE;
                     } else {
                         EnterCriticalSection(&pipe->lock);
                         object->direct_fail_streak = 0;
-                        object->direct_maps++;
-                        job->mapped = TRUE;
+                        /* MAP ownership was registered at successful IO return. */
                         LeaveCriticalSection(&pipe->lock);
                         job->info.Width = job->map.Width;
                         job->info.Height = job->map.Height;
@@ -4094,49 +6327,7 @@ static DWORD WINAPI pipeline_worker(LPVOID param) {
                         job->info.FourCC = job->map.FourCC;
                         job->info.SessionId = job->map.SessionId;
                         job->info.Index = job->map.Index;
-                        ok = TRUE;
                     }
-                } else if (error == ERROR_SEM_TIMEOUT) {
-                    /* AV1FIX rule: a timeout is not a refusal.  The route stays
-                     * enabled and the next picture maps again. */
-                    EnterCriticalSection(&pipe->lock);
-                    object->direct_timeouts++;
-                    if (object->direct_timeouts <= 4u)
-                        INFO("%s: job %llu: MAP_FRAME waited %.2f ms and no frame "
-                             "arrived (err=%u) -- timeout #%llu, the direct route "
-                             "stays enabled", __FUNCTION__,
-                             (unsigned long long)job->seq, job->fetch_ms, error,
-                             (unsigned long long)object->direct_timeouts);
-                    LeaveCriticalSection(&pipe->lock);
-                } else if (error == ERROR_INVALID_FUNCTION || error == ERROR_NOT_SUPPORTED ||
-                           error == ERROR_CALL_NOT_IMPLEMENTED ||
-                           error == ERROR_INVALID_PARAMETER || error == ERROR_INVALID_DATA ||
-                           error == ERROR_PROC_NOT_FOUND) {
-                    EnterCriticalSection(&pipe->lock);
-                    object->direct_refusals++;
-                    object->direct_ok = FALSE;
-                    LeaveCriticalSection(&pipe->lock);
-                    refused_route = TRUE;
-                    INFO("%s: job %llu: direct-mapped frame refused err=%u after "
-                         "%.2f ms -> staged GET_FRAME for the rest of this session",
-                         __FUNCTION__, (unsigned long long)job->seq, error, job->fetch_ms);
-                } else {
-                    EnterCriticalSection(&pipe->lock);
-                    object->direct_other_failures++;
-                    object->direct_fail_streak++;
-                    if (object->direct_fail_streak >= VIRTIO_WDDM_DIRECT_FAIL_STREAK_MAX) {
-                        object->direct_ok = FALSE;
-                        INFO("%s: job %llu: MAP_FRAME failed %u time(s) in a row "
-                             "(last err=%u) -> staged GET_FRAME for the rest of this "
-                             "session", __FUNCTION__, (unsigned long long)job->seq,
-                             object->direct_fail_streak, error);
-                    } else if (object->direct_other_failures <= 4u) {
-                        INFO("%s: job %llu: MAP_FRAME failed err=%u after %.2f ms "
-                             "(streak %u) -> staged path for this picture only",
-                             __FUNCTION__, (unsigned long long)job->seq, error,
-                             job->fetch_ms, object->direct_fail_streak);
-                    }
-                    LeaveCriticalSection(&pipe->lock);
                 }
             }
 
@@ -4167,9 +6358,10 @@ static DWORD WINAPI pipeline_worker(LPVOID param) {
                     continue;
                 }
                 ok = FALSE;
+                error = 0;
                 for (;;) {
-                    UINT left = pipeline_left_ms(deadline);
-                    BOOL got;
+                    UINT left;
+                    BOOL got = FALSE;
 
                     EnterCriticalSection(&pipe->lock);
                     if (pipe->stop || generation != pipe->generation) {
@@ -4178,17 +6370,40 @@ static DWORD WINAPI pipeline_worker(LPVOID param) {
                         abandon = TRUE;
                         break;
                     }
-                    t0 = decoder_qpc_now();
-                    got = vm_get_frame(object->session, job->slot, job->slot_cap,
-                                       &job->info, left ? left : 1u)
-                              ? TRUE
-                              : FALSE;
-                    error = got ? 0u : vm_last_error();
-                    job->fetch_ms = decoder_qpc_ms(t0, decoder_qpc_now());
-                    if (!got && error == ERROR_INSUFFICIENT_BUFFER &&
+                    left = pipeline_left_ms(deadline);
+                    if (left == 0) {
+                        LeaveCriticalSection(&pipe->lock);
+                        error = ERROR_SEM_TIMEOUT;
+                    } else {
+                        /* round 46: same rule as vm_map_frame -- the GET_FRAME is a
+                         * blocking ioctl and runs with the lock released. */
+                        job->in_ioctl = TRUE;
+                        LeaveCriticalSection(&pipe->lock);
+                        t0 = decoder_qpc_now();
+                        got = vm_get_frame(decoder_session_borrow(object), job->slot, job->slot_cap,
+                                           &job->info, left)
+                                  ? TRUE
+                                  : FALSE;
+                        error = got ? 0u : vm_last_error();
+                        job->fetch_ms = decoder_qpc_ms(t_fetch0, decoder_qpc_now());
+                        EnterCriticalSection(&pipe->lock);
+                        job->in_ioctl = FALSE;
+                    }
+                    if (job->dead) {
+                        pipeline_job_release_locked(pipe, job, "dead after vm_get_frame");
+                        LeaveCriticalSection(&pipe->lock);
+                        abandon = TRUE;
+                        break;
+                    }
+                    LeaveCriticalSection(&pipe->lock);
+                    if (got) {
+                        ok = TRUE;
+                        break;
+                    }
+                    if (error == ERROR_INSUFFICIENT_BUFFER &&
                         job->slot_cap < 0x08000000u) {
                         UINT bigger = job->slot_cap * 2u;
-                        LeaveCriticalSection(&pipe->lock);
+
                         INFO("%s: job %llu: frame does not fit %u B, retrying with %u",
                              __FUNCTION__, (unsigned long long)job->seq, job->slot_cap,
                              bigger);
@@ -4196,22 +6411,17 @@ static DWORD WINAPI pipeline_worker(LPVOID param) {
                             break;
                         continue;
                     }
-                    if (!got && error == ERROR_SEM_TIMEOUT) {
-                        object->frame_get_timeouts++;
-                        decoder_release_stray_frame(object);
-                    }
-                    LeaveCriticalSection(&pipe->lock);
-                    ok = got;
-                    break;
+                    if (error != ERROR_SEM_TIMEOUT)
+                        break;
+                    object->frame_get_timeouts++;
+                    break; /* one blocking call: a timeout fails this job */
                 }
                 if (abandon) {
                     SetEvent(pipe->ready);
                     continue;
                 }
-                if (ok) {
+                if (ok)
                     job->using_slot = TRUE;
-                    refused_route = FALSE;
-                }
             }
 
             if (abandon) {
@@ -4219,21 +6429,62 @@ static DWORD WINAPI pipeline_worker(LPVOID param) {
                 continue;
             }
             if (!ok) {
+                /* §7 P3 (round 27): an AV1 miss is not a failure yet.  The host needs
+                 * ~17 more access units before it releases this picture, and the
+                 * worker is the only thread that sends them -- so blocking here (or
+                 * retiring the job) is exactly what starved the stream in round 26.
+                 * The job keeps its place in the host output order (state SENT) and
+                 * the loop goes back to sending; the next fetch attempt is short
+                 * (VIRTIO_WDDM_AV1_FETCH_MS).  Only after
+                 * VIRTIO_WDDM_AV1_FETCH_TRIES misses does §5.4's "a timeout fails
+                 * the job" apply. */
+                if (pipe->av1_async && error == ERROR_SEM_TIMEOUT && !refused_route &&
+                    job->fetch_tries < VIRTIO_WDDM_AV1_FETCH_TRIES) {
+                    job->fetch_tries++;
+                    pipe->av1_fetch_retries++;
+                    EnterCriticalSection(&pipe->lock);
+                    if (generation != pipe->generation)
+                        pipeline_job_release_locked(pipe, job, "generation changed");
+                    else
+                        job->state = VIRTIO_WDDM_JOB_SENT; /* keeps its place */
+                    LeaveCriticalSection(&pipe->lock);
+                    if (job->fetch_tries <= 2u)
+                        INFO("%s: job %llu: no AV1 picture after %.2f ms (try %u/%u) "
+                             "-> back to sending; the host needs more access units "
+                             "before it releases this one", __FUNCTION__,
+                             (unsigned long long)job->seq, job->fetch_ms,
+                             job->fetch_tries, VIRTIO_WDDM_AV1_FETCH_TRIES);
+                    decoder_release_stray_frame(object);
+                    SetEvent(pipe->ready);
+                    continue;
+                }
+                /* The host genuinely did not deliver within the budget: retire the
+                 * job as FAILED with the ioctl's error (a timeout keeps 121, which
+                 * names the failure exactly).  A capture buffer the failed get may
+                 * still be holding is requeued once, not per poll. */
                 pipe->fetch_failures++;
                 pipe->failed_jobs++;
                 job->error = error;
                 job->failure = refused_route ? "no fetch route" : "map/get_frame";
+                if (error == ERROR_SEM_TIMEOUT)
+                    decoder_release_stray_frame(object);
                 EnterCriticalSection(&pipe->lock);
                 if (generation == pipe->generation)
                     job->state = VIRTIO_WDDM_JOB_FAILED;
                 else
                     pipeline_job_release_locked(pipe, job, "generation changed");
+                /* §7 P3 (round 27): a failed fetch consumed this job's place in
+                 * the host's output sequence, so it also consumes one unit of the
+                 * AV1 lag budget -- otherwise the sender would keep `av1_lag`
+                 * pictures outstanding forever and never fetch again. */
+                if (pipe->av1_async && pipe->av1_outstanding)
+                    pipe->av1_outstanding--;
                 LeaveCriticalSection(&pipe->lock);
                 ERROR("%s: job %llu: no decoded frame after %.2f ms (err=%u, %s, "
-                      "direct_ok=%d) -> job failed", __FUNCTION__,
+                      "fetch budget %u ms, direct_ok=%d) -> job failed", __FUNCTION__,
                       (unsigned long long)job->seq, job->fetch_ms, error,
                       refused_route ? "no route" : "host/fetch failure",
-                      (int)object->direct_ok);
+                      pipe->fetch_timeout_ms, (int)object->direct_ok);
                 SetEvent(pipe->ready);
                 continue;
             }
@@ -4250,6 +6501,29 @@ static DWORD WINAPI pipeline_worker(LPVOID param) {
             job->ready_qpc = decoder_qpc_now();
             job->state = VIRTIO_WDDM_JOB_READY;
             pipe->produced++;
+            if (pipe->av1_async) {
+                /* §7 P3 (round 27): the picture the host produced belongs to this
+                 * job (pictures are fetched in send order), so the lag budget shrinks
+                 * by one and the send loop may put the next AU on the wire. */
+                pipe->av1_produced++;
+                if (pipe->av1_outstanding)
+                    pipe->av1_outstanding--;
+                pipe->av1_fetch_waits++;
+                pipe->av1_fetch_wait_sum += job->fetch_ms;
+                if (job->fetch_ms > pipe->av1_fetch_wait_max)
+                    pipe->av1_fetch_wait_max = job->fetch_ms;
+                VERBOSE("%s: AV1 collect: job %llu picture ready after %.2f ms "
+                        "(outstanding %u/%u)", __FUNCTION__,
+                        (unsigned long long)job->seq, job->fetch_ms,
+                        (unsigned)pipe->av1_outstanding, (unsigned)pipe->av1_lag);
+            }
+            if (job->seq <= 8u)
+                INFO("%s: job %llu READY t=%lld: %ux%u stride=%u fourcc=%08x %s "
+                     "fetch=%.2f ms (mappings out %u/%u)", __FUNCTION__,
+                     (unsigned long long)job->seq, (long long)job->ready_qpc,
+                     job->info.Width, job->info.Height, job->info.Stride,
+                     job->info.FourCC, job->mapped ? "pool mapping" : "staged slot",
+                     job->fetch_ms, pipe->mappings_out, pipe->mapping_limit);
             LeaveCriticalSection(&pipe->lock);
             SetEvent(pipe->ready);
         }
@@ -4257,76 +6531,361 @@ static DWORD WINAPI pipeline_worker(LPVOID param) {
     return 0;
 }
 
-/* Snapshot the target of the frame that is being ended and copy its access unit
- * into a free ring slot.  Returns FALSE only on a hard failure (the caller then
- * drops the frame); the session is not touched here. */
-static BOOL pipeline_submit(VIRTIO_WDDM_VideoDecoder *object, const UINT8 *data,
-                            UINT size, UINT send_w, UINT send_h) {
-    VIRTIO_WDDM_DecodePipeline *pipe = object->pipeline;
-    VIRTIO_WDDM_VideoDecoderOutputView *view;
-    VIRTIO_WDDM_Resource *resource;
-    VIRTIO_WDDM_PipelineJob *job;
-    UINT64 seq;
-    UINT free_slots = 0;
+/* Is `texture` one of the surfaces this decoder has ever decoded into?  Lock
+ * held.  A weak pointer on purpose: the set is only consulted to decide whether
+ * a read that found no pending job deserves the neutral fill, and a decoder's
+ * output textures live as long as the decoder in practice. */
+static BOOL pipeline_is_target_locked(VIRTIO_WDDM_DecodePipeline *pipe,
+                                      ID3D11Resource *texture) {
     UINT i;
 
-    if (!pipe || pipe->broken)
+    for (i = 0; i < VIRTIO_WDDM_PIPELINE_TARGETS_MAX; i++) {
+        if (pipe->targets[i] == texture)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void pipeline_note_target_locked(VIRTIO_WDDM_DecodePipeline *pipe,
+                                        ID3D11Resource *texture) {
+    if (!texture || pipeline_is_target_locked(pipe, texture))
+        return;
+    pipe->targets[pipe->targets_next] = texture;
+    pipe->targets_next = (pipe->targets_next + 1u) % VIRTIO_WDDM_PIPELINE_TARGETS_MAX;
+}
+
+/* Snapshot the output view the current BeginFrame/EndFrame pair named.  The AV1
+ * show_existing path calls this at the HIDDEN picture's EndFrame because the job
+ * that finally produces that picture is queued at the NEXT EndFrame, when
+ * object->output_view already points at a different surface.
+ *
+ * `loud` = FALSE is the AV1 deferral: a hidden picture without a usable output
+ * view is a reason to skip the show_existing unit, not to fail the frame, and it
+ * must not add an ERROR line per hidden picture. */
+static BOOL pipeline_capture_target_ex(VIRTIO_WDDM_VideoDecoder *object,
+                                       VIRTIO_WDDM_PipelineTarget *out, BOOL loud) {
+    VIRTIO_WDDM_VideoDecoderOutputView *view;
+    VIRTIO_WDDM_Resource *resource;
+
+    if (!object || !out)
         return FALSE;
+    memset(out, 0, sizeof(*out));
     view = object->output_view.pDrvPrivate;
-    if (!view || view->magic != VIRTIO_WDDM_VIDEO_MAGIC_DECOUT || !view->resource.pDrvPrivate) {
-        ERROR("%s: no usable output view for the pipeline job -> E_FAIL", __FUNCTION__);
-        decoder_fail_frame(object, E_FAIL);
+    if (!view || view->magic != VIRTIO_WDDM_VIDEO_MAGIC_DECOUT ||
+        !view->resource.pDrvPrivate) {
+        if (loud)
+            ERROR("%s: no usable output view for the pipeline job -> E_FAIL",
+                  __FUNCTION__);
         return FALSE;
     }
     resource = view->resource.pDrvPrivate;
     if (!resource->base.pResource) {
-        ERROR("%s: output resource %p has no D3D11 texture -> E_FAIL", __FUNCTION__,
-              (void *)resource);
-        decoder_fail_frame(object, E_FAIL);
+        if (loud)
+            ERROR("%s: output resource %p has no D3D11 texture -> E_FAIL",
+                  __FUNCTION__, (void *)resource);
         return FALSE;
+    }
+    out->texture = resource->base.pResource;
+    out->tex_format = (DXGI_FORMAT)resource->base.Format;
+    out->tex_width = resource->base.Width;
+    out->tex_height = resource->base.Height;
+    out->array_size = resource->base.ArraySize;
+    out->mips = resource->base.MipLevels ? resource->base.MipLevels : 1u;
+    out->mip_slice = view->mip_slice;
+    out->first_array_slice = view->first_array_slice;
+    out->subresource = view->mip_slice + view->first_array_slice * out->mips;
+    return TRUE;
+}
+
+static BOOL pipeline_capture_target(VIRTIO_WDDM_VideoDecoder *object,
+                                    VIRTIO_WDDM_PipelineTarget *out) {
+    return pipeline_capture_target_ex(object, out, TRUE);
+}
+
+/* Snapshot the target of the frame that is being ended and copy its access unit
+ * into a free ring slot.  Returns FALSE only on a hard failure (the caller then
+ * drops the frame).  §5.4b: when every slot is taken this call first drains the
+ * oldest job (wait + upload + retire, bounded), so it is the ONLY place the
+ * submit thread can block, and never on a consumer that has not run yet.
+ *
+ * §7 P3 (round 28): `target_override` lets the AV1 show_existing unit target the
+ * output view of the picture it displays instead of the view of the frame that is
+ * ending now (see VIRTIO_WDDM_PipelineTarget). */
+static BOOL pipeline_submit(VIRTIO_WDDM_VideoDecoder *object, const UINT8 *data,
+                            UINT size, UINT send_w, UINT send_h,
+                            BOOL produces_picture,
+                            const VIRTIO_WDDM_PipelineTarget *target_override,
+                            BOOL no_wait) {
+    VIRTIO_WDDM_DecodePipeline *pipe = decoder_ctx_access(object);
+    VIRTIO_WDDM_PipelineTarget current;
+    const VIRTIO_WDDM_PipelineTarget *target = target_override;
+    VIRTIO_WDDM_PipelineJob *job;
+    UINT64 seq, submit_generation;
+    LONGLONG t_submit;
+    LONGLONG deadline;
+    HRESULT dhr;
+    BOOL drained;
+    UINT i;
+
+    if (!pipe) return FALSE;
+    if (pipe->broken || pipeline_admission_terminal(object) ||
+        InterlockedCompareExchange(&pipe->flushing,0,0)) goto admission_cancel;
+    if (!target) {
+        if (!pipeline_capture_target(object, &current))
+            goto fail_frame;
+        target = &current;
+    }
+    if (!target->texture) {
+        ERROR("%s: the job target has no D3D11 texture -> E_FAIL", __FUNCTION__);
+        goto fail_frame;
     }
     if (!data || size == 0) {
         ERROR("%s: empty access unit (%u B) -> E_FAIL", __FUNCTION__, size);
-        decoder_fail_frame(object, E_FAIL);
+        pipeline_fail_admission(object);
+        object->pending_error = E_FAIL;
         return FALSE;
     }
 
-    EnterCriticalSection(&pipe->lock);
-    for (i = 0; i < VIRTIO_WDDM_PIPELINE_JOBS; i++) {
-        if (pipe->jobs[i].state == VIRTIO_WDDM_JOB_FREE)
-            free_slots++;
-    }
-    if (!free_slots) {
-        /* Cannot happen with one submit and one drain per EndFrame; refuse
-         * instead of overwriting a job that is still in flight. */
+    t_submit = decoder_qpc_now();
+    /* One finite budget for lock acquisition and actual capacity backpressure.
+     * no_wait skips a per-frame picture wait, never compressed AU preservation. */
+    deadline = t_submit + (LONGLONG)pipe->timeout_ms * decoder_qpc_freq() / 1000;
+    if (pipe->trace)
+        INFO("%s: enter #%llu t=%lld: %u B %ux%u", __FUNCTION__,
+             (unsigned long long)(pipe->submit_seq + 1u), (long long)t_submit, size,
+             send_w, send_h);
+    /* §5.4b diagnostic: never an unbounded Enter here.  If another thread holds
+     * pipe->lock, this says who and for how long instead of freezing EndFrame
+     * with no log line at all (round 23's symptom). */
+    if (!pipeline_lock_bounded(pipe, deadline, "pipeline_submit"))
+        goto admission_timeout;
+    submit_generation = pipe->generation;
+    if (pipe->stop || pipe->broken || pipeline_admission_terminal(object) ||
+        InterlockedCompareExchange(&pipe->flushing,0,0) ||
+        InterlockedCompareExchange(&pipe->detached,0,0)) {
         LeaveCriticalSection(&pipe->lock);
-        ERROR("%s: all %u pipeline job slots are busy (submit=%llu drain=%llu) -> "
-              "E_FAIL for this frame", __FUNCTION__, VIRTIO_WDDM_PIPELINE_JOBS,
-              (unsigned long long)pipe->submit_seq, (unsigned long long)pipe->drain_seq);
-        decoder_fail_frame(object, E_FAIL);
-        return FALSE;
+        goto admission_cancel;
     }
-    seq = pipe->submit_seq + 1u;
-    job = &pipe->jobs[seq % VIRTIO_WDDM_PIPELINE_JOBS];
-    if (job->state != VIRTIO_WDDM_JOB_FREE) {
-        /* find any free slot (the ring is small, keep it simple) */
+    /* §5.4b (2026-10-25, round 24): a slot becomes free when its picture has been
+     * uploaded (decoder_texture_sync) or when a flush/destroy drops it.  Round 23
+     * waited for the event that only a consumer read can signal; when the
+     * application's renderer is behind its decoder, EndFrame #2 then waited for a
+     * read that itself waits for EndFrame #2.  Backpressure is the one targeted
+     * wait §5.4 allows, so the submit now DRAINS THE OLDEST JOB ITSELF -- through
+     * the very same pipeline_drain_one() the read path uses -- and only then
+     * enqueues its own.  Counted as `capacity drain=N` in the summary.
+     *
+     * The trigger is "no free slot OR max_inflight jobs outstanding".  The second
+     * half is the throttle that keeps the worker within a few frames of the host:
+     * without it the application queued 30+ frames, MAP_FRAME waited ~1 s for the
+     * host, and that wait (under pipe->lock) stalled the renderer (measured 1.03 s
+     * present gaps, 04-测试记录/24 §4).  Ring depth stays large; correctness never
+     * depends on either limit because every trigger drains. */
+    for (;;) {
+        UINT try;
+        BOOL cap_hit;
+        BOOL av1_tried = FALSE;
+
+        if (pipe->stop || pipe->broken || pipeline_admission_terminal(object) ||
+            submit_generation != pipe->generation ||
+            InterlockedCompareExchange(&pipe->flushing,0,0) ||
+            InterlockedCompareExchange(&pipe->detached,0,0)) {
+            LeaveCriticalSection(&pipe->lock);
+            goto admission_cancel;
+        }
         job = NULL;
-        for (i = 0; i < VIRTIO_WDDM_PIPELINE_JOBS; i++) {
-            if (pipe->jobs[i].state == VIRTIO_WDDM_JOB_FREE) {
-                job = &pipe->jobs[i];
+        for (try = 0; try < pipe->job_count; try++) {
+            if (pipe->jobs[try].state == VIRTIO_WDDM_JOB_FREE) {
+                job = &pipe->jobs[try];
                 break;
             }
         }
-        if (!job) {
+        cap_hit = job ? TRUE : FALSE; /* slot exists, but the in-flight cap is reached */
+        if (job && pipe->jobs_in_flight < pipe->max_inflight)
+            break;
+        if (pipe->stop || pipe->broken) {
             LeaveCriticalSection(&pipe->lock);
-            decoder_fail_frame(object, E_FAIL);
+            ERROR("%s: no free pipeline slot and the pipeline is %s -> E_FAIL",
+                  __FUNCTION__, pipe->stop ? "stopping" : "broken");
+            pipeline_fail_admission(object);
+        object->pending_error = E_FAIL;
             return FALSE;
         }
+        pipe->backpressure++;
+        pipe->drain_capacity++;
+        /* Never evict QUEUED, SENT, or any other owned AU. A full ring can
+         * make progress by uploading an already READY result to its OWN target.
+         * The drain and event wait both run without the producer holding lock. */
+        if (no_wait) {
+            if (job) break; /* cap is a throttle; no ring growth */
+            if (ma_capacity(FALSE, job != NULL, pipeline_left_ms(deadline)) == MA_EXPIRED) {
+                LeaveCriticalSection(&pipe->lock);
+                goto admission_timeout;
+            }
+            pipe->av1_feed_waits++;
+            LeaveCriticalSection(&pipe->lock);
+            drained = FALSE;
+            dhr = pipeline_drain_one(object, NULL, 0, TRUE, t_submit, deadline,
+                                     &drained, TRUE);
+            if (FAILED(dhr)) goto admission_cancel;
+            if (!drained) {
+                UINT left = pipeline_left_ms(deadline);
+                DWORD waited;
+                if (!left) goto admission_timeout;
+                waited = WaitForSingleObject(pipe->slot_free, left > 20u ? 20u : left);
+                if (waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT)
+                    goto admission_cancel;
+            }
+            if (!pipeline_lock_bounded(pipe, deadline, "AV1 capacity retry"))
+                goto admission_timeout;
+            if (pipe->stop || pipe->broken || pipeline_admission_terminal(object) ||
+                submit_generation != pipe->generation ||
+                InterlockedCompareExchange(&pipe->flushing,0,0) ||
+                InterlockedCompareExchange(&pipe->detached,0,0)) {
+                LeaveCriticalSection(&pipe->lock);
+                goto admission_cancel;
+            }
+            continue;
+        }
+        if (pipe->av1_async && cap_hit && !av1_tried) {
+            /* §7 P3 (round 27): the AV1 rule -- "when the queue is full (or at the
+             * in-flight cap), drain the oldest job, but if this drain has no
+             * picture yet, skip it and keep enqueueing; never wait per frame".
+             *
+             * So the first attempt is ONE non-blocking drain: it uploads/retires a
+             * READY (or dead) job if there is one, and otherwise returns
+             * immediately with nothing done.  If the ring still has a free slot the
+             * submit then goes ABOVE max_inflight (counted as av1_cap_skip) -- the
+             * cap is a throttle, not a correctness limit, and the worker keeps the
+             * host `av1_lag` AUs ahead anyway.  Only a truly full ring falls back to
+             * the bounded drain below. */
+            UINT64 cap_log = pipe->drain_capacity;
+
+            av1_tried = TRUE;
+            job = NULL;
+            LeaveCriticalSection(&pipe->lock);
+            drained = FALSE;
+            dhr = pipeline_drain_one(object, NULL, 0, TRUE, t_submit, t_submit,
+                                     &drained, TRUE /* non-blocking */);
+            EnterCriticalSection(&pipe->lock);
+            if (FAILED(dhr)) {
+                pipe->drain_failures++;
+                LeaveCriticalSection(&pipe->lock);
+                ERROR("%s: AV1 opportunistic capacity drain #%llu failed 0x%08lx "
+                      "-> this frame fails", __FUNCTION__,
+                      (unsigned long long)cap_log, (unsigned long)dhr);
+                pipeline_fail_admission(object);
+                object->pending_error = dhr;
+                return FALSE;
+            }
+            if (drained)
+                continue; /* a slot (or a picture) was retired: re-scan */
+            for (try = 0; try < pipe->job_count; try++) {
+                if (pipe->jobs[try].state == VIRTIO_WDDM_JOB_FREE) {
+                    job = &pipe->jobs[try];
+                    break;
+                }
+            }
+            if (job) {
+                pipe->av1_cap_skips++;
+                if (pipe->av1_cap_skips <= 4u)
+                    INFO("%s: AV1 in-flight cap %u reached (%u job(s) in flight) "
+                         "and the oldest job has no picture yet -> skipping the "
+                         "drain and enqueueing anyway (cap skip #%llu, "
+                         "outstanding %u/%u); the worker collects it once the "
+                         "host has produced it", __FUNCTION__, pipe->max_inflight,
+                         (unsigned)pipe->jobs_in_flight,
+                         (unsigned long long)pipe->av1_cap_skips,
+                         (unsigned)pipe->av1_outstanding,
+                         (unsigned)pipe->av1_lag);
+                break; /* enqueue above the cap: do not wait for the picture */
+            }
+            /* no free slot at all: fall through to the bounded drain (the no_wait
+             * path never reaches this point: it breaks out above) */
+        }
+        if (pipe->drain_capacity <= 8u || (pipe->drain_capacity % 120u) == 0u) {
+            if (cap_hit)
+                INFO("%s: in-flight cap %u reached (%u job(s) in flight, submit=%llu "
+                     "drain=%llu) -> draining the oldest job (capacity drain #%llu)",
+                     __FUNCTION__, pipe->max_inflight, (unsigned)pipe->jobs_in_flight,
+                     (unsigned long long)pipe->submit_seq,
+                     (unsigned long long)pipe->drain_seq,
+                     (unsigned long long)pipe->drain_capacity);
+            else
+                INFO("%s: all %u pipeline slot(s) busy (submit=%llu drain=%llu, %u "
+                     "job(s) in flight) -> draining the oldest job (capacity drain "
+                     "#%llu)", __FUNCTION__, pipe->job_count,
+                     (unsigned long long)pipe->submit_seq,
+                     (unsigned long long)pipe->drain_seq,
+                     (unsigned)pipe->jobs_in_flight,
+                     (unsigned long long)pipe->drain_capacity);
+        }
+        job = NULL; /* the drain loop re-scans after it made room */
+        LeaveCriticalSection(&pipe->lock);
+
+        drained = FALSE;
+        dhr = pipeline_drain_one(object, NULL, 0, TRUE, t_submit, deadline, &drained,
+                                 FALSE);
+        EnterCriticalSection(&pipe->lock);
+        if (FAILED(dhr)) {
+            UINT64 cap = pipe->drain_capacity;
+            UINT64 inflight = pipe->jobs_in_flight;
+
+            pipe->drain_failures++;
+            LeaveCriticalSection(&pipe->lock);
+            ERROR("%s: backpressure (ring %u slot(s), cap %u, %llu entries) and the "
+                  "oldest job could not be drained (0x%08lx, %llu capacity drain(s)) "
+                  "-> this EndFrame fails instead of waiting for a slot no consumer "
+                  "can free, see 04-测试记录/24", __FUNCTION__, (unsigned)pipe->job_count,
+                  (unsigned)pipe->max_inflight,
+                  (unsigned long long)inflight, (unsigned long)dhr,
+                  (unsigned long long)cap);
+            pipeline_fail_admission(object);
+                object->pending_error = dhr;
+            return FALSE;
+        }
+        if (!drained) {
+            /* Every matching job is owned by another consumer's upload right now
+             * (or an old generation is being torn down): wait for the next retire,
+             * still bounded by the same deadline.  Never waits for this frame's
+             * media. */
+            UINT left = pipeline_left_ms(deadline);
+
+            if (left == 0) {
+                UINT64 inflight = pipe->jobs_in_flight;
+
+                LeaveCriticalSection(&pipe->lock);
+                ERROR("%s: backpressure and nothing became drainable within %u ms "
+                      "(submit=%llu drain=%llu, %llu job(s) in flight) -> "
+                      "0x%08lx for this frame", __FUNCTION__, pipe->timeout_ms,
+                      (unsigned long long)pipe->submit_seq,
+                      (unsigned long long)pipe->drain_seq,
+                      (unsigned long long)inflight,
+                      (unsigned long)VIRTIO_WDDM_E_PIPELINE_TIMEOUT);
+                pipeline_fail_admission(object);
+        object->pending_error = VIRTIO_WDDM_E_PIPELINE_TIMEOUT;
+                return FALSE;
+            }
+            LeaveCriticalSection(&pipe->lock);
+            WaitForSingleObject(pipe->slot_free, left > 20 ? 20 : left);
+            if (!pipeline_lock_bounded(pipe, deadline, "pipeline_submit (capacity retry)")) {
+                pipeline_fail_admission(object);
+        object->pending_error = VIRTIO_WDDM_E_PIPELINE_TIMEOUT;
+                return FALSE;
+            }
+        }
+        /* loop re-checks for a free slot */
     }
+    seq = pipe->submit_seq + 1u;
     memset(&job->map, 0, sizeof(job->map));
     memset(&job->info, 0, sizeof(job->info));
     job->mapped = FALSE;
     job->using_slot = FALSE;
+    job->produces_picture = produces_picture;
+    job->dead = FALSE;
+    job->in_ioctl = FALSE;
+    job->fetch_tries = 0;
+    job->input_ordinal = 0;
     job->error = 0;
     job->failure = NULL;
     job->send_ms = 0.0;
@@ -4340,16 +6899,19 @@ static BOOL pipeline_submit(VIRTIO_WDDM_VideoDecoder *object, const UINT8 *data,
     job->send_h = send_h;
     job->desc_w = object->desc.SampleWidth;
     job->desc_h = object->desc.SampleHeight;
-    job->texture = resource->base.pResource;
+    job->texture = target->texture;
     job->texture->lpVtbl->AddRef(job->texture);
-    job->tex_format = (DXGI_FORMAT)resource->base.Format;
-    job->tex_width = resource->base.Width;
-    job->tex_height = resource->base.Height;
-    job->array_size = resource->base.ArraySize;
-    job->mips = resource->base.MipLevels ? resource->base.MipLevels : 1u;
-    job->mip_slice = view->mip_slice;
-    job->first_array_slice = view->first_array_slice;
-    job->subresource = view->mip_slice + view->first_array_slice * job->mips;
+    /* Register the surface: from now on a read of it is a read of OUR pixels
+     * (and may therefore be offered the neutral fill). */
+    pipeline_note_target_locked(pipe, job->texture);
+    job->tex_format = target->tex_format;
+    job->tex_width = target->tex_width;
+    job->tex_height = target->tex_height;
+    job->array_size = target->array_size;
+    job->mips = target->mips ? target->mips : 1u;
+    job->mip_slice = target->mip_slice;
+    job->first_array_slice = target->first_array_slice;
+    job->subresource = target->subresource;
     job->au_size = 0;
     if (!decoder_reserve(&job->au, &job->au_cap, size)) {
         job->texture->lpVtbl->Release(job->texture);
@@ -4357,16 +6919,36 @@ static BOOL pipeline_submit(VIRTIO_WDDM_VideoDecoder *object, const UINT8 *data,
         LeaveCriticalSection(&pipe->lock);
         ERROR("%s: cannot reserve %u B for the access unit -> E_FAIL", __FUNCTION__,
               size);
-        decoder_fail_frame(object, E_FAIL);
+        pipeline_fail_admission(object);
+        object->pending_error = E_FAIL;
         return FALSE;
     }
     memcpy(job->au, data, size);
     job->au_size = size;
+    job->read_ticket=0;
+    if(pipe->strict_read && produces_picture && !read_reserve_locked(pipe,job)) {
+        job->texture->lpVtbl->Release(job->texture); job->texture=NULL; job->au_size=0;
+        LeaveCriticalSection(&pipe->lock);
+        ERROR("strict target lease denied: same-slice pending/cross-decoder/capacity");
+        pipeline_fail_admission(object); object->pending_error=E_ACCESSDENIED; return FALSE;
+    }
+    if (pipe->tag_mode) pipe->tag_paused=FALSE;
     job->state = VIRTIO_WDDM_JOB_QUEUED;
     pipe->submit_seq = seq;
+    pipe->last_submit_qpc = job->submit_qpc;
     pipe->submitted++;
+    InterlockedExchange(&pipe->stream_started,1); /* accepted even before SEND/upload */
     pipe->jobs_in_flight++;
-    LeaveCriticalSection(&pipe->lock);
+    {
+        UINT free_after = pipeline_free_slots_locked(pipe); /* this job excluded */
+        UINT inflight = (UINT)pipe->jobs_in_flight;
+
+        LeaveCriticalSection(&pipe->lock);
+        if (pipe->trace)
+            INFO("%s: enqueued #%llu t=%lld: %u free slot(s) left, %u in flight",
+                 __FUNCTION__, (unsigned long long)seq, (long long)decoder_qpc_now(),
+                 free_after, inflight);
+    }
 
     object->bytes_sent += size;
     object->last_width = send_w;
@@ -4381,6 +6963,24 @@ static BOOL pipeline_submit(VIRTIO_WDDM_VideoDecoder *object, const UINT8 *data,
             __FUNCTION__, (unsigned long long)seq, size, send_w, send_h,
             (void *)job->texture, job->subresource, (unsigned long long)job->generation);
     return TRUE;
+
+admission_timeout:
+    pipeline_fail_admission(object);
+    object->decode_failures++;
+    object->pending_error = VIRTIO_WDDM_E_PIPELINE_TIMEOUT;
+    ERROR("AV1 admission deadline: decoder terminal until recreation; no queued AU evicted");
+    return FALSE;
+admission_cancel:
+    pipeline_fail_admission(object);
+    object->decode_failures++;
+    object->pending_error = E_ABORT;
+    return FALSE;
+fail_frame:
+    /* No target could be resolved (no BeginFrame, no texture): the same failure
+     * the inline checks above report. */
+    pipeline_fail_admission(object);
+        object->pending_error = E_FAIL;
+    return FALSE;
 }
 
 /* Build the neutral picture the fill EndFrame writes: a zeroed NV12 surface is
@@ -4409,218 +7009,1452 @@ static void pipeline_prepare_fill(VIRTIO_WDDM_DecodePipeline *pipe, VIRTIO_WDDM_
     out->info.FourCC = VIRTIO_WDDM_FOURCC_NV12;
 }
 
-/* Drain one job: wait (bounded) for the oldest pending job to be READY, hand
- * its pixels and its target to the caller, and release the slot.  Returns
- * FALSE when the pipeline cannot deliver a frame at all (the caller then drops
- * the frame); a fill returns TRUE with out->fill set. */
-static BOOL pipeline_drain(VIRTIO_WDDM_VideoDecoder *object, VIRTIO_WDDM_PipelineFrame *out) {
-    VIRTIO_WDDM_DecodePipeline *pipe = object->pipeline;
-    VIRTIO_WDDM_PipelineJob *job = NULL;
-    LONGLONG t_wait0;
-    double waited;
+/* §5.4 DEFERRED (2026-10-25, round 23): the CONSUMER half of the pipeline.
+ *
+ * The pipeline this replaces drained inside DecoderEndFrame: it waited for the
+ * oldest job and handed its pixels to the upload tail of the EndFrame that had
+ * just submitted a NEWER frame.  That is "blocking DecoderEndFrame as general
+ * synchronisation", which the author's §5.4 forbids, and its first-frame
+ * handshake deadlocked (job 2 timed out 1250 ms waiting for a capture buffer;
+ * 04-测试记录/22-并发mapping-上机.md §4.2).  The deferred form:
+ *
+ *   DecoderEndFrame        queue the AU, snapshot the target texture/subresource,
+ *                          return.  No wait, no upload, no fill write.
+ *   decoder_texture_sync   called by every entry point that is about to READ the
+ *                          output texture -- VideoProcessorBlt's input views, Map,
+ *                          CopyResource / CopySubresourceRegion /
+ *                          ResolveSubresource, the two read-after-write hazard
+ *                          callbacks, an SRV read.  Waits (event, bounded) for
+ *                          every job that targets that (texture, subresource),
+ *                          oldest first, uploads its picture into the subresource
+ *                          that job's OWN BeginFrame named, and retires it.
+ *
+ * The host decode of picture N therefore overlaps everything the application does
+ * between EndFrame(N) and the first read of N's texture, and the wait + the
+ * 3.1 MB staging copy are paid on the thread that actually needs the pixels.
+ * Nothing here polls: a job signals pipe->ready when it leaves SENDING /
+ * FETCHING / UPLOADING or fails, and the wait is bounded by pipe->timeout_ms
+ * ("all waits carry a timeout and diagnostics; a timeout fails the job", §5.4).
+ *
+ * Generation: a job carries the generation it was submitted in.  quiesce()
+ * bumps the generation and drops every job of the old one, so a picture from
+ * before a flush/seek can never be written after it -- not even by a sync that
+ * raced the flush, because the job is already FREE and its mapping released. */
+
+/* Record that a picture landed in (texture, subresource) for this generation.
+ * Only used to decide whether a read that finds no job needs the neutral fill
+ * picture.  Lock held. */
+static void pipeline_note_uploaded_locked(VIRTIO_WDDM_DecodePipeline *pipe,
+                                          ID3D11Resource *texture, UINT subresource) {
+    pipe->uploaded[pipe->uploaded_next].texture = texture;
+    pipe->uploaded[pipe->uploaded_next].subresource = subresource;
+    pipe->uploaded_next = (pipe->uploaded_next + 1u) % VIRTIO_WDDM_PIPELINE_UPLOADED_MAX;
+}
+
+static BOOL pipeline_uploaded_before_locked(VIRTIO_WDDM_DecodePipeline *pipe,
+                                            ID3D11Resource *texture, UINT subresource) {
     UINT i;
 
-    memset(out, 0, sizeof(*out));
-    if (!pipe)
-        return FALSE;
-
-    t_wait0 = decoder_qpc_now();
-    EnterCriticalSection(&pipe->lock);
-    /* The oldest job that has not been drained yet.  A single worker produces
-     * them in submission order, so waiting for the oldest waits for all of
-     * them. */
-    for (i = 0; i < VIRTIO_WDDM_PIPELINE_JOBS; i++) {
-        VIRTIO_WDDM_PipelineJob *candidate = &pipe->jobs[i];
-        if (candidate->state == VIRTIO_WDDM_JOB_FREE || candidate->seq <= pipe->drain_seq)
-            continue;
-        if (!job || candidate->seq < job->seq)
-            job = candidate;
+    for (i = 0; i < VIRTIO_WDDM_PIPELINE_UPLOADED_MAX; i++) {
+        if (pipe->uploaded[i].texture == texture &&
+            pipe->uploaded[i].subresource == subresource)
+            return TRUE;
     }
-    if (job && pipe->defer && job->seq == pipe->submit_seq) {
-        /* The only pending job is the one submitted a moment ago: with the
-         * deferred pipeline this EndFrame must NOT wait for it, otherwise the
-         * fetch is back on the critical path and the pipeline degenerates into
-         * the serial path with an extra thread.  The frame that is owed is the
-         * previous one, which has already been drained. */
-        job = NULL;
-    }
-    if (!job) {
-        /* Fill frame: nothing older is pending.  Write the placeholder instead
-         * of leaving the subresource untouched. */
-        VIRTIO_WDDM_VideoDecoderOutputView *view = object->output_view.pDrvPrivate;
-        VIRTIO_WDDM_Resource *resource =
-            view && view->resource.pDrvPrivate ? view->resource.pDrvPrivate : NULL;
-        /* drain_seq deliberately does NOT move: the job submitted by this
-         * EndFrame is still owed, and the next EndFrame has to upload it. */
-        pipe->fills++;
-        pipeline_prepare_fill(pipe, out);
-        if (resource && resource->base.pResource) {
-            out->texture = resource->base.pResource;
-            out->tex_format = (DXGI_FORMAT)resource->base.Format;
-            out->tex_width = resource->base.Width;
-            out->tex_height = resource->base.Height;
-            out->array_size = resource->base.ArraySize;
-            out->mips = resource->base.MipLevels ? resource->base.MipLevels : 1u;
-            out->mip_slice = view->mip_slice;
-            out->first_array_slice = view->first_array_slice;
-            out->subresource = view->mip_slice + view->first_array_slice * out->mips;
-        }
-        LeaveCriticalSection(&pipe->lock);
-        if (pipe->fill_logged < 4u) {
-            pipe->fill_logged++;
-            INFO("%s: pipeline fill #%llu: no older job to upload, writing the "
-                 "neutral %ux%u picture into subresource %u (a zeroed NV12 slice "
-                 "would present as flat green)", __FUNCTION__,
-                 (unsigned long long)pipe->fills, out->info.Width, out->info.Height,
-                 out->subresource);
-        }
-        out->queue_ms = 0.0;
-        out->lead_ms = 0.0;
-        return out->src != NULL;
-    }
+    return FALSE;
+}
 
-    {
-        LONGLONG deadline = decoder_qpc_now() +
-                            (LONGLONG)(pipe->timeout_ms + 250u) *
-                                decoder_qpc_freq() / 1000;
-        for (;;) {
-            UINT left;
+/* Retire a job: its picture was uploaded (or the job is dead).  Lock held. */
+static void pipeline_retire_locked(VIRTIO_WDDM_DecodePipeline *pipe,
+                                   VIRTIO_WDDM_PipelineJob *job, BOOL uploaded) {
+    if (uploaded && job->texture)
+        pipeline_note_uploaded_locked(pipe, job->texture, job->subresource);
+    pipe->drain_seq = job->seq;
+    if (uploaded)
+        pipe->drained++;
+    pipe->jobs_in_flight = pipe->jobs_in_flight ? pipe->jobs_in_flight - 1u : 0u;
+    pipeline_job_release_locked(pipe, job, uploaded ? "uploaded" : "dropped at sync");
+    /* Both events: a consumer waiting for this picture, a submit waiting for a
+     * free slot, and the worker's capture-buffer gate (it waits on pipe->wake
+     * when mappings_out == mapping_limit, and this retire is what lowers it). */
+    SetEvent(pipe->ready);
+    SetEvent(pipe->wake);
+}
 
-            if (job->state == VIRTIO_WDDM_JOB_READY ||
-                job->state == VIRTIO_WDDM_JOB_FAILED ||
-                job->state == VIRTIO_WDDM_JOB_FREE)
-                break;
-            if (job->generation != pipe->generation)
-                break; /* quiesced under us: the job is no longer ours */
-            left = pipeline_left_ms(deadline);
-            if (left == 0) {
-                job->state = VIRTIO_WDDM_JOB_FAILED;
-                job->failure = "drain timeout";
-                job->error = ERROR_SEM_TIMEOUT;
-                pipe->timeouts++;
-                pipe->failed_jobs++;
-                ERROR("%s: job %llu: the worker did not produce it within %u ms "
-                      "-> job failed (submit=%llu drain=%llu state=%u)",
-                      __FUNCTION__, (unsigned long long)job->seq,
-                      pipe->timeout_ms + 250u, (unsigned long long)pipe->submit_seq,
-                      (unsigned long long)pipe->drain_seq, job->state);
-                break;
-            }
-            LeaveCriticalSection(&pipe->lock);
-            WaitForSingleObject(pipe->ready, left > 20 ? 20 : left);
-            EnterCriticalSection(&pipe->lock);
-        }
-    }
-
-    waited = decoder_qpc_ms(t_wait0, decoder_qpc_now());
-    pipe->wait_sum += waited;
-    if (waited > pipe->wait_max)
-        pipe->wait_max = waited;
-
-    out->wait_ms = waited;
-    out->error = job->error;
-    out->failure = job->failure;
-    out->send_ms = job->send_ms;
-    out->fetch_ms = job->fetch_ms;
-    out->start_qpc = job->send_qpc;
-    out->queue_ms = job->ready_qpc ? decoder_qpc_ms(job->submit_qpc, job->ready_qpc) : -1.0;
-    out->lead_ms = job->ready_qpc ? decoder_qpc_ms(job->ready_qpc, decoder_qpc_now()) : -1.0;
-    if (out->queue_ms > 0.0) {
-        pipe->queue_sum += out->queue_ms;
-        if (out->queue_ms > pipe->queue_max)
-            pipe->queue_max = out->queue_ms;
-    }
-    if (out->lead_ms > 0.0) {
-        pipe->lead_sum += out->lead_ms;
-        if (out->lead_ms > pipe->lead_max)
-            pipe->lead_max = out->lead_ms;
-    }
-
-    if (job->state != VIRTIO_WDDM_JOB_READY) {
-        /* FAILED, FREE (quiesced) or timed out: the frame is dropped. */
-        pipe->failed_jobs += (job->state == VIRTIO_WDDM_JOB_FAILED) ? 0u : 1u;
-        out->failed = TRUE;
-        ERROR("%s: job %llu dropped: %s (err=%u, waited %.2f ms, state=%u)",
-              __FUNCTION__, (unsigned long long)job->seq,
-              job->failure ? job->failure : "no frame", job->error, waited,
-              job->state);
-        pipeline_job_release_locked(pipe, job, "failed at drain");
-        pipe->drain_seq = job->seq;
-        pipe->jobs_in_flight = pipe->jobs_in_flight ? pipe->jobs_in_flight - 1u : 0u;
-        LeaveCriticalSection(&pipe->lock);
-        return TRUE;
-    }
-
-    /* Hand the pixels over. */
-    out->texture = job->texture;
-    out->tex_format = job->tex_format;
-    out->tex_width = job->tex_width;
-    out->tex_height = job->tex_height;
-    out->array_size = job->array_size;
-    out->mips = job->mips;
-    out->mip_slice = job->mip_slice;
-    out->first_array_slice = job->first_array_slice;
-    out->subresource = job->subresource;
-    out->info = job->info;
+/* §7 P3 (round 27): retire a job whose access unit has been sent but that owes
+ * nobody a picture -- the hidden AV1 DPB catch-up.  The host decodes it without
+ * emitting a CAPTURE buffer, so there is nothing to fetch and nothing to upload;
+ * holding the slot (or, worse, fetching for it) would both waste a ring slot and
+ * shift the "one host picture per shown AU" ordering the async collector relies
+ * on.  Deliberately NOT pipeline_job_release_locked()/pipeline_retire_locked():
+ * those count a slot as `dropped`, and a catch-up that did its job is not a
+ * dropped frame.  Lock held. */
+static void pipeline_retire_no_picture_locked(VIRTIO_WDDM_DecodePipeline *pipe,
+                                              VIRTIO_WDDM_PipelineJob *job) {
     if (job->mapped) {
-        /* Transfer the capture buffer to the DDI thread: the existing decode
-         * tail reads it and decoder_drop_direct() gives it back on every exit
-         * path, which also tells the worker that the next map may start. */
-        object->direct_map = job->map;
-        object->direct_active = TRUE;
+        /* Cannot happen (a no-picture job never reaches the fetch), but never
+         * lose a capture buffer to an accounting assumption. */
+        if (!vm_release_frame(decoder_session_borrow(pipe->object), job->map.Index)) {
+            if(pipe->life_mode) { pipe->unresolved_map=TRUE; pipe->broken=TRUE; return; }
+            ERROR("%s: job %llu RELEASE_FRAME(index %u) failed err=%u", __FUNCTION__,
+                  (unsigned long long)job->seq, job->map.Index, vm_last_error());
+        }
         job->mapped = FALSE;
-        pipe->mapping_out = TRUE;
-        pipe->mapping_out_seq = job->seq;
-        out->src = (const UINT8 *)job->map.UserVa;
-        out->readable = (UINT64)job->map.MappedLength;
-        pipe->drained_mapped++;
-    } else {
-        out->src = job->slot;
-        out->readable = (UINT64)job->slot_cap;
-        pipe->drained_staged++;
+        if (pipe->mappings_out)
+            pipe->mappings_out--;
     }
     if (job->texture) {
         job->texture->lpVtbl->Release(job->texture);
         job->texture = NULL;
     }
-    {
-        /* Log before the slot is cleared: the state below is what the summary
-         * needs, and the job's own fields are gone once it is reused. */
-        UINT au_size = job->au_size;
-        BOOL staged = job->using_slot;
+    pipeline_job_free_scratch_locked(job);
+    job->identity.state = MT_EMPTY;
+    if(pipe->tag_mode) SetEvent(pipe->tag_wake);
+    job->state = VIRTIO_WDDM_JOB_FREE;
+    job->au_size = 0;
+    job->using_slot = FALSE;
+    job->error = 0;
+    job->failure = NULL;
+    job->produces_picture = FALSE;
+    pipe->jobs_in_flight = pipe->jobs_in_flight ? pipe->jobs_in_flight - 1u : 0u;
+    SetEvent(pipe->slot_free);
+    SetEvent(pipe->wake);
+}
 
-        job->state = VIRTIO_WDDM_JOB_FREE;
-        job->au_size = 0;
-        job->using_slot = FALSE;
-        pipe->drain_seq = job->seq;
-        pipe->drained++;
-        pipe->jobs_in_flight = pipe->jobs_in_flight ? pipe->jobs_in_flight - 1u : 0u;
-        pipe->logged++;
-        if (pipe->logged <= 8u || (job->seq % 120u) == 0u) {
-            INFO("%s: job %llu %s: au=%u B send=%.2f fetch=%.2f -> subresource %u "
-                 "(tex=%p) queue=%.2f lead=%.2f wait=%.2f ms (gen %llu, %s)",
-                 __FUNCTION__, (unsigned long long)job->seq,
-                 staged ? "staged" : "pool",
-                 au_size, job->send_ms, job->fetch_ms, out->subresource,
-                 (void *)out->texture, out->queue_ms, out->lead_ms, waited,
-                 (unsigned long long)job->generation,
-                 out->lead_ms >= 0.0 ? "worker ahead" : "worker late");
-        } else {
-            VERBOSE("%s: job %llu: send=%.2f fetch=%.2f queue=%.2f lead=%.2f ms",
-                    __FUNCTION__, (unsigned long long)job->seq, job->send_ms,
-                    job->fetch_ms, out->queue_ms, out->lead_ms);
+/* The upload itself: copy the job's pixels into the subresource its own
+ * BeginFrame named.  Runs on the consumer thread, OUTSIDE pipe->lock -- a 1080p
+ * picture is a 3.1 MB staging copy plus a DXVK command, and holding the lock
+ * would stall the worker's vm_send for that long (killing the overlap this whole
+ * change exists for).
+ *
+ * The layout rules are the same ones the serial tail documents: VM_FRAME_INFO
+ * names the host layout (NV12 or P010, both stride*height*3/2 bytes), the texture
+ * format names the surface layout, and only a mismatch is converted, once, into
+ * the decoder's scratch buffer.  Every read is bounds-checked against BOTH the
+ * producer's valid size and the bytes actually mapped/copied (VP9FIX). */
+static HRESULT pipeline_upload_picture(VIRTIO_WDDM_VideoDecoder *object,
+                                       VIRTIO_WDDM_PipelineJob *job,
+                                       double *upload_ms) {
+    VIRTIO_WDDM_DecodePipeline *upload_pipe = object ? decoder_ctx_access(object) : NULL;
+    ID3D11DeviceContext1 *upload_context = upload_pipe && upload_pipe->life_mode
+        ? upload_pipe->upload_context : (object && object->device ? object->device->base.pCtx1 : NULL);
+    const UINT8 *src;
+    UINT64 readable;
+    BOOL host_p010;
+    BOOL dst_p010;
+    UINT row_bytes;
+    UINT stride;
+    UINT conv_stride;
+    const UINT8 *upload_src;
+    UINT upload_stride;
+    UINT upload_fourcc;
+    UINT upload_h; /* height actually handed to UpdateSubresource */
+    UINT64 need;
+    LONGLONG t0;
+    HRESULT hr;
+    UINT8 *local_conv=NULL;
+    UINT local_conv_cap=0;
+
+    if (upload_ms)
+        *upload_ms = 0.0;
+    if (!object || !upload_context || !job || !job->texture) {
+        ERROR("%s: no device/texture/job (%s) -> E_FAIL", __FUNCTION__,
+              !job ? "no job" : (!job->texture ? "no texture" : "no device"));
+        if(local_conv) HeapFree(GetProcessHeap(),0,local_conv);
+        return E_FAIL;
+    }
+    if (!decoder_output_format_supported((DXGI_FORMAT)job->tex_format)) {
+        ERROR("%s: job %llu targets format %u, not NV12 or P010 -> E_FAIL",
+              __FUNCTION__, (unsigned long long)job->seq, (UINT)job->tex_format);
+        if(local_conv) HeapFree(GetProcessHeap(),0,local_conv);
+        return E_FAIL;
+    }
+    if (job->subresource >=
+        (job->array_size ? job->array_size : 1u) * (job->mips ? job->mips : 1u)) {
+        ERROR("%s: job %llu: subresource %u outside %ux%u (mips=%u array=%u) -> E_FAIL",
+              __FUNCTION__, (unsigned long long)job->seq, job->subresource,
+              job->tex_width, job->tex_height, job->mips, job->array_size);
+        if(local_conv) HeapFree(GetProcessHeap(),0,local_conv);
+        return E_FAIL;
+    }
+    src = job->mapped ? (const UINT8 *)job->map.UserVa : job->slot;
+    readable = job->mapped ? (UINT64)job->map.MappedLength : (UINT64)job->slot_cap;
+    if (!src || readable == 0 || job->info.Width == 0 || job->info.Height == 0) {
+        ERROR("%s: job %llu has no readable pixels (src=%p readable=%llu %ux%u) -> E_FAIL",
+              __FUNCTION__, (unsigned long long)job->seq, (const void *)src,
+              (unsigned long long)readable, job->info.Width, job->info.Height);
+        if(local_conv) HeapFree(GetProcessHeap(),0,local_conv);
+        return E_FAIL;
+    }
+
+    host_p010 = job->info.FourCC == VIRTIO_WDDM_FOURCC_P010;
+    dst_p010 = (DXGI_FORMAT)job->tex_format == DXGI_FORMAT_P010;
+    row_bytes = host_p010 ? job->info.Width * 2u : job->info.Width;
+    stride = job->info.Stride ? job->info.Stride : row_bytes;
+    if (stride < row_bytes)
+        stride = row_bytes;
+    if ((UINT64)job->info.Size < (UINT64)stride * job->info.Height * 3u / 2u)
+        stride = row_bytes;
+    need = (UINT64)stride * job->info.Height * 3u / 2u;
+    if (need > (UINT64)job->info.Size || need > readable) {
+        ERROR("%s: job %llu: %ux%u stride=%u needs %llu B but %u are valid and "
+              "%llu readable (%s) -> E_INVALIDARG", __FUNCTION__,
+              (unsigned long long)job->seq, job->info.Width, job->info.Height,
+              stride, (unsigned long long)need, job->info.Size,
+              (unsigned long long)readable, job->mapped ? "pool mapping" : "staged slot");
+        if(local_conv) HeapFree(GetProcessHeap(),0,local_conv);
+        return E_INVALIDARG;
+    }
+
+    /* 2026-10-27 (round 46c): geometry audit for the 360p chroma bug.  Prints the
+     * layout the HOST reported (V4L2 S_FMT: width/height/bytesperline/sizeimage)
+     * next to the one this upload uses, plus the 16/32/64-row alignments.  If the
+     * host's height is not 16-aligned, its UV plane starts at stride*align(height)
+     * while D3D reads ours at stride*height -> chroma shifted by the difference. */
+    {
+        static volatile LONG geom_logs;
+        LONG n = InterlockedIncrement(&geom_logs);
+
+        if (n <= 12 || (n % 240) == 0) {
+            UINT h16 = (job->info.Height + 15u) & ~15u;
+            UINT h32 = (job->info.Height + 31u) & ~31u;
+            UINT h64 = (job->info.Height + 63u) & ~63u;
+
+            INFO("%s: geom #%ld: host %ux%u stride=%u size=%u fourcc=0x%08x | ours "
+                 "stride=%u y=%llu uv_off=%llu total=%llu | align16=%u align32=%u "
+                 "align64=%u | tex %ux%u fmt=%u sub=%u",
+                 __FUNCTION__, n, job->info.Width, job->info.Height, job->info.Stride,
+                 job->info.Size, (UINT)job->info.FourCC, stride,
+                 (unsigned long long)((UINT64)stride * job->info.Height),
+                 (unsigned long long)((UINT64)stride * job->info.Height),
+                 (unsigned long long)need, h16, h32, h64, job->tex_width,
+                 job->tex_height, (UINT)job->tex_format, job->subresource);
         }
     }
+
+    upload_h = job->info.Height;
+    if (host_p010 == dst_p010) {
+        upload_src = src;
+        upload_stride = stride;
+        upload_fourcc = host_p010 ? VIRTIO_WDDM_FOURCC_P010 : VIRTIO_WDDM_FOURCC_NV12;
+        /* 2026-10-27 (round 46c): 360p chroma fix.  D3D11 places the NV12 UV
+         * plane of a subresource at stride * TEXTURE height, not at
+         * stride * box height.  The host frame is 640x360 while the decoder
+         * texture PotPlayer allocated is 640x384, so uploading a 360-row box
+         * wrote the chroma at stride*360 -- 24 rows above the plane DXVK/the
+         * video processor reads -> the picture showed correct luma with garbage
+         * colour (measured: a1g360, geom #1 host 640x360 tex 640x384).  Pad the
+         * staged copy to the texture's height and upload the full box. */
+        if (!host_p010 && job->tex_height > job->info.Height) {
+            UINT64 y_full = (UINT64)stride * job->tex_height;
+            UINT64 need_full = y_full * 3u / 2u;
+
+            if (need_full <= 0x7FFFFFFFu &&
+                decoder_reserve(&local_conv, &local_conv_cap, (UINT)need_full)) {
+                UINT8 *dst_buf = local_conv;
+                if(!mu_pad(dst_buf,need_full,src,stride,job->info.Height,job->tex_height)) {
+                    HeapFree(GetProcessHeap(),0,local_conv); return E_INVALIDARG;
+                }
+                upload_src = dst_buf;
+                upload_stride = stride;
+                upload_h = job->tex_height;
+            } else {
+                if(decoder_ctx_access(object) && decoder_ctx_access(object)->strict_read) {
+                    if(local_conv) HeapFree(GetProcessHeap(),0,local_conv);
+                    return E_OUTOFMEMORY;
+                }
+                INFO("%s: job %llu: cannot stage the %ux%u -> %u-row padded copy "
+                     "(need %llu B); uploading the short box (chroma may shift)",
+                     __FUNCTION__, (unsigned long long)job->seq, job->info.Width,
+                     job->info.Height, job->tex_height,
+                     (unsigned long long)need_full);
+            }
+        }
+    } else {
+        conv_stride = dst_p010 ? job->info.Width * 2u : job->info.Width;
+        need = (UINT64)conv_stride * job->info.Height * 3u / 2u;
+        if (need > 0x7FFFFFFFu) {
+            ERROR("%s: job %llu: %ux%u needs %llu B for the %s surface -> E_FAIL",
+                  __FUNCTION__, (unsigned long long)job->seq, job->info.Width,
+                  job->info.Height, (unsigned long long)need, dst_p010 ? "P010" : "NV12");
+            if(local_conv) HeapFree(GetProcessHeap(),0,local_conv);
+        return E_FAIL;
+        }
+        if (!decoder_reserve(&local_conv, &local_conv_cap, (UINT)need)) {
+            ERROR("%s: job %llu: out of memory for the %s conversion (%llu B)",
+                  __FUNCTION__, (unsigned long long)job->seq,
+                  dst_p010 ? "P010" : "NV12", (unsigned long long)need);
+            if(local_conv) HeapFree(GetProcessHeap(),0,local_conv);
+        return E_FAIL;
+        }
+        if (!decoder_convert_420(src, stride, host_p010, local_conv, conv_stride,
+                                 dst_p010, job->info.Width, job->info.Height)) {
+            ERROR("%s: job %llu: cannot convert %s %ux%u (stride %u) into %s (stride %u)",
+                  __FUNCTION__, (unsigned long long)job->seq,
+                  host_p010 ? "P010" : "NV12", job->info.Width, job->info.Height,
+                  stride, dst_p010 ? "P010" : "NV12", conv_stride);
+            if(local_conv) HeapFree(GetProcessHeap(),0,local_conv);
+        return E_FAIL;
+        }
+        upload_src = local_conv;
+        upload_stride = conv_stride;
+        upload_fourcc = dst_p010 ? VIRTIO_WDDM_FOURCC_P010 : VIRTIO_WDDM_FOURCC_NV12;
+    }
+
+    if (upload_pipe && upload_pipe->life_mode && InterlockedCompareExchange(&upload_pipe->detached,0,0)) {
+        if(local_conv) HeapFree(GetProcessHeap(),0,local_conv);
+        return E_ABORT;
+    }
+    t0 = decoder_qpc_now();
+    hr = virtio_wddm_dxvk_video_upload_frame(upload_context, job->texture,
+                                             job->subresource, upload_src,
+                                             job->info.Width, upload_h,
+                                             upload_stride, upload_fourcc);
+    if (upload_ms)
+        *upload_ms = decoder_qpc_ms(t0, decoder_qpc_now());
+    if (FAILED(hr)) {
+        ERROR("%s: job %llu: upload into %ux%u texture %p subresource %u (mip %u "
+              "slice %u) failed 0x%08lx", __FUNCTION__, (unsigned long long)job->seq,
+              job->tex_width, job->tex_height, (void *)job->texture, job->subresource,
+              job->mip_slice, job->first_array_slice, (unsigned long)hr);
+        if(local_conv) HeapFree(GetProcessHeap(),0,local_conv);
+    return hr;
+    }
+    VERBOSE("%s: job %llu uploaded: %ux%u %s from %s -> tex=%p subresource=%u in %.2f ms",
+            __FUNCTION__, (unsigned long long)job->seq, job->info.Width, job->info.Height,
+            dst_p010 ? "P010" : "NV12", job->mapped ? "pool mapping" : "staged slot",
+            (void *)job->texture, job->subresource, upload_ms ? *upload_ms : 0.0);
+    if(local_conv) HeapFree(GetProcessHeap(),0,local_conv);
+    return S_OK;
+}
+
+/* The neutral picture for a subresource that is read before any decoded picture
+ * landed in it: uninitialised NV12 memory is not black, and a zeroed slice is
+ * flat green (Y=0, U=V=0) -- the P2-2J bug.  Only NV12 targets; a P010 surface
+ * keeps whatever it had (the 10-bit path is not the one this round measures). */
+static HRESULT pipeline_upload_fill(VIRTIO_WDDM_VideoDecoder *object,
+                                    ID3D11Resource *texture, UINT subresource) {
+    VIRTIO_WDDM_PipelineFrame fill;
+    HRESULT hr;
+    VIRTIO_WDDM_DecodePipeline *p=decoder_ctx_access(object);
+    ID3D11DeviceContext1 *context=p && p->life_mode ? p->upload_context :
+        (object && object->device ? object->device->base.pCtx1 : NULL);
+
+    if (!object || !p || !context || !texture)
+        return E_FAIL;
+    if(p->life_mode && InterlockedCompareExchange(&p->detached,0,0)) return E_ABORT;
+    memset(&fill, 0, sizeof(fill));
+    pipeline_prepare_fill(decoder_ctx_access(object), &fill);
+    if (!fill.src || fill.readable == 0 ||
+        decoder_ctx_access(object)->fill_size == 0) {
+        ERROR("%s: no fill picture available (%ux%u) -> E_FAIL", __FUNCTION__,
+              fill.info.Width, fill.info.Height);
+        return E_FAIL;
+    }
+    hr = virtio_wddm_dxvk_video_upload_frame(context, texture,
+                                             subresource, fill.src, fill.info.Width,
+                                             fill.info.Height, fill.info.Stride,
+                                             VIRTIO_WDDM_FOURCC_NV12);
+    if (FAILED(hr)) {
+        ERROR("%s: neutral fill into %p subresource %u failed 0x%08lx", __FUNCTION__,
+              (void *)texture, subresource, (unsigned long)hr);
+        return hr;
+    }
+    return S_OK;
+}
+
+/* §5.4b (2026-10-25, round 24): THE ONE DRAIN -- shared verbatim by the
+ * capacity backpressure in pipeline_submit() and by the read-before-use path in
+ * pipeline_sync().
+ *
+ * Why this exists (04-测试记录/23-延迟等待.md §4.3 + 04-测试记录/24): round 23
+ * moved "wait for the picture + upload" out of DecoderEndFrame (correct, author
+ * §5.4) but left the ring-full case as "wait for a free slot".  A slot is
+ * released only by that very read path, so the wait is a cycle whenever the
+ * application does not read before its next EndFrame:
+ *
+ *   pipeline_submit: no free slot -> wait   <-- job N-1 READY, holds its slot
+ *         ^                                          |
+ *         |                                          v
+ *   decoder_texture_sync (only consumer)  <- the application must read first
+ *
+ * The author allows a targeted wait, and a full queue is exactly that: so a
+ * submit that finds no slot now DRAINS THE OLDEST JOB ITSELF (bounded by the
+ * pipeline timeout) and only then enqueues its own.  There is no second copy of
+ * the wait/upload/release sequence: both callers run this function.
+ *
+ * Filter: texture == NULL matches every job of the current generation (capacity
+ * drain); otherwise jobs targeting (texture, subresource), or the whole texture
+ * when `whole`.  Oldest seq first.  Idempotent: S_OK + *drained == FALSE when
+ * nothing matches, so a caller may call it before every read.
+ *
+ * Locking: pipe->lock is held only to scan, to mark UPLOADING and to retire.  The
+ * 3.1 MB upload and every wait happen with the lock RELEASED:
+ *   - the worker never waits for a consumer while holding the lock, and
+ *   - this consumer never waits for the worker while holding it,
+ * so no "hold the lock and wait for the other side" cycle can form.  (Round 23's
+ * hang was the other shape of that rule: the worker broke out of its
+ * capture-buffer gate with the lock still held; see pipeline_worker's guard.)
+ *
+ * Slot accounting -- the invariant the task asks to prove, per selected job:
+ *   READY            -> UPLOADING -> upload -> retire (FREE, jobs_in_flight--,
+ *                       slot_free + ready + wake set).  Also on upload failure:
+ *                       a picture that cannot be written must not pin a slot.
+ *   FAILED / DROPPED -> retire (FREE).  DROPPED (err=1450 AU) is not an error.
+ *   timeout, job still QUEUED -> mark FAILED, retire (FREE).
+ *   timeout, worker inside SENDING/FETCHING -> the ioctl may still write that
+ *       slot, so it cannot be freed here; mark the pipeline BROKEN (after this no
+ *       submit waits for a slot) and return VIRTIO_WDDM_E_PIPELINE_TIMEOUT.
+ *   Any other exit is "nothing matched" (no slot owned).
+ */
+static HRESULT pipeline_drain_one(VIRTIO_WDDM_VideoDecoder *object,
+                                  ID3D11Resource *texture, UINT subresource,
+                                  BOOL whole, LONGLONG t_start, LONGLONG deadline,
+                                  BOOL *drained, BOOL nonblocking) {
+    VIRTIO_WDDM_DecodePipeline *pipe = object ? decoder_ctx_access(object) : NULL;
+    HRESULT hr = S_OK;
+    BOOL did = FALSE;
+
+    if (drained)
+        *drained = FALSE;
+    if (!pipe) return S_OK;
+    for (;;) {
+        VIRTIO_WDDM_PipelineJob done; /* copy of the job being uploaded */
+        VIRTIO_WDDM_PipelineJob *job = NULL;
+        UINT64 wait_seq = 0;
+        MT_JOB selected_identity={0};
+        BOOL do_upload = FALSE;
+        BOOL do_fail = FALSE;
+        BOOL dropped_au = FALSE;
+        UINT i;
+
+        memset(&done, 0, sizeof(done));
+        if (nonblocking) {
+            if (!TryEnterCriticalSection(&pipe->lock)) break;
+        } else EnterCriticalSection(&pipe->lock);
+        if (texture && !pipeline_is_target_locked(pipe,texture)) {
+            LeaveCriticalSection(&pipe->lock);
+            return S_OK; /* unrelated resource, no read authorization */
+        }
+        if (pipe->broken || pipeline_admission_terminal(object)) {
+            LeaveCriticalSection(&pipe->lock);
+            return E_FAIL; /* NULL texture is capacity work, not a read commit */
+        }
+        if (InterlockedCompareExchange(&pipe->flushing,0,0)) {
+            LeaveCriticalSection(&pipe->lock);
+            return DXGI_ERROR_WAS_STILL_DRAWING;
+        }
+        if (pipe->stop) {
+            LeaveCriticalSection(&pipe->lock);
+            break;
+        }
+        for (i = 0; i < pipe->job_count; i++) {
+            VIRTIO_WDDM_PipelineJob *cand = &pipe->jobs[i];
+            if (cand->state == VIRTIO_WDDM_JOB_FREE)
+                continue;
+            if (cand->generation != pipe->generation)
+                continue; /* quiesce released it; not ours any more */
+            if (texture && cand->texture != texture)
+                continue;
+            if (texture && !whole && cand->subresource != subresource)
+                continue;
+            /* §7 P3 (round 27): the non-blocking (AV1 capacity) form only ever
+             * takes a job it can finish right now -- a picture to upload or a job
+             * to retire.  A job whose picture is still inside the host is simply
+             * left for a later drain; this is the "skip it and keep enqueueing"
+             * rule, expressed in the one shared drain. */
+            if (nonblocking && cand->state != VIRTIO_WDDM_JOB_READY &&
+                cand->state != VIRTIO_WDDM_JOB_FAILED &&
+                cand->state != VIRTIO_WDDM_JOB_DROPPED)
+                continue;
+            if (!job || cand->seq < job->seq)
+                job = cand;
+        }
+        if (!job) {
+            LeaveCriticalSection(&pipe->lock);
+            break; /* nothing pending: idempotent no-op */
+        }
+        selected_identity=job->identity;
+        if (job->state == VIRTIO_WDDM_JOB_READY) {
+            if(!read_upload_pin_locked(pipe,job)) {
+                job->state=VIRTIO_WDDM_JOB_FAILED; job->error=ERROR_INVALID_STATE;
+                job->failure="upload denied: stale/failed target lease";
+                LeaveCriticalSection(&pipe->lock); continue;
+            }
+            if (!ma_authorize(&pipe->admission_terminal)) {
+                /* Pin has been acquired but no upload authorized. The normal
+                 * failed retirement below consumes the pin exactly once. */
+                read_update_locked(pipe,job,3,E_FAIL);
+                pipeline_retire_locked(pipe,job,FALSE);
+                LeaveCriticalSection(&pipe->lock);
+                hr=E_FAIL; did=TRUE; break;
+            }
+            job->state = VIRTIO_WDDM_JOB_UPLOADING;
+            done = *job;
+            do_upload = TRUE;
+        } else if (job->state == VIRTIO_WDDM_JOB_FAILED ||
+                   job->state == VIRTIO_WDDM_JOB_DROPPED) {
+            dropped_au = job->state == VIRTIO_WDDM_JOB_DROPPED ? TRUE : FALSE;
+            done = *job;
+            do_fail = TRUE;
+        } else {
+            wait_seq = job->seq;
+        }
+        /* QUEUED / SENDING / FETCHING / UPLOADING: wait outside the lock. */
+        LeaveCriticalSection(&pipe->lock);
+
+        if (do_fail) {
+            ERROR("%s: job %llu (%s, err=%u) could not deliver %p subresource %u -> %s",
+                  __FUNCTION__, (unsigned long long)done.seq,
+                  done.failure ? done.failure : "no frame", done.error, (void *)texture,
+                  done.subresource, dropped_au ? "picture dropped, session kept"
+                                              : "E_FAIL for this read");
+            EnterCriticalSection(&pipe->lock);
+            if(pipe->tag_mode && (!mt_same(&selected_identity,&job->identity) ||
+               job->generation!=pipe->generation || job->state==VIRTIO_WDDM_JOB_FREE)) {
+                LeaveCriticalSection(&pipe->lock); continue;
+            }
+            pipe->drain_selected++;
+            if (job->state == VIRTIO_WDDM_JOB_FAILED ||
+                job->state == VIRTIO_WDDM_JOB_DROPPED) {
+                pipeline_retire_locked(pipe, job, FALSE);
+                pipe->drain_retired++;
+            }
+            LeaveCriticalSection(&pipe->lock);
+            did = TRUE;
+            if (!dropped_au)
+                hr = E_FAIL;
+            break;
+        }
+
+        if (do_upload) {
+            LONGLONG start = done.send_qpc;
+            double upload_ms = 0.0;
+            double waited;
+
+            hr = pipeline_upload_picture(pipe->life_mode ? pipe->object : object, &done, &upload_ms);
+            waited = decoder_qpc_ms(t_start, decoder_qpc_now());
+            EnterCriticalSection(&pipe->lock);
+            if (!ma_complete(&pipe->admission_terminal) ||
+                pipeline_admission_terminal(object)) hr=E_FAIL;
+            pipe->drain_selected++;
+            /* Retire even on failure: the ticket is spent, the job's capture
+             * buffer must go back, and the next read must not retry a picture
+             * that cannot be written. */
+            {
+                VIRTIO_WDDM_PipelineJob *live = NULL;
+                for (i = 0; i < pipe->job_count; i++) {
+                    if (pipe->jobs[i].seq == done.seq && pipe->jobs[i].state != VIRTIO_WDDM_JOB_FREE &&
+                        (!pipe->tag_mode || (mt_same(&done.identity,&pipe->jobs[i].identity) &&
+                         pipe->jobs[i].generation==pipe->generation))) {
+                        live = &pipe->jobs[i];
+                        break;
+                    }
+                }
+                if (live && live->state == VIRTIO_WDDM_JOB_UPLOADING) {
+                    if (SUCCEEDED(hr)) {
+                        object->frames++;
+                        object->direct_frames += live->mapped ? 1u : 0u;
+                        pipe->drained_mapped += live->mapped ? 1u : 0u;
+                        pipe->drained_staged += live->mapped ? 0u : 1u;
+                        pipe->upload_sum += upload_ms;
+                        if (upload_ms > pipe->upload_max)
+                            pipe->upload_max = upload_ms;
+                        {
+                            double lead = live->ready_qpc
+                                              ? decoder_qpc_ms(live->ready_qpc, decoder_qpc_now())
+                                              : -1.0;
+                            double queue = live->ready_qpc
+                                               ? decoder_qpc_ms(live->submit_qpc, live->ready_qpc)
+                                               : -1.0;
+                            if (queue > 0.0) {
+                                pipe->queue_sum += queue;
+                                if (queue > pipe->queue_max)
+                                    pipe->queue_max = queue;
+                            }
+                            if (lead > 0.0) {
+                                pipe->lead_sum += lead;
+                                if (lead > pipe->lead_max)
+                                    pipe->lead_max = lead;
+                            }
+                            pipe->logged++;
+                            if (pipe->logged <= 8u || (live->seq % 120u) == 0u) {
+                                INFO("%s: job %llu %s: au=%u B send=%.2f fetch=%.2f "
+                                     "queue=%.2f lead=%.2f -> subresource %u (tex=%p) "
+                                     "upload=%.2f sync_wait=%.2f ms (gen %llu)",
+                                     __FUNCTION__, (unsigned long long)live->seq,
+                                     live->mapped ? "pool" : "staged", live->au_size,
+                                     live->send_ms, live->fetch_ms, queue, lead,
+                                     live->subresource, (void *)live->texture, upload_ms,
+                                     waited, (unsigned long long)live->generation);
+                            }
+                            /* The per-frame lines the test harness parses.  They keep
+                             * the EXACT shape the serial path prints (same regexes,
+                             * same QPC space), so this round's numbers are directly
+                             * comparable with 04-测试记录/22: `frame N t=.. -> tex=..`
+                             * for the decode timeline, `budget:` for the split, and
+                             * `pipeline:` for the queue depth.  The only change is
+                             * that they are printed by the CONSUMER when it uploads,
+                             * which is why `t=` is the job's send QPC. */
+                            INFO("%s: frame %llu t=%lld -> tex=%p subresource=%u "
+                                 "(mip %u slice %u of %u x %u mips) (P2-2J diag v2)",
+                                 __FUNCTION__, (unsigned long long)object->frames,
+                                 (long long)live->send_qpc, (void *)live->texture,
+                                 live->subresource, live->mip_slice,
+                                 live->first_array_slice, live->array_size, live->mips);
+                            INFO("%s: frame %llu budget: send=%.2f host_wait=%.2f "
+                                 "copy=%.2f up=%.2f (sum %.2f ms, polls=0), au=%u B "
+                                 "subresource=%u, direct=%llu maps=%llu releases=%llu "
+                                 "%s (mapped=%u B)", __FUNCTION__,
+                                 (unsigned long long)object->frames, live->send_ms,
+                                 live->fetch_ms, -1.0, upload_ms,
+                                 live->send_ms + live->fetch_ms + upload_ms, live->au_size,
+                                 live->subresource,
+                                 (unsigned long long)object->direct_frames,
+                                 (unsigned long long)object->direct_maps,
+                                 (unsigned long long)object->direct_releases,
+                                 live->mapped ? "pool/staged (pipeline job)" : "staging",
+                                 live->map.MappedLength);
+                            INFO("%s: frame %llu pipeline: send=%.2f fetch=%.2f "
+                                 "queue=%.2f lead=%.2f sync_wait=%.2f ms, %u job(s) in "
+                                 "flight, gen %llu", __FUNCTION__,
+                                 (unsigned long long)object->frames, live->send_ms,
+                                 live->fetch_ms, queue, lead, waited,
+                                 (unsigned)pipe->jobs_in_flight,
+                                 (unsigned long long)pipe->generation);
+                        }
+                        if (start)
+                            object->last_send_qpc = start;
+                    }
+                    read_update_locked(pipe,live,3,hr);
+                    pipeline_retire_locked(pipe, live, SUCCEEDED(hr) ? TRUE : FALSE);
+                    pipe->drain_retired++;
+                }
+            }
+            LeaveCriticalSection(&pipe->lock);
+            did = TRUE;
+            break; /* one picture per call; the caller loops for the next */
+        }
+
+        /* Still in flight: wait for the worker's next state change.  Bounded by
+         * the caller's deadline, so a wedged host fails the job instead of the
+         * DDI/render thread. */
+        {
+            UINT left = pipeline_left_ms(deadline);
+
+            if (nonblocking) {
+                /* §7 P3 (round 27): the AV1 capacity form never waits.  The
+                 * selection above already skipped every job that is not finishable,
+                 * so arriving here means "nothing to do right now" -- the submit
+                 * will enqueue above its cap instead of sleeping for a picture. */
+                LeaveCriticalSection(&pipe->lock);
+                break;
+            }
+            if (left == 0) {
+                UINT state;
+
+                EnterCriticalSection(&pipe->lock);
+                if(pipe->tag_mode && (!mt_same(&selected_identity,&job->identity) ||
+                   job->generation!=pipe->generation || job->state==VIRTIO_WDDM_JOB_FREE)) {
+                    LeaveCriticalSection(&pipe->lock); continue;
+                }
+                pipe->drain_timeouts++;
+                state = job->state;
+                if (job->state == VIRTIO_WDDM_JOB_SENT) {
+                    /* §7 P3 (round 27): the AV1 picture is still inside the host's
+                     * output queue.  Failing the job here would retire a SENT job
+                     * whose picture the host is GOING to produce, and the next fetch
+                     * would hand that picture to the following job -- a permanent
+                     * one-frame misalignment (wrong pixels in every later
+                     * subresource).  So the READ fails (it cannot wait any longer)
+                     * but the job stays SENT and keeps its place in the host output
+                     * order; the worker collects it and a later read gets it. */
+                    pipe->av1_drain_keeps++;
+                    LeaveCriticalSection(&pipe->lock);
+                    ERROR("%s: job %llu is still waiting for its host picture after "
+                          "%u ms -> this read fails with 0x%08lx, the job keeps its "
+                          "place (state SENT, no retire: retiring it would shift every "
+                          "later picture by one)", __FUNCTION__,
+                          (unsigned long long)wait_seq, pipe->timeout_ms,
+                          (unsigned long)VIRTIO_WDDM_E_PIPELINE_TIMEOUT);
+                    hr = VIRTIO_WDDM_E_PIPELINE_TIMEOUT;
+                    break;
+                }
+                if (job->state == VIRTIO_WDDM_JOB_QUEUED &&
+                    object->codec == VIRTIO_WDDM_CODEC_AV1) {
+                    pipeline_fail_admission(object);
+                    LeaveCriticalSection(&pipe->lock);
+                    hr = VIRTIO_WDDM_E_PIPELINE_TIMEOUT;
+                    break; /* preserve unsent AU for teardown, never retire */
+                }
+                if (job->state == VIRTIO_WDDM_JOB_QUEUED) {
+                    /* The worker never picked it up: nobody else can be touching
+                     * the slot, so it is safe to fail and free it here. */
+                    job->failure = "drain timeout: the worker never picked this job up";
+                    job->error = ERROR_TIMEOUT;
+                    job->state = VIRTIO_WDDM_JOB_FAILED;
+                    pipeline_retire_locked(pipe, job, FALSE);
+                    pipe->drain_retired++;
+                    did = TRUE;
+                } else if (job->state != VIRTIO_WDDM_JOB_READY &&
+                           job->state != VIRTIO_WDDM_JOB_FAILED &&
+                           job->state != VIRTIO_WDDM_JOB_DROPPED) {
+                    /* The worker is inside an ioctl for this job, so its slot cannot
+                     * be freed here.  The read fails (this is the only thing the
+                     * caller can do), but the PIPELINE IS NOT MARKED BROKEN any more
+                     * (§7 P3, round 27): breaking it makes every later submit fail,
+                     * i.e. the whole decoder stops because one read was early.  The
+                     * job stay where it is and the worker finishes it; a later read
+                     * gets the picture. */
+                    pipe->av1_drain_keeps_worker++;
+                }
+                LeaveCriticalSection(&pipe->lock);
+                ERROR("%s: job %llu did not reach READY within the drain budget "
+                      "(state=%u, %u ms allowed) -> 0x%08lx (this read fails; the job "
+                      "and the pipeline are kept)", __FUNCTION__,
+                      (unsigned long long)wait_seq, state, pipe->timeout_ms,
+                      (unsigned long)VIRTIO_WDDM_E_PIPELINE_TIMEOUT);
+                hr = VIRTIO_WDDM_E_PIPELINE_TIMEOUT;
+                break;
+            }
+            WaitForSingleObject(pipe->ready, left > 20 ? 20 : left);
+            did = TRUE; /* a job was pending; the caller re-scans after we return */
+        }
+    }
+    if (drained)
+        *drained = did;
+    if (FAILED(hr) && object->codec == VIRTIO_WDDM_CODEC_AV1)
+        pipeline_fail_admission(object);
+    return hr;
+}
+
+/* §5.4 read path: wait (event, bounded) for every pending job that targets this
+ * (texture, subresource), oldest first, upload each picture and retire the job.
+ * This is now a thin loop over pipeline_drain_one() -- the SAME function the
+ * capacity path in pipeline_submit() runs -- plus the neutral-fill rule for a
+ * subresource this generation never received a picture in.
+ *
+ * Idempotent: with nothing pending it returns S_OK immediately, so a caller may
+ * sync before every read.  Returns E_FAIL / VIRTIO_WDDM_E_PIPELINE_TIMEOUT when
+ * a job failed or timed out (the read must not believe stale pixels are the new
+ * frame). */
+
+static HRESULT pipeline_strict_read(VIRTIO_WDDM_VideoDecoder *o,ID3D11Resource *texture,
+                                    UINT sub,BOOL whole,BOOL nowait) {
+    VIRTIO_WDDM_DecodePipeline *p=decoder_ctx_access(o);
+    UINT i;
+    BOOL matched=FALSE;
+    if (!p || !texture) return S_OK;
+    for(i=0;i<READ_TARGET_MAX;++i) {
+        uint64_t version=0;
+        for(;;) {
+            READ_TARGET q;
+            BOOL drained=FALSE;
+            HRESULT hr;
+            LONGLONG now=decoder_qpc_now();
+            EnterCriticalSection(&p->lock);
+            AcquireSRWLockShared(&g_read_lock); q=g_read_targets[i]; ReleaseSRWLockShared(&g_read_lock);
+            if(q.pipe!=p || q.texture!=texture || (!whole && q.subresource!=sub)) {
+                LeaveCriticalSection(&p->lock); break;
+            }
+            matched=TRUE;
+            if (pipeline_admission_terminal(o) || p->broken) {
+                LeaveCriticalSection(&p->lock); return E_FAIL;
+            }
+            if(p->life_mode && InterlockedCompareExchange(&p->detached,0,0)) {
+                LeaveCriticalSection(&p->lock); return E_ABORT;
+            }
+            if(InterlockedCompareExchange(&p->flushing,0,0)) {
+                LeaveCriticalSection(&p->lock); return DXGI_ERROR_WAS_STILL_DRAWING;
+            }
+            if(!version) version=q.media.version;
+            if(version!=q.media.version) { LeaveCriticalSection(&p->lock); return E_ABORT; }
+            if(p->broken || q.media.owner.generation!=p->generation) {
+                AcquireSRWLockExclusive(&g_read_lock); mr_fail(&g_read_targets[i].media,E_FAIL);
+                q=g_read_targets[i]; ReleaseSRWLockExclusive(&g_read_lock);
+            }
+            if(q.media.state==MR_FAILED) { LeaveCriticalSection(&p->lock); return q.media.failure; }
+            if(q.media.state==MR_QUEUED) { LeaveCriticalSection(&p->lock); break; }
+            /* Publish job terminal errors before retirement, not after slot reuse. */
+            {
+                UINT k;
+                for(k=0;k<p->job_count;++k) {
+                    VIRTIO_WDDM_PipelineJob *j=&p->jobs[k];
+                    if(j->read_ticket==i+1 && j->read_version==version &&
+                       (j->state==VIRTIO_WDDM_JOB_FAILED || j->state==VIRTIO_WDDM_JOB_DROPPED))
+                        read_update_locked(p,j,2,E_FAIL);
+                }
+            }
+            if(now>=q.deadline) {
+                AcquireSRWLockExclusive(&g_read_lock);
+                mr_fail(&g_read_targets[i].media,VIRTIO_WDDM_E_PIPELINE_TIMEOUT);
+                ReleaseSRWLockExclusive(&g_read_lock);
+                ERROR("strict read deadline seq=%llu gen=%llu tag=%llu lease=%llu; lookahead may need more AU",
+                      (unsigned long long)q.media.owner.seq,(unsigned long long)q.media.owner.generation,
+                      (unsigned long long)q.media.owner.tag,(unsigned long long)version);
+                LeaveCriticalSection(&p->lock); return VIRTIO_WDDM_E_PIPELINE_TIMEOUT;
+            }
+            LeaveCriticalSection(&p->lock);
+            SetEvent(p->tag_wake);
+            if(nowait) return DXGI_ERROR_WAS_STILL_DRAWING;
+            hr=pipeline_drain_one(o,texture,q.subresource,FALSE,now,q.deadline,&drained,TRUE);
+            if(hr==DXGI_ERROR_WAS_STILL_DRAWING) return hr; /* flush gate is transient, not a sticky media failure */
+            if(FAILED(hr)) {
+                EnterCriticalSection(&p->lock);
+                AcquireSRWLockExclusive(&g_read_lock);
+                if(g_read_targets[i].media.version==version) mr_fail(&g_read_targets[i].media,hr);
+                ReleaseSRWLockExclusive(&g_read_lock); LeaveCriticalSection(&p->lock);
+                return hr;
+            }
+            if(!drained) WaitForSingleObject(p->ready,20);
+        }
+    }
+    return matched ? pipeline_commit_read(o) : S_OK;
+}
+static HRESULT pipeline_sync(VIRTIO_WDDM_VideoDecoder *object, ID3D11Resource *texture,
+                             UINT subresource, BOOL whole) {
+    VIRTIO_WDDM_DecodePipeline *pipe = object ? decoder_ctx_access(object) : NULL;
+    LONGLONG t_wait0;
+    LONGLONG deadline;
+
+    if (!pipe || !texture) return S_OK;
+    if(pipe->strict_read) return pipeline_strict_read(object,texture,subresource,whole,FALSE);
+    t_wait0 = decoder_qpc_now();
+    deadline = t_wait0 + (LONGLONG)(pipe->timeout_ms + 250u) * decoder_qpc_freq() / 1000;
+    if (pipe->trace) {
+        /* §5.4b trace: EVERY hook call, before the target filter.  A run that
+         * stops here without a following "sync #" proves the application read
+         * something else (or never read at all); one that stops before this line
+         * proves the render thread did not even get to a resource read. */
+        static volatile LONG trace_logs;
+        LONG n = InterlockedIncrement(&trace_logs);
+
+        if (n <= 200)
+            INFO("%s: hook #%ld tex=%p subresource=%u whole=%d t=%lld", __FUNCTION__,
+                 n, texture, subresource, (int)whole, (long long)t_wait0);
+    }
+    /* Cheap rejection first: the hook sees every resource the application reads,
+     * and a read of a texture this decoder never decoded into cannot need a
+     * wait (nor the fill).  This is what keeps the cost of the hook on ordinary
+     * Map/Copy traffic to one small array scan. */
+    {
+        LONGLONG lock0 = decoder_qpc_now();
+
+        EnterCriticalSection(&pipe->lock);
+        if (decoder_qpc_ms(lock0, decoder_qpc_now()) > 50.0)
+            ERROR("%s: waited %.0f ms for pipe->lock before the target check "
+                  "(tex=%p) -- the consumer was blocked on the pipeline lock",
+                  __FUNCTION__, decoder_qpc_ms(lock0, decoder_qpc_now()), texture);
+    }
+    if (!texture || !pipeline_is_target_locked(pipe, texture)) {
+        LeaveCriticalSection(&pipe->lock);
+        return S_OK; /* unrelated resource: no decoder read authorization */
+    }
+    if (pipe->broken || pipeline_admission_terminal(object)) {
+        LeaveCriticalSection(&pipe->lock);
+        return E_FAIL;
+    }
     LeaveCriticalSection(&pipe->lock);
+    {
+        /* §5.4 trace: the first few consumer reads of a decode surface.  If the
+         * guest log stops before one of these, the application never asked for
+         * the picture (its renderer is waiting for something else); if it stops
+         * inside one, the wait below is where it went. */
+        static volatile LONG sync_logs;
+        LONG n = InterlockedIncrement(&sync_logs);
+
+        if (n <= 8)
+            INFO("%s: sync #%ld tex=%p subresource=%u whole=%d t=%lld", __FUNCTION__,
+                 n, texture, subresource, (int)whole, (long long)decoder_qpc_now());
+    }
+    for (;;) {
+        BOOL drained = FALSE;
+        BOOL do_fill = FALSE;
+        HRESULT hr;
+
+        /* §7 P3 (round 27): an AV1 read never waits for a picture.  The host keeps
+         * ~18 coded pictures inside itself, so early in a stream (and after a seek)
+         * the surface the renderer asks for simply has no picture yet; waiting for
+         * it just stalls the renderer on a decode that is already in flight.  The
+         * one shared drain is still what does the work -- it uploads whatever is
+         * READY for this subresource and returns immediately otherwise.  The read
+         * then proceeds with the surface's current content (the "skip this frame
+         * and keep enqueueing" rule of the task book).  H.264/HEVC keep the bounded
+         * wait: there the picture is always just one frame behind the read. */
+        hr = pipeline_drain_one(object, texture, subresource, whole, t_wait0, deadline,
+                                &drained, pipe->av1_async ? TRUE : FALSE);
+        if (FAILED(hr)) {
+            pipe->sync_wait_timeouts++;
+            return hr;
+        }
+        if (drained)
+            continue; /* a picture was retired; an older one may still be pending */
+        /* Nothing pending.  A subresource this generation has never seen a
+         * picture in is read as uninitialised memory; write the neutral picture
+         * once instead (and remember it, so the next read is a no-op again). */
+        EnterCriticalSection(&pipe->lock);
+        if (!whole && texture &&
+            object->desc.OutputFormat != DXGI_FORMAT_P010 &&
+            !pipeline_uploaded_before_locked(pipe, texture, subresource)) {
+            pipeline_note_uploaded_locked(pipe, texture, subresource);
+            pipe->fills++;
+            do_fill = TRUE;
+        }
+        LeaveCriticalSection(&pipe->lock);
+        if (!do_fill)
+            break;
+        hr = pipeline_upload_fill(object, texture, subresource);
+        if (FAILED(hr)) {
+            /* uploaded[] was reserved before the physical fill. A failed fill
+             * must never turn its next read into a successful no-op. */
+            pipeline_fail_admission(object);
+            return hr;
+        }
+    }
+    return pipeline_commit_read(object);
+}
+
+/* §5.4: the global entry point every "read this texture" path calls (through
+ * Triton's texture-sync hook, or directly from VideoProcessorBlt where an
+ * HRESULT can be propagated).  A D3D11 texture has no back-pointer to the video
+ * decoder that decodes into it, so every live decoder is asked in turn; each one
+ * answers immediately when the texture is not one of its output views.
+ *
+ * The registry lock is held across the sync: it serialises a consumer against a
+ * decoder being destroyed (DestroyVideoDecoder unlinks under the same lock
+ * before the pipeline -- and the object -- go away). */
+
+/* LIFE prototype. Admission reserves one of 16 slots for the entire lifetime,
+ * including asynchronous close. Thus 16 hung sessions cannot grow without bound.
+ * The cleanup reference exists before either VM worker is started; no last-DDI
+ * release can run COM Release, RELEASE_FRAME or CLOSE synchronously. */
+#define LIFE_MAX 16u
+static SRWLOCK g_life_lock = SRWLOCK_INIT;
+static VIRTIO_WDDM_DecodePipeline *g_life[LIFE_MAX];
+static volatile LONG g_life_admitted;
+static void life_ref(VIRTIO_WDDM_DecodePipeline *p) { InterlockedIncrement(&p->life_refs); }
+static void life_unref(VIRTIO_WDDM_DecodePipeline *p) {
+    SetEvent(p->refs_changed);
+    /* Final operation: cleanup may free p as soon as this RMW publishes 1.
+     * Cleanup uses a timed predicate recheck, avoiding the signal-before-drop
+     * lost-wakeup race without making DDI drop wait on a lock. */
+    InterlockedDecrement(&p->life_refs);
+}
+typedef struct LIFE_BOOT {
+    VIRTIO_WDDM_DecodePipeline *pipe;
+    LPTHREAD_START_ROUTINE run;
+    HMODULE module;
+} LIFE_BOOT;
+static DWORD WINAPI life_worker_boot(LPVOID arg) {
+    LIFE_BOOT *b=arg;
+    VIRTIO_WDDM_DecodePipeline *p=b->pipe;
+    LPTHREAD_START_ROUTINE run=b->run;
+    HMODULE module=b->module;
+    DWORD result;
+    HeapFree(GetProcessHeap(),0,b);
+    result=run(p);
+    life_unref(p);
+    FreeLibraryAndExitThread(module,result); /* atomic unload + exit, never return */
+}
+static HANDLE life_start(VIRTIO_WDDM_DecodePipeline *p, LPTHREAD_START_ROUTINE run, DWORD *id) {
+    LIFE_BOOT *b=HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,sizeof(*b));
+    HANDLE thread;
+    if(!b) return NULL;
+    if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        (LPCWSTR)(ULONG_PTR)&life_worker_boot,&b->module)) {
+        HeapFree(GetProcessHeap(),0,b); return NULL;
+    }
+    b->pipe=p; b->run=run;
+    life_ref(p);
+    thread=CreateThread(NULL,0,life_worker_boot,b,0,id);
+    if(!thread) {
+        HMODULE module=b->module;
+        life_unref(p); HeapFree(GetProcessHeap(),0,b);
+        /* No worker was started; caller's DDI module reference is still live. */
+        FreeLibrary(module);
+    }
+    return thread;
+}
+static BOOL life_registry_add(VIRTIO_WDDM_DecodePipeline *p) {
+    UINT i; BOOL ok=FALSE;
+    AcquireSRWLockExclusive(&g_life_lock);
+    for(i=0;i<LIFE_MAX;++i) if(!g_life[i]) { g_life[i]=p; ok=TRUE; break; }
+    ReleaseSRWLockExclusive(&g_life_lock);
+    return ok;
+}
+static HRESULT life_registry_read(void *texture,UINT sub,BOOL whole,BOOL nowait) {
+    VIRTIO_WDDM_DecodePipeline *pins[LIFE_MAX];
+    UINT n=0,i; HRESULT hr=S_OK;
+    AcquireSRWLockShared(&g_life_lock);
+    for(i=0;i<LIFE_MAX;++i) if(g_life[i] && !InterlockedCompareExchange(&g_life[i]->detached,0,0)) {
+        life_ref(g_life[i]); pins[n++]=g_life[i];
+    }
+    ReleaseSRWLockShared(&g_life_lock);
+    for(i=0;i<n;++i) {
+        VIRTIO_WDDM_DecodePipeline *p=pins[i];
+        BOOL entered=FALSE, matching=FALSE;
+        if(SUCCEEDED(hr)) {
+            EnterCriticalSection(&p->lock);
+            if(texture && p->strict_read) {
+                UINT target;
+                AcquireSRWLockShared(&g_read_lock);
+                for(target=0;target<READ_TARGET_MAX;++target) {
+                    READ_TARGET *q=&g_read_targets[target];
+                    if(q->pipe==p && q->texture==(ID3D11Resource *)texture &&
+                       (whole || q->subresource==sub)) { matching=TRUE; break; }
+                }
+                ReleaseSRWLockShared(&g_read_lock);
+            } else {
+                matching=texture && pipeline_is_target_locked(p,(ID3D11Resource *)texture);
+            }
+            if(matching) {
+                if(InterlockedCompareExchange(&p->flushing,0,0))
+                    hr=DXGI_ERROR_WAS_STILL_DRAWING;
+                else if(InterlockedCompareExchange(&p->detached,0,0) || p->stop)
+                    hr=E_ABORT;
+                else { ++p->reader_active; entered=TRUE; }
+            }
+            LeaveCriticalSection(&p->lock);
+            if(entered) {
+                hr=p->strict_read
+                    ? pipeline_strict_read(p->object,texture,sub,whole,nowait)
+                    : pipeline_sync(p->object,(ID3D11Resource *)texture,sub,whole);
+                EnterCriticalSection(&p->lock);
+                --p->reader_active;
+                SetEvent(p->ready);
+                LeaveCriticalSection(&p->lock);
+            }
+        }
+        life_unref(p);
+    }
+    return hr;
+}
+static DWORD WINAPI life_cleanup(LPVOID arg) {
+    VIRTIO_WDDM_DecodePipeline *p=arg;
+    VM_SESSION *session;
+    UINT i;
+    /* The wrapper owns the sole cleanup reference. Workers/readers must finish
+     * before freeing any storage. Close may itself hang here, outside the DDI. */
+    while(!InterlockedCompareExchange(&p->detached,0,0))
+        WaitForSingleObject(p->refs_changed,100);
+    /* Remove BEFORE observing final ref: a reader holding the shared registry
+     * lock may have tested detached just before publication but not pinned yet. */
+    AcquireSRWLockExclusive(&g_life_lock);
+    for(i=0;i<LIFE_MAX;++i) if(g_life[i]==p) g_life[i]=NULL;
+    ReleaseSRWLockExclusive(&g_life_lock);
+    while(!ml_cleanup_ready(InterlockedCompareExchange(&p->life_refs,0,0),1))
+        WaitForSingleObject(p->refs_changed,100);
+    if(p->thread) WaitForSingleObject(p->thread,INFINITE);
+    if(p->collector) WaitForSingleObject(p->collector,INFINITE);
+    EnterCriticalSection(&p->lock);
+    for(i=0;i<p->job_count;++i) pipeline_job_release_locked(p,&p->jobs[i],"life cleanup");
+    LeaveCriticalSection(&p->lock);
+    if(p->unresolved_map) {
+        InterlockedExchange(&p->quarantined,1);
+        ERROR("LIFE unresolved RELEASE ownership retained; permanent quarantine");
+        for(;;) WaitForSingleObject(p->refs_changed,INFINITE);
+    }
+    /* read_forget converts entries to error tombstones, and releases only after
+     * all active read invocations finished. Map tickets independently own COM. */
+    read_forget(p,TRUE);
+    if(p->upload_context) p->upload_context->lpVtbl->Release(p->upload_context);
+    if(p->thread) CloseHandle(p->thread);
+    if(p->collector) CloseHandle(p->collector);
+    for(i=0;i<p->job_count;++i) {
+        if(p->jobs[i].au) HeapFree(GetProcessHeap(),0,p->jobs[i].au);
+        if(p->jobs[i].slot) HeapFree(GetProcessHeap(),0,p->jobs[i].slot);
+    }
+    if(p->jobs) HeapFree(GetProcessHeap(),0,p->jobs);
+    if(p->fill) HeapFree(GetProcessHeap(),0,p->fill);
+    CloseHandle(p->wake); CloseHandle(p->ready); CloseHandle(p->tag_wake);
+    CloseHandle(p->slot_free);
+    session=life_owner_session(p); /* final owner read AFTER refs/jobs/leases quiesce */
+    p->owned_session=NULL;
+    vm_close(session);
+    DeleteCriticalSection(&p->lock);
+    /* life_worker_boot must not dereference a freed ctx after run returns.
+     * Cleanup instead uses its own special module trampoline below. */
+    return 0;
+}
+static DWORD WINAPI life_cleanup_boot(LPVOID arg) {
+    LIFE_BOOT *b=arg;
+    VIRTIO_WDDM_DecodePipeline *p=b->pipe;
+    HMODULE module=b->module;
+    VIRTIO_WDDM_VideoDecoder *snapshot=p->object;
+    HeapFree(GetProcessHeap(),0,b);
+    life_cleanup(p);
+    CloseHandle(p->refs_changed);
+    HeapFree(GetProcessHeap(),0,snapshot);
+    HeapFree(GetProcessHeap(),0,p);
+    InterlockedDecrement(&g_life_admitted);
+    FreeLibraryAndExitThread(module,0);
+}
+static BOOL life_prepare(VIRTIO_WDDM_DecodePipeline *p,VIRTIO_WDDM_VideoDecoder *runtime) {
+    VIRTIO_WDDM_VideoDecoder *q;
+    LIFE_BOOT *b;
+    HANDLE cleanup;
+    if(!ml_admission_allowed(InterlockedIncrement(&g_life_admitted),LIFE_MAX)) {
+        InterlockedDecrement(&g_life_admitted); return FALSE;
+    }
+    q=HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,sizeof(*q));
+    b=HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,sizeof(*b));
+    p->refs_changed=CreateEventW(NULL,FALSE,FALSE,NULL);
+    if(!q || !b || !p->refs_changed) goto fail;
+    /* Whitelist: never memcpy a runtime decoder/device or builder. */
+    q->session_id=runtime->session_id; /* no owning alias in snapshot */
+    q->life_requested=TRUE; q->life_snapshot=TRUE;
+    q->media_token=runtime->media_token; q->driver_version=runtime->driver_version;
+    q->codec=runtime->codec; q->desc=runtime->desc;
+    q->direct_ok=runtime->direct_ok; q->capture_count=runtime->capture_count;
+    q->pipeline=p;
+    p->object=q; p->life_mode=TRUE; p->life_refs=2; /* owner + cleanup */
+    p->upload_context=runtime->device->base.pCtx1;
+    p->upload_context->lpVtbl->AddRef(p->upload_context);
+    if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        (LPCWSTR)(ULONG_PTR)&life_cleanup_boot,&b->module)) goto fail;
+    b->pipe=p;
+    cleanup=CreateThread(NULL,0,life_cleanup_boot,b,0,NULL);
+    if(!cleanup) { FreeLibrary(b->module); goto fail; }
+    life_owner_transfer(p,runtime); /* infallible commit: cleanup alive, workers not started */
+    runtime->async_lifetime=TRUE; /* independent of explicit TAG_LIFE admission */
+    CloseHandle(cleanup); /* cleanup waits for detached; commit precedes publication */
+    return TRUE;
+fail:
+    if(p->upload_context) { p->upload_context->lpVtbl->Release(p->upload_context); p->upload_context=NULL; }
+    if(q) HeapFree(GetProcessHeap(),0,q);
+    if(b) HeapFree(GetProcessHeap(),0,b);
+    if(p->refs_changed) { CloseHandle(p->refs_changed); p->refs_changed=NULL; }
+    p->object=runtime; p->life_mode=FALSE;
+    InterlockedDecrement(&g_life_admitted);
+    return FALSE;
+}
+static BOOL pipeline_life_admitted(VIRTIO_WDDM_VideoDecoder *runtime) {
+    VIRTIO_WDDM_DecodePipeline *p = runtime ? runtime->pipeline : NULL;
+    return p && p->life_mode && !p->broken && p->started &&
+           p->thread && (!p->tag_mode || p->collector) &&
+           !InterlockedCompareExchange(&p->detached, 0, 0);
+}
+static BOOL pipeline_life_detach(VIRTIO_WDDM_VideoDecoder *runtime) {
+    VIRTIO_WDDM_DecodePipeline *p;
+    ULONGLONG deadline;
+    UINT i; DWORD left;
+    AcquireSRWLockExclusive(&g_runtime_ctx_lock);
+    p=runtime ? runtime->pipeline : NULL;
+    if(!p || !p->life_mode) {
+        ReleaseSRWLockExclusive(&g_runtime_ctx_lock); return FALSE;
+    }
+    InterlockedExchange(&p->detached,1);
+    runtime->pipeline=NULL; /* revoke publication before dropping owner */
+    ReleaseSRWLockExclusive(&g_runtime_ctx_lock);
+    deadline=GetTickCount64()+p->timeout_ms;
+    InterlockedExchange(&p->stop,1);
+    /* Atomic detach blocks new pins. Cleanup removes the registry entry;
+     * a preempted short-lock holder must not stall the DDI. */
+    SetEvent(p->wake); SetEvent(p->tag_wake); SetEvent(p->ready);
+    for(i=0;i<2;++i) {
+        HANDLE h=i ? p->collector : p->thread;
+        ULONGLONG now=GetTickCount64();
+        left=ml_remaining(now,deadline);
+        if(h && WaitForSingleObject(h,left)!=WAIT_OBJECT_0) {
+            InterlockedExchange(&p->quarantined,1);
+            /* Cancel is intentionally omitted: even cancellation is an optional
+             * OS call with no bounded-return contract. Workers retain ownership. */
+        }
+    }
+    /* runtime session ownership was already transferred before workers. */
+    life_unref(p); /* never releases COM/maps/session on this DDI */
     return TRUE;
 }
 
+static INIT_ONCE g_video_decoders_once = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION g_video_decoders_lock;
+static VIRTIO_WDDM_VideoDecoder *g_video_decoders;
+/* §5.4b diagnostic: VIRTIO_WDDM_PIPELINE_TRACE=1 (read by the decoder) also turns
+ * on the blit-entry trace, which lives on the video-processor path where there is
+ * no decoder object at hand.  It only gates log lines; nothing else reads it. */
+static volatile LONG g_pipeline_trace;
+
+static BOOL CALLBACK video_decoders_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once;
+    (void)param;
+    (void)ctx;
+    InitializeCriticalSection(&g_video_decoders_lock);
+    return TRUE;
+}
+
+static void decoder_register_live(VIRTIO_WDDM_VideoDecoder *object) {
+    if (!object)
+        return;
+    if(object->pipeline && object->pipeline->life_mode) {
+        if(!life_registry_add(object->pipeline)) object->pipeline->broken=TRUE;
+        return;
+    }
+    InitOnceExecuteOnce(&g_video_decoders_once, video_decoders_init, NULL, NULL);
+    EnterCriticalSection(&g_video_decoders_lock);
+    if (!object->live_linked) {
+        object->live_next = g_video_decoders;
+        g_video_decoders = object;
+        object->live_linked = TRUE;
+    }
+    LeaveCriticalSection(&g_video_decoders_lock);
+}
+
+static void decoder_unregister_live(VIRTIO_WDDM_VideoDecoder *object) {
+    VIRTIO_WDDM_VideoDecoder **link;
+
+    if (!object)
+        return;
+    InitOnceExecuteOnce(&g_video_decoders_once, video_decoders_init, NULL, NULL);
+    EnterCriticalSection(&g_video_decoders_lock);
+    for (link = &g_video_decoders; *link; link = &(*link)->live_next) {
+        if (*link == object) {
+            *link = object->live_next;
+            object->live_next = NULL;
+            object->live_linked = FALSE;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_video_decoders_lock);
+}
+
+static HRESULT decoder_texture_sync(void *texture, UINT subresource, BOOL whole) {
+    VIRTIO_WDDM_VideoDecoder *object;
+    HRESULT hr = S_OK;
+
+    if (!texture)
+        return S_OK;
+    hr=life_registry_read(texture,subresource,whole,FALSE);
+    if(FAILED(hr)) return hr;
+    InitOnceExecuteOnce(&g_video_decoders_once, video_decoders_init, NULL, NULL);
+    EnterCriticalSection(&g_video_decoders_lock);
+    for (object = g_video_decoders; object; object = object->live_next) {
+        if (!object->pipeline)
+            continue;
+        hr = pipeline_sync(object, (ID3D11Resource *)texture, subresource, whole);
+        if (FAILED(hr))
+            break;
+    }
+    LeaveCriticalSection(&g_video_decoders_lock);
+    return hr;
+}
+
+/* Triton's hook shape (void): a texture read through Map / CopyResource /
+ * CopySubresourceRegion / ResolveSubresource / an SRV read cannot fail the DDI
+ * call, so a failed sync is logged with the same wording the blit uses and the
+ * read proceeds (the picture may be missing, but no frame is invented). */
+static HRESULT decoder_texture_sync_hook(void *texture, UINT subresource, BOOL whole, UINT action, UINT64 *ticket) {
+    VIRTIO_WDDM_VideoDecoder *o;
+    HRESULT hr=S_OK;
+    if(action==TR_READ_FORGET) {
+        ID3D11Resource *release[READ_TARGET_MAX]; UINT n=0,i;
+        AcquireSRWLockExclusive(&g_read_lock);
+        for(i=0;i<READ_TARGET_MAX;++i) if(g_read_targets[i].texture==(ID3D11Resource *)texture) {
+            READ_TARGET *q=&g_read_targets[i];
+            q->destroy_requested=TRUE;
+            if(!q->pipe) { release[n++]=q->texture; memset(q,0,sizeof(*q)); }
+        }
+        ReleaseSRWLockExclusive(&g_read_lock);
+        for(i=0;i<n;++i) release[i]->lpVtbl->Release(release[i]);
+        return S_OK;
+    }
+    if(action==TR_READ_ADMIT || action==TR_READ_RELEASE) {
+        UINT i;
+        ID3D11Resource *ref=texture;
+        BOOL transfer=FALSE,removed=FALSE;
+        if(!ticket) return E_INVALIDARG;
+        if(action==TR_READ_ADMIT) ref->lpVtbl->AddRef(ref);
+        AcquireSRWLockExclusive(&g_read_lock);
+        if(action==TR_READ_ADMIT) {
+            *ticket=0;
+            for(i=0;i<READ_TARGET_MAX;++i) {
+                READ_TARGET *q=&g_read_targets[i];
+                if(q->texture!=ref || (!whole && q->subresource!=subresource)) continue;
+                if(q->pipe && ma_terminal(&q->pipe->admission_terminal)) {
+                    hr=E_FAIL; break;
+                }
+                if(q->pipe && InterlockedCompareExchange(&q->pipe->flushing,0,0)) {
+                    hr=DXGI_ERROR_WAS_STILL_DRAWING; break;
+                }
+                if(mr_read(&q->media)!=MR_ALLOW) {
+                    hr=q->media.state==MR_FAILED ? q->media.failure : DXGI_ERROR_WAS_STILL_DRAWING;
+                    break;
+                }
+            }
+            if(SUCCEEDED(hr)) {
+                /* Logical read admission commits against each decoder state.
+                 * g_read_lock serializes target/ctx removal. Physical
+                 * texture access may follow terminal if authorized earlier. */
+                for(i=0;i<READ_TARGET_MAX;++i) {
+                    READ_TARGET *q=&g_read_targets[i];
+                    if(q->texture!=ref || (!whole && q->subresource!=subresource) || !q->pipe) continue;
+                    if(!ma_authorize(&q->pipe->admission_terminal)) { hr=E_FAIL; break; }
+                    if(!ma_complete(&q->pipe->admission_terminal)) { hr=E_FAIL; break; }
+                }
+            }
+            if(SUCCEEDED(hr)) {
+                *ticket=mr_ticket_add(g_read_tickets,READ_TARGET_MAX,(uintptr_t)ref,&g_read_next_ticket);
+                if(!*ticket) hr=DXGI_ERROR_WAS_STILL_DRAWING;
+                else transfer=TRUE;
+            }
+        } else {
+            removed=mr_ticket_remove(g_read_tickets,READ_TARGET_MAX,(uintptr_t)ref,*ticket);
+            *ticket=0;
+        }
+        ReleaseSRWLockExclusive(&g_read_lock);
+        if((action==TR_READ_ADMIT && !transfer) || removed) ref->lpVtbl->Release(ref);
+        return hr;
+    }
+    AcquireSRWLockShared(&g_read_lock);
+    for(UINT i=0;i<READ_TARGET_MAX;++i) {
+        READ_TARGET *q=&g_read_targets[i];
+        if(q->texture==(ID3D11Resource *)texture && !q->pipe && (whole || q->subresource==subresource) &&
+           q->media.state!=MR_QUEUED) { hr=q->media.failure ? q->media.failure : E_ABORT; break; }
+    }
+    ReleaseSRWLockShared(&g_read_lock);
+    if(FAILED(hr)) return hr;
+    hr=life_registry_read(texture,subresource,whole,action==TR_READ_NOWAIT);
+    if(FAILED(hr)) return hr;
+    InitOnceExecuteOnce(&g_video_decoders_once,video_decoders_init,NULL,NULL);
+    EnterCriticalSection(&g_video_decoders_lock);
+    for(o=g_video_decoders;o;o=o->live_next) {
+        if(!o->pipeline) continue;
+        hr=o->pipeline->strict_read ? pipeline_strict_read(o,texture,subresource,whole,action==TR_READ_NOWAIT)
+                                    : pipeline_sync(o,texture,subresource,whole);
+        if(FAILED(hr)) break;
+    }
+    LeaveCriticalSection(&g_video_decoders_lock);
+    return hr;
+}
 /* Discard everything in flight and make sure no ioctl of the old sequence is
  * still running.  Called before vm_flush (seek / IDR / parameter change) and
  * from DestroyVideoDecoder.  Blocks until the worker is between stages, which
  * is bounded by the job timeout. */
+/* Explicit controlled maintenance entry. No AV1 seek detector calls this today.
+ * The owner-thread contract is enforced against Begin/Submit/End; runtime storage
+ * still requires the external Destroy serialization contract. No worker builder. */
+static BOOL decoder_life_flush(VIRTIO_WDDM_VideoDecoder *runtime, const char *reason) {
+    VIRTIO_WDDM_DecodePipeline *p=decoder_ctx_access(runtime);
+    RUNTIME_CTX_SCOPE scope;
+    BOOL local=FALSE, locked=FALSE, ok=FALSE;
+    ULONGLONG deadline;
+    VM_FLUSH_OUT out;
+    UINT i;
+    (void)reason;
+    if(!runtime) return FALSE;
+    if(runtime->driver_version<VMEDIA_FLUSH_MIN_DRIVER_VERSION) {
+        pipeline_fail_admission(runtime);
+        return FALSE;
+    }
+    if(!p) {
+        p=runtime_ctx_pin(runtime);
+        if(!p) return FALSE;
+        if(!life_runtime_enter(p)) { life_unref(p); return FALSE; }
+        runtime_scope_enter(&scope,runtime,p); local=TRUE;
+    }
+    if(ma_terminal(&p->admission_terminal)) goto done; /* flush cannot revive refused input */
+    if(!p->life_mode || InterlockedCompareExchange(&p->runtime_owner,0,0)!=(LONG)GetCurrentThreadId() ||
+       runtime->driver_version<VMEDIA_FLUSH_MIN_DRIVER_VERSION)
+        goto done;
+    if(InterlockedCompareExchange(&p->maintenance_owner,1,0)) goto done;
+    deadline=GetTickCount64()+p->timeout_ms;
+    InterlockedExchange(&p->flushing,1); /* no automatic submit can reopen this gate */
+    for(;;) {
+        BOOL busy=FALSE;
+        if(!TryEnterCriticalSection(&p->lock)) goto wait;
+        locked=TRUE;
+        p->tag_paused=TRUE;
+        if(InterlockedCompareExchange(&p->detached,0,0) || p->broken || p->unresolved_map ||
+           ma_terminal(&p->admission_terminal)) goto failed;
+        busy=p->tag_fetching || p->worker_active || p->reader_active;
+        for(i=0;i<p->job_count;++i)
+            if(p->jobs[i].in_ioctl || p->jobs[i].state==VIRTIO_WDDM_JOB_UPLOADING) busy=TRUE;
+        AcquireSRWLockShared(&g_read_lock);
+        for(i=0;i<READ_TARGET_MAX;++i)
+            if(g_read_targets[i].pipe==p && mr_resource_pinned(g_read_tickets,READ_TARGET_MAX,
+                (uintptr_t)g_read_targets[i].texture)) busy=TRUE;
+        ReleaseSRWLockShared(&g_read_lock);
+        if(!busy) break;
+        LeaveCriticalSection(&p->lock); locked=FALSE;
+wait:
+        if(GetTickCount64()>=deadline || InterlockedCompareExchange(&p->detached,0,0) ||
+           ma_terminal(&p->admission_terminal)) goto failed;
+        WaitForSingleObject(p->ready,ml_remaining(GetTickCount64(),deadline)>10 ? 10 :
+            ml_remaining(GetTickCount64(),deadline));
+    }
+    /* All old IO and uploads have left. RELEASE may itself block in the driver;
+     * this deadline is NOT a bound on synchronous WDF or the whole DDI. */
+    for(i=0;i<p->job_count;++i) {
+        if(GetTickCount64()>=deadline || ma_terminal(&p->admission_terminal)) goto failed;
+        pipeline_job_release_locked(p,&p->jobs[i],"controlled LIFE flush");
+        if(p->unresolved_map || p->jobs[i].mapped || p->jobs[i].in_ioctl) goto failed;
+    }
+    if(p->mappings_out || p->unresolved_map || InterlockedCompareExchange(&p->detached,0,0) ||
+       p->generation==~(UINT64)0 || GetTickCount64()>=deadline) goto failed;
+    memset(&out,0,sizeof(out));
+    /* owned_session stays owned even on ambiguous IO/short response failure. */
+    if(!vm_flush(life_owner_session(p),&out)) goto failed;
+    if(!out.SessionToken || InterlockedCompareExchange(&p->detached,0,0) ||
+       ma_terminal(&p->admission_terminal)) goto failed; /* session id zero is valid */
+    /* Detach and commit serialize on the publication lock. Never restart a
+     * revoked ctx. The following lock contains scalar writes only, no COM/IO. */
+    AcquireSRWLockExclusive(&g_runtime_ctx_lock);
+    if(InterlockedCompareExchange(&p->detached,0,0) || runtime->pipeline!=p ||
+       ma_terminal(&p->admission_terminal)) {
+        ReleaseSRWLockExclusive(&g_runtime_ctx_lock); goto failed;
+    }
+    p->object->session_id=runtime->session_id=out.SessionId;
+    p->object->media_token=runtime->media_token=out.SessionToken;
+    p->object->capture_count=runtime->capture_count=0;
+    p->object->frame_sent=runtime->frame_sent=FALSE;
+    p->object->send_fail_streak=runtime->send_fail_streak=0;
+    p->object->direct_fail_streak=runtime->direct_fail_streak=0;
+    ++p->generation;
+    p->drain_seq=p->submit_seq; /* global tags / submit sequence never reused */
+    p->jobs_in_flight=0;
+    p->av1_outstanding=0; p->av1_inputs_sent=0; p->last_submit_qpc=0;
+    p->mapping_limit=1; /* learn new host capture count on its first SEND */
+    memset(p->uploaded,0,sizeof(p->uploaded)); p->uploaded_next=0;
+    runtime->flushes++; runtime->aus_dropped+=out.DroppedAu;
+    runtime->frames_dropped+=out.DroppedFrames;
+    ReleaseSRWLockExclusive(&g_runtime_ctx_lock);
+    LeaveCriticalSection(&p->lock); locked=FALSE;
+    read_forget(p,FALSE);
+    if(runtime->codec==VIRTIO_WDDM_CODEC_AV1) {
+        av1_dpb_reset(&runtime->av1_dpb);
+        runtime->av1_prev_pending=FALSE; runtime->av1_seq_emitted=FALSE;
+        av1_prev_target_release(runtime);
+        av1_flush_builder(runtime,"controlled LIFE flush");
+    }
+    AcquireSRWLockExclusive(&g_runtime_ctx_lock);
+    if(InterlockedCompareExchange(&p->detached,0,0) || runtime->pipeline!=p ||
+       ma_terminal(&p->admission_terminal)) {
+        ReleaseSRWLockExclusive(&g_runtime_ctx_lock); goto failed;
+    }
+    p->tag_paused=FALSE;
+    InterlockedExchange(&p->flushing,0);
+    ReleaseSRWLockExclusive(&g_runtime_ctx_lock);
+    ok=TRUE;
+    goto owner_done;
+failed:
+    /* May arrive without pipe lock. Atomic terminal closes all admission;
+     * never race an unlocked ordinary broken write or revive via flush. */
+    pipeline_fail_admission(runtime);
+    InterlockedExchange(&p->flushing,1);
+owner_done:
+    if(locked) LeaveCriticalSection(&p->lock);
+    InterlockedExchange(&p->maintenance_owner,0);
+    if(p->ready) SetEvent(p->ready);
+    if(p->wake) SetEvent(p->wake);
+    if(p->tag_wake) SetEvent(p->tag_wake);
+done:
+    if(local) { life_runtime_leave(p); runtime_scope_leave(&scope); }
+    return ok;
+}
+
+static BOOL pipeline_tag_flush_safe(VIRTIO_WDDM_VideoDecoder *o) {
+    return !o->pipeline || (!o->pipeline->life_mode && (!o->pipeline->tag_mode || !o->pipeline->broken));
+}
 static void pipeline_quiesce(VIRTIO_WDDM_VideoDecoder *object, const char *reason) {
-    VIRTIO_WDDM_DecodePipeline *pipe = object ? object->pipeline : NULL;
+    VIRTIO_WDDM_DecodePipeline *pipe = object ? decoder_ctx_access(object) : NULL;
     LONGLONG t0;
     UINT i;
     UINT64 generation;
@@ -4634,6 +8468,22 @@ static void pipeline_quiesce(VIRTIO_WDDM_VideoDecoder *object, const char *reaso
         return;
     }
     t0 = decoder_qpc_now();
+    if (pipe->tag_mode) {
+        EnterCriticalSection(&pipe->lock); pipe->tag_paused=TRUE;
+        LeaveCriticalSection(&pipe->lock);
+        for (;;) {
+            BOOL busy;
+            EnterCriticalSection(&pipe->lock);
+            busy=pipe->tag_fetching;
+            for(i=0;i<pipe->job_count;++i) if(pipe->jobs[i].in_ioctl) busy=TRUE;
+            LeaveCriticalSection(&pipe->lock);
+            if(!busy) break;
+            if(decoder_qpc_ms(t0,decoder_qpc_now())>pipe->timeout_ms+500u) {
+                pipe->broken=TRUE; ERROR("tag quiesce timeout; session must not flush"); return;
+            }
+            WaitForSingleObject(pipe->ready,20);
+        }
+    }
     /* Bounded wait for the worker to leave whatever stage it is in: it holds
      * the lock only around an ioctl, and every ioctl has a timeout, so this
      * normally returns immediately.  If it does not, the session state is
@@ -4653,16 +8503,67 @@ static void pipeline_quiesce(VIRTIO_WDDM_VideoDecoder *object, const char *reaso
         Sleep(1);
     }
     dropped_before = (UINT)pipe->dropped;
+    /* §5.4: an upload runs on a consumer thread OUTSIDE pipe->lock (the 3.1 MB
+     * staging copy), so a job can be in JOB_UPLOADING right now.  Dropping it
+     * here would RELEASE_FRAME the capture buffer the upload is reading, so wait
+     * for it to finish first: the copy is ~30 ms and the budget is the pipeline
+     * timeout.  After that the generation bump makes the flushed sequence
+     * unwritable no matter what the consumer does. */
+    for (;;) {
+        BOOL uploading = FALSE;
+
+        for (i = 0; i < pipe->job_count; i++) {
+            if (pipe->jobs[i].state == VIRTIO_WDDM_JOB_UPLOADING) {
+                uploading = TRUE;
+                break;
+            }
+        }
+        if(pipe->strict_read) {
+            AcquireSRWLockShared(&g_read_lock);
+            for(i=0;i<READ_TARGET_MAX;++i)
+                if(g_read_targets[i].pipe==pipe && mr_resource_pinned(g_read_tickets,READ_TARGET_MAX,(uintptr_t)g_read_targets[i].texture)) uploading=TRUE;
+            ReleaseSRWLockShared(&g_read_lock);
+        }
+        if (!uploading)
+            break;
+        if (decoder_qpc_ms(t0, decoder_qpc_now()) >
+            (double)(pipe->timeout_ms + 500u)) {
+            pipe->broken = TRUE;
+            ERROR("%s: a consumer stayed in the upload of a job for more than %u ms "
+                  "(%s) -> pipeline marked broken", __FUNCTION__,
+                  pipe->timeout_ms + 500u, reason ? reason : "?");
+            LeaveCriticalSection(&pipe->lock);
+            return;
+        }
+        LeaveCriticalSection(&pipe->lock);
+        WaitForSingleObject(pipe->ready, 20);
+        EnterCriticalSection(&pipe->lock);
+    }
+    if(pipe->strict_read) read_forget(pipe,FALSE);
     generation = pipe->generation;
     pipe->generation = generation + 1u;
-    for (i = 0; i < VIRTIO_WDDM_PIPELINE_JOBS; i++) {
+    for (i = 0; i < pipe->job_count; i++) {
         VIRTIO_WDDM_PipelineJob *job = &pipe->jobs[i];
         if (job->state == VIRTIO_WDDM_JOB_FREE)
             continue;
         pipeline_job_release_locked(pipe, job, reason ? reason : "quiesce");
     }
+    /* Every slot is FREE now: keep the in-flight statistic honest, otherwise a
+     * streaming session that flushes once would report a phantom queue depth for
+     * the rest of its life (and a reader of the summary would think the ring is
+     * permanently full). */
+    pipe->jobs_in_flight = 0;
     pipe->drain_seq = pipe->submit_seq;
-    pipe->mapping_out = FALSE;
+    pipe->mappings_out = 0;
+    /* §7 P3 (round 27): every SENT AV1 job was just released, so none of them is
+     * waiting for a host picture any more.  A stale count would freeze the send
+     * loop (it sends while outstanding < lag) after a seek. */
+    pipe->av1_outstanding = 0;
+    /* A new generation starts with no picture in any subresource (the session
+     * that produced them is about to be flushed), so the first read after a seek
+     * gets the neutral fill instead of a stale frame. */
+    memset(pipe->uploaded, 0, sizeof(pipe->uploaded));
+    pipe->uploaded_next = 0;
     LeaveCriticalSection(&pipe->lock);
     SetEvent(pipe->wake);
     if (object->direct_active) {
@@ -4687,12 +8588,25 @@ static void pipeline_destroy(VIRTIO_WDDM_VideoDecoder *object) {
 
     if (!pipe)
         return;
+    if(pipe->life_mode) {
+        pipeline_life_detach(object);
+        return; /* never enter legacy freeing path for any live worker */
+    }
     EnterCriticalSection(&pipe->lock);
     pipe->stop = TRUE;
+    pipe->tag_paused = TRUE;
     LeaveCriticalSection(&pipe->lock);
     SetEvent(pipe->wake);
+    if(pipe->tag_wake) SetEvent(pipe->tag_wake);
     if (pipe->thread) {
         DWORD waited = WaitForSingleObject(pipe->thread, pipe->timeout_ms + 2000u);
+        if (waited != WAIT_OBJECT_0 && pipe->tag_mode) {
+            ERROR("FATAL tag sender stop timed out; cancel then wait for actual exit; NOT bounded teardown");
+            if(!CancelSynchronousIo(pipe->thread)) ERROR("tag sender cancel err=%lu",GetLastError());
+            if(pipe->collector && !CancelSynchronousIo(pipe->collector))
+                ERROR("tag collector cancel err=%lu",GetLastError());
+            WaitForSingleObject(pipe->thread,INFINITE); /* never free live runtime object */
+        }
         if (waited != WAIT_OBJECT_0)
             ERROR("%s: the pipeline worker did not stop within %u ms (state=%lu) "
                   "-> closing the session anyway", __FUNCTION__,
@@ -4700,61 +8614,135 @@ static void pipeline_destroy(VIRTIO_WDDM_VideoDecoder *object) {
         CloseHandle(pipe->thread);
         pipe->thread = NULL;
     }
+    if (pipe->collector) {
+        SetEvent(pipe->tag_wake);
+        if (WaitForSingleObject(pipe->collector,pipe->timeout_ms+2000u)!=WAIT_OBJECT_0) {
+            ERROR("FATAL tag collector stop timed out; cancel then wait for actual exit; NOT bounded teardown");
+            if(!CancelSynchronousIo(pipe->collector)) ERROR("tag collector cancel err=%lu",GetLastError());
+            WaitForSingleObject(pipe->collector,INFINITE);
+        }
+        CloseHandle(pipe->collector); pipe->collector=NULL;
+    }
+    if (pipe->tag_wake) { CloseHandle(pipe->tag_wake); pipe->tag_wake=NULL; }
+    if(pipe->strict_read) {
+        BOOL active;
+        do {
+            active=FALSE;
+            AcquireSRWLockShared(&g_read_lock);
+            for(i=0;i<READ_TARGET_MAX;++i)
+                if(g_read_targets[i].pipe==pipe && mr_resource_pinned(g_read_tickets,READ_TARGET_MAX,(uintptr_t)g_read_targets[i].texture)) active=TRUE;
+            ReleaseSRWLockShared(&g_read_lock);
+            if(active) Sleep(10); /* inherited unbounded experimental teardown limitation */
+        } while(active);
+        read_forget(pipe,TRUE);
+    }
     EnterCriticalSection(&pipe->lock);
-    for (i = 0; i < VIRTIO_WDDM_PIPELINE_JOBS; i++)
+    for (i = 0; i < pipe->job_count; i++)
         pipeline_job_release_locked(pipe, &pipe->jobs[i], "destroy");
     LeaveCriticalSection(&pipe->lock);
 
     INFO("%s: pipeline summary: %llu submitted / %llu produced / %llu uploaded "
          "(%llu pool, %llu staged) / %llu fill(s) / %llu dropped / %llu failed job(s) "
-         "| %llu send failure(s) / %llu fetch failure(s) / %llu timeout(s) | "
+         "(%llu AU refused err=1450, %llu backoff(s)) "
+         "| %llu send failure(s) / %llu fetch failure(s) / %llu timeout(s) / "
+         "%llu sync failure(s), %llu capacity drain(s) "
+         "[selected %llu, retired %llu, timeout %llu, failure %llu] | "
          "queue avg %.2f max %.2f ms, worker lead avg %.2f max %.2f ms, "
-         "DDI wait avg %.2f max %.2f ms | %s, %u job(s), timeout %u ms, "
-         "generation %llu",
+         "sync wait avg %.2f max %.2f ms, upload avg %.2f max %.2f ms | "
+         "%u job slot(s), timeout %u ms, generation %llu | "
+         "AV1 async: %s lag %u, %llu AU sent / %llu picture(s) collected, "
+         "%llu catch-up job(s), %llu cap skip(s), %llu read(s) kept a SENT job, "
+         "%llu read(s) found the worker in the pipe, %llu fetch retry(ies), "
+         "%llu read failure(s) swallowed, collect wait avg %.2f max %.2f ms",
          __FUNCTION__, (unsigned long long)pipe->submitted,
          (unsigned long long)pipe->produced, (unsigned long long)pipe->drained,
          (unsigned long long)pipe->drained_mapped,
          (unsigned long long)pipe->drained_staged, (unsigned long long)pipe->fills,
          (unsigned long long)pipe->dropped, (unsigned long long)pipe->failed_jobs,
+         (unsigned long long)pipe->au_dropped,
+         (unsigned long long)pipe->send_backoffs,
          (unsigned long long)pipe->send_failures,
          (unsigned long long)pipe->fetch_failures, (unsigned long long)pipe->timeouts,
+         (unsigned long long)pipe->sync_wait_timeouts,
+         (unsigned long long)pipe->drain_capacity,
+         (unsigned long long)pipe->drain_selected,
+         (unsigned long long)pipe->drain_retired,
+         (unsigned long long)pipe->drain_timeouts,
+         (unsigned long long)pipe->drain_failures,
          pipe->drained ? pipe->queue_sum / (double)pipe->drained : 0.0, pipe->queue_max,
          pipe->drained ? pipe->lead_sum / (double)pipe->drained : 0.0, pipe->lead_max,
          pipe->drained ? pipe->wait_sum / (double)pipe->drained : 0.0, pipe->wait_max,
-         pipe->defer ? "deferred" : "immediate", VIRTIO_WDDM_PIPELINE_JOBS,
-         pipe->timeout_ms, (unsigned long long)pipe->generation);
+         pipe->drained ? pipe->upload_sum / (double)pipe->drained : 0.0,
+         pipe->upload_max,
+         pipe->job_count, pipe->timeout_ms, (unsigned long long)pipe->generation,
+         pipe->av1_async ? "on" : "off", pipe->av1_lag,
+         (unsigned long long)pipe->av1_sent,
+         (unsigned long long)pipe->av1_produced,
+         (unsigned long long)pipe->av1_catchup_jobs,
+         (unsigned long long)pipe->av1_cap_skips,
+         (unsigned long long)pipe->av1_drain_keeps,
+         (unsigned long long)pipe->av1_drain_keeps_worker,
+         (unsigned long long)pipe->av1_fetch_retries,
+         (unsigned long long)pipe->av1_read_failures_swallowed,
+         pipe->av1_fetch_waits
+             ? pipe->av1_fetch_wait_sum / (double)pipe->av1_fetch_waits
+             : 0.0,
+         pipe->av1_fetch_wait_max);
 
-    for (i = 0; i < VIRTIO_WDDM_PIPELINE_JOBS; i++) {
+    for (i = 0; i < pipe->job_count; i++) {
         if (pipe->jobs[i].au)
             HeapFree(GetProcessHeap(), 0, pipe->jobs[i].au);
         if (pipe->jobs[i].slot)
             HeapFree(GetProcessHeap(), 0, pipe->jobs[i].slot);
-        memset(&pipe->jobs[i], 0, sizeof(pipe->jobs[i]));
     }
+    if (pipe->jobs)
+        HeapFree(GetProcessHeap(), 0, pipe->jobs);
+    pipe->jobs = NULL;
+    pipe->job_count = 0;
     if (pipe->fill)
         HeapFree(GetProcessHeap(), 0, pipe->fill);
     if (pipe->wake)
         CloseHandle(pipe->wake);
     if (pipe->ready)
         CloseHandle(pipe->ready);
+    if (pipe->slot_free)
+        CloseHandle(pipe->slot_free);
     DeleteCriticalSection(&pipe->lock);
     HeapFree(GetProcessHeap(), 0, pipe);
     object->pipeline = NULL;
 }
 
-/* Arm the pipeline for this decoder.  Opt-out (like the log file and the
- * zero-copy route), so a guest can A/B on one machine without a rebuild. */
+/* Arm the pipeline for this decoder.  SERIAL (2026-10-25): this is now a
+ * compile-time opt-in AND still a runtime opt-out, so a default build stays on
+ * the serial path no matter what the environment says (see the switch next to
+ * the pipeline forward declarations).  VIRTIO_WDDM_PIPELINE=0 at build time ->
+ * `object->pipeline` stays NULL -> DecoderEndFrame calls decoder_decode_unit()
+ * for every picture, which is the P4-13 code path unchanged. */
 static BOOL pipeline_create(VIRTIO_WDDM_VideoDecoder *object) {
     VIRTIO_WDDM_DecodePipeline *pipe;
     BOOL enabled;
-    UINT depth;
+    BOOL env_requested;
+    UINT jobs;
 
     if (!object)
         return FALSE;
-    enabled = pipeline_env_flag("VIRTIO_WDDM_PIPELINE", TRUE);
+    env_requested = pipeline_env_flag("VIRTIO_WDDM_PIPELINE", TRUE);
+    enabled = env_requested && VIRTIO_WDDM_PIPELINE;
+    if (object->life_requested &&
+        (!enabled || object->codec != VIRTIO_WDDM_CODEC_AV1 ||
+         object->driver_version < VMEDIA_TAG_MIN_VERSION || !object->media_token ||
+         !object->device || !object->device->base.pCtx1 ||
+         !pipeline_env_flag("VIRTIO_WDDM_MEDIA_TAG_EXPERIMENT", FALSE) ||
+         !pipeline_env_flag("VIRTIO_WDDM_STRICT_READ_EXPERIMENT", FALSE))) {
+        ERROR("explicit LIFE prerequisites unavailable; rejecting before any worker starts");
+        return FALSE;
+    }
     if (!enabled) {
-        INFO("%s: pipeline disabled by VIRTIO_WDDM_PIPELINE -> the serial "
-             "send/get/upload path", __FUNCTION__);
+        INFO("%s: serial send/get/upload path (build-time VIRTIO_WDDM_PIPELINE=%d, "
+             "runtime VIRTIO_WDDM_PIPELINE=%s): every EndFrame runs "
+             "decoder_decode_unit() -> send, fetch, upload on this thread",
+             __FUNCTION__, (int)VIRTIO_WDDM_PIPELINE,
+             env_requested ? "unset/1" : "0");
         return FALSE;
     }
     if (object->codec == VIRTIO_WDDM_CODEC_VP9) {
@@ -4768,109 +8756,266 @@ static BOOL pipeline_create(VIRTIO_WDDM_VideoDecoder *object) {
              __FUNCTION__, object->driver_version, (UINT)VMEDIA_FLUSH_MIN_DRIVER_VERSION);
         return FALSE;
     }
-    depth = pipeline_env_uint("VIRTIO_WDDM_PIPELINE_DEPTH", 2u, 1u, 2u);
+    jobs = pipeline_env_uint("VIRTIO_WDDM_PIPELINE_JOBS", VIRTIO_WDDM_PIPELINE_JOBS_DEFAULT,
+                             4u, VIRTIO_WDDM_PIPELINE_JOBS_MAX);
     pipe = (VIRTIO_WDDM_DecodePipeline *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                                    sizeof(*pipe));
     if (!pipe) {
         ERROR("%s: out of memory for the pipeline state -> serial path", __FUNCTION__);
         return FALSE;
     }
+    pipe->jobs = (VIRTIO_WDDM_PipelineJob *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                                      (size_t)jobs * sizeof(*pipe->jobs));
+    if (!pipe->jobs) {
+        ERROR("%s: out of memory for %u job slots -> serial path", __FUNCTION__, jobs);
+        HeapFree(GetProcessHeap(), 0, pipe);
+        return FALSE;
+    }
+    pipe->tag_mode = object->codec==VIRTIO_WDDM_CODEC_AV1 &&
+        object->driver_version>=VMEDIA_TAG_MIN_VERSION && object->media_token &&
+        pipeline_env_flag("VIRTIO_WDDM_MEDIA_TAG_EXPERIMENT",FALSE);
+    pipe->strict_read=pipe->tag_mode && pipeline_env_flag("VIRTIO_WDDM_STRICT_READ_EXPERIMENT",FALSE);
+    pipe->job_count = jobs;
+    /* §5.4b backpressure: 4 frames in flight is ~160 ms of host decode at 25 fps,
+     * short enough that the worker's one blocking MAP_FRAME never waits long.
+     * §7 P3 (round 27): AV1 is the exception.  Its host decoder holds ~18 decoded
+     * pictures before it emits the first CAPTURE buffer (Codec2 "updating output
+     * delay 11 -> 17", REQBUFS granted 18), so a cap below the host's output delay
+     * would make every submit wait for a picture that is still inside the decoder
+     * -- exactly the round 26 stall.  The AV1 cap therefore starts at the lag (20,
+     * VIRTIO_WDDM_AV1_LAG) and is never allowed below it; H.264/HEVC keep 4. */
+    pipe->av1_async = (object->codec == VIRTIO_WDDM_CODEC_AV1) ? TRUE : FALSE;
+    pipe->av1_lag = pipeline_env_uint("VIRTIO_WDDM_AV1_LAG", VIRTIO_WDDM_AV1_LAG_DEFAULT,
+                                      2u, jobs);
+    /* §7 P3 (round 28): the show_existing_frame unit is what makes a HIDDEN AV1
+     * picture displayable -- except that this host answers it with an empty
+     * output buffer (see the field comment).  Off by default; =1 is the A/B. */
+    pipe->av1_show_existing = pipeline_env_flag("VIRTIO_WDDM_AV1_SHOW_EXISTING", FALSE);
+    /* §7 P3 (round 28): send every coded picture as a shown frame, so a hidden
+     * alt-ref still makes the host emit a CAPTURE buffer.  This is the mode that
+     * got pictures out of a host whose output delay is counted in inputs. */
+    pipe->av1_shown_always = pipeline_env_flag("VIRTIO_WDDM_AV1_SHOWN_ALWAYS", TRUE);
+    /* AV1 STATEFUL PORT (2026-10-27): the reference's one-frame lookahead.  Only
+     * meaningful with the pipeline on (a deferred picture's output view is
+     * restored from the job's tag snapshot); OFF by default so the default build
+     * keeps the measured round-28 behaviour (one picture per EndFrame, mask 0 +
+     * hidden catch-up). */
+    pipe->av1_lookahead = pipeline_env_flag("VIRTIO_WDDM_AV1_LOOKAHEAD", FALSE);
+    /* 2026-10-27 (round 1027b): the worker sends, the read path collects.  This is
+     * what keeps the host's input pipe full (measured: 16 sends in 20 s while the
+     * worker was spending 300 ms per hopeless fetch).
+     *
+     * round 46: back to FALSE by default.  With send_only=TRUE nothing collected
+     * the SENT jobs at all (the read path only drains READY ones), so the host's
+     * 18 capture buffers stayed checked out, its output queue filled up and
+     * vm_send() blocked -- measured: 29 AUs in 20 s, 0 decoded pictures.  The
+     * worker fetches oldest-first again, but only when the host can already have
+     * produced the picture (ready_by_delay), and never with pipe->lock held. */
+#if VIRTIO_WDDM_AV1_LEGACY_BUILD
+    pipe->av1_send_only = FALSE;
+#else
+    pipe->av1_send_only = pipeline_env_flag("VIRTIO_WDDM_AV1_SEND_ONLY", FALSE);
+#endif
+    /* §7 P3 (round 28): the host's output delay in input buffers (CCodec reports
+     * 17 for this 1080p AV1 stream; measured as "outputs start at input 18"). */
+    pipe->av1_host_delay = pipeline_env_uint("VIRTIO_WDDM_AV1_OUTPUT_DELAY", 17u, 0u, 64u);
+    pipe->max_inflight = pipeline_env_uint("VIRTIO_WDDM_PIPELINE_MAX_INFLIGHT",
+                                           pipe->av1_async ? pipe->av1_lag : 4u, 1u,
+                                           jobs);
+    if (pipe->av1_async && pipe->max_inflight < pipe->av1_lag)
+        pipe->max_inflight = pipe->av1_lag;
+    if (pipe->tag_mode) pipe->max_inflight=jobs;
     pipe->object = object;
-    pipe->defer = depth >= 2u;
     pipe->timeout_ms = pipeline_env_uint("VIRTIO_WDDM_PIPELINE_TIMEOUT_MS", 1000u, 50u,
                                          10000u);
+    pipe->fetch_timeout_ms = pipeline_env_uint("VIRTIO_WDDM_PIPELINE_FETCH_MS", 3000u,
+                                               200u, 15000u);
+    pipe->av1_fetch_ms = pipeline_env_uint("VIRTIO_WDDM_AV1_FETCH_MS",
+                                           VIRTIO_WDDM_AV1_FETCH_MS_DEFAULT, 20u, 5000u);
+    /* §5.4b: opt-in trace (submit enter/enqueue, sync hook, blit entry, worker
+     * heartbeat).  Off by default; a normal run pays nothing. */
+    pipe->trace = pipeline_env_flag("VIRTIO_WDDM_PIPELINE_TRACE", FALSE);
+    if (pipe->trace)
+        InterlockedExchange(&g_pipeline_trace, 1);
+    /* §5.4: how many capture buffers this decoder may hold at once.  Driver
+     * 1.0.0.22 maps per capture buffer, so a mapped job keeps it until its
+     * picture is uploaded; before that the driver allowed exactly one. */
+    pipe->multi_mapping = object->driver_version >= VMEDIA_MULTI_MAPPING_MIN_DRIVER_VERSION;
+    pipe->mapping_limit = pipe->multi_mapping
+                              ? (object->capture_count ? object->capture_count : 1u)
+                              : 1u;
     InitializeCriticalSection(&pipe->lock);
     pipe->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
     pipe->ready = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!pipe->wake || !pipe->ready) {
+    pipe->tag_wake = CreateEventW(NULL,FALSE,FALSE,NULL);
+    pipe->slot_free = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!pipe->wake || !pipe->ready || !pipe->slot_free || !pipe->tag_wake) {
         ERROR("%s: cannot create the pipeline events err=%lu -> serial path",
               __FUNCTION__, (unsigned long)GetLastError());
         goto fail;
     }
+    /* Every asynchronous worker needs independent storage/session/code ownership.
+     * A setup failure happens before any worker and may select the serial path;
+     * never start the former runtime-backed worker as a fallback. */
+    if(!object->device || !object->device->base.pCtx1 || !life_prepare(pipe,object)) {
+        ERROR("async heap lifetime setup failed before worker startup; serial path only");
+        pipe->broken=TRUE; goto fail;
+    }
+    AcquireSRWLockExclusive(&g_runtime_ctx_lock);
     object->pipeline = pipe;
-    pipe->thread = CreateThread(NULL, 0, pipeline_worker, pipe, 0, &pipe->thread_id);
+    ReleaseSRWLockExclusive(&g_runtime_ctx_lock);
+    pipe->thread = life_start(pipe,pipeline_worker,&pipe->thread_id);
     if (!pipe->thread) {
-        ERROR("%s: CreateThread failed err=%lu -> serial path", __FUNCTION__,
+        ERROR("%s: CreateThread failed err=%lu after lifetime commit; decoder rejected", __FUNCTION__,
               (unsigned long)GetLastError());
+        if(pipe->life_mode) { pipeline_life_detach(object); return FALSE; }
         object->pipeline = NULL;
         goto fail;
     }
+    if (pipe->tag_mode) {
+        pipe->collector=life_start(pipe,pipeline_tag_collector,NULL);
+        if (!pipe->collector) {
+            /* Requested tag must not fall through to FIFO. */
+            pipe->broken=TRUE;
+            ERROR("tag collector creation failed; pipeline failed, no FIFO fallback");
+        }
+    }
     pipe->started = TRUE;
-    INFO("%s: pipeline armed (%s, %u job(s), timeout %u ms, codec %s, drv=0x%08x): "
-         "vm_send + fetch on the worker, the upload of the previous job on the "
-         "DDI thread -- see 04-测试记录/10-流水线.md",
-         __FUNCTION__, pipe->defer ? "deferred by one frame" : "immediate drain",
-         VIRTIO_WDDM_PIPELINE_JOBS, pipe->timeout_ms,
-         decoder_codec_name(object->codec), object->driver_version);
+    INFO("%s: pipeline armed §5.4b BACKPRESSURE-DRAIN (build-time switch=%d, %u "
+         "job slot(s), in-flight cap %u, mapping limit %u (multi=%d), timeout %u ms, "
+         "fetch timeout %u ms, codec %s, drv=0x%08x, trace=%d): EndFrame only queues; "
+         "a submit at the in-flight cap (or with no free slot) drains the oldest job "
+         "through the same pipeline_drain_one() the read path uses; "
+         "decoder_sync_texture() waits + uploads before a read (see "
+         "04-测试记录/24-背压排空.md)",
+         __FUNCTION__, (int)VIRTIO_WDDM_PIPELINE, pipe->job_count, pipe->max_inflight,
+         pipe->mapping_limit, (int)pipe->multi_mapping, pipe->timeout_ms,
+         pipe->fetch_timeout_ms, decoder_codec_name(object->codec),
+         object->driver_version, (int)pipe->trace);
+    if (pipe->av1_async)
+        INFO("%s: AV1 ASYNC COLLECT armed (round 28, §7 P3): the worker sends until "
+             "%u access units are inside the host and only then collects pictures "
+             "oldest-first; the host's output delay is %u INPUT buffers (CCodec 17, "
+             "measured: outputs start at input %u), so a fetch is skipped until "
+             "input_ordinal + %u inputs went in -- round 27 spent 300 ms per AU "
+             "fetching pictures the host could not have produced yet; every coded "
+             "picture is sent SHOWN=%d (hidden alt-refs included), the DPB catch-up "
+             "is a no-picture job, show_existing units are %s, one-frame lookahead=%d; "
+             "in-flight cap %u, lag "
+             "%u, fetch tries %u; VIRTIO_WDDM_AV1_LAG / _OUTPUT_DELAY / "
+             "_SHOWN_ALWAYS / _SHOW_EXISTING / _LOOKAHEAD / _FETCH_MS override",
+             __FUNCTION__, pipe->av1_lag, pipe->av1_host_delay,
+             pipe->av1_host_delay + 1u, pipe->av1_host_delay,
+             (int)pipe->av1_shown_always,
+             pipe->av1_show_existing ? "ON (A/B)" : "off (host drops them)",
+             (int)pipe->av1_lookahead,
+             pipe->max_inflight, pipe->av1_lag, (UINT)VIRTIO_WDDM_AV1_FETCH_TRIES);
     return TRUE;
 
 fail:
+    if (pipe->tag_wake)
+        CloseHandle(pipe->tag_wake);
     if (pipe->wake)
         CloseHandle(pipe->wake);
     if (pipe->ready)
         CloseHandle(pipe->ready);
+    if (pipe->slot_free)
+        CloseHandle(pipe->slot_free);
+    if (pipe->jobs)
+        HeapFree(GetProcessHeap(), 0, pipe->jobs);
     DeleteCriticalSection(&pipe->lock);
     HeapFree(GetProcessHeap(), 0, pipe);
     return FALSE;
 }
 
-/* decoder_drop_direct() hook: the capture buffer is back in the device's queue,
- * so the worker may map the next frame. */
+/* decoder_drop_direct() hook: the serial path's capture buffer is back in the
+ * device's queue, so the worker may map the next frame.  (The deferred pipeline
+ * does not use object->direct_map: each job owns its own mapping and releases it
+ * when its picture is uploaded.) */
 static void pipeline_on_mapping_freed(VIRTIO_WDDM_VideoDecoder *object) {
-    VIRTIO_WDDM_DecodePipeline *pipe = object ? object->pipeline : NULL;
+    VIRTIO_WDDM_DecodePipeline *pipe = object ? decoder_ctx_access(object) : NULL;
 
     if (!pipe)
         return;
-    EnterCriticalSection(&pipe->lock);
-    pipe->mapping_out = FALSE;
-    LeaveCriticalSection(&pipe->lock);
     SetEvent(pipe->wake);
 }
 
 static void pipeline_session_lock(VIRTIO_WDDM_VideoDecoder *object) {
-    if (object && object->pipeline)
-        EnterCriticalSection(&object->pipeline->lock);
+    if (object && decoder_ctx_access(object))
+        EnterCriticalSection(&decoder_ctx_access(object)->lock);
 }
 
 static void pipeline_session_unlock(VIRTIO_WDDM_VideoDecoder *object) {
-    if (object && object->pipeline)
-        LeaveCriticalSection(&object->pipeline->lock);
+    if (object && decoder_ctx_access(object))
+        LeaveCriticalSection(&decoder_ctx_access(object)->lock);
 }
 
-/* The EndFrame entry point of the pipeline: queue this access unit, then upload
- * the oldest finished job.  FALSE means "the caller must not continue" (the
- * failure is already recorded with decoder_fail_frame). */
-static BOOL pipeline_frame(VIRTIO_WDDM_VideoDecoder *object, const UINT8 *data, UINT size,
-                           UINT send_w, UINT send_h, VIRTIO_WDDM_PipelineFrame *out) {
-    VIRTIO_WDDM_DecodePipeline *pipe = object->pipeline;
+/* The EndFrame entry point of the deferred pipeline (§5.4): queue this access
+ * unit and RETURN.  No wait, no upload, no fill write -- the picture is produced
+ * by the worker and written by decoder_sync_texture() when the application is
+ * about to read the texture.  FALSE means "the caller must not continue" (the
+ * failure is already recorded with decoder_fail_frame).
+ *
+ * §7 P3 (round 27): `produces_picture` is FALSE for the AV1 hidden DPB catch-up.
+ * Such an AU still has to travel through this queue (it must be SENT in stream
+ * order, and the worker owns the session's send order), but it owes no picture,
+ * so the worker retires it right after the send instead of fetching. */
+static BOOL pipeline_queue_frame_ex(VIRTIO_WDDM_VideoDecoder *object,
+                                    const UINT8 *data, UINT size, UINT send_w,
+                                    UINT send_h, BOOL produces_picture,
+                                    const VIRTIO_WDDM_PipelineTarget *target,
+                                    BOOL no_wait) {
+    VIRTIO_WDDM_DecodePipeline *pipe = decoder_ctx_access(object);
 
     if (!pipe)
         return FALSE;
-    if (pipe->broken) {
+    if (pipeline_admission_terminal(object) || pipe->broken) {
         ERROR("%s: the pipeline is broken (a stage timed out earlier) -> E_FAIL",
               __FUNCTION__);
         decoder_fail_frame(object, E_FAIL);
         return FALSE;
     }
-    if (!pipeline_submit(object, data, size, send_w, send_h))
-        return FALSE;
-    if (!pipeline_drain(object, out)) {
-        ERROR("%s: pipeline_drain could not deliver a frame (fill buffer "
-              "unavailable) -> E_FAIL", __FUNCTION__);
-        decoder_fail_frame(object, E_FAIL);
-        return FALSE;
+    /* pipeline_submit() touches the ring, the output-view snapshot, and -- only
+     * when every slot is busy -- drains the oldest job (wait + upload + retire,
+     * bounded by the pipeline timeout).  It never waits for THIS frame's media.
+     * no_wait permits bounded capacity waits; it never evicts a coded AU. */
+    {
+        BOOL ok = pipeline_submit(object, data, size, send_w, send_h, produces_picture,
+                                  target, no_wait);
+        if (!ok) pipeline_fail_admission(object);
+
+        /* §5.4 trace (round 23): one line per queued AU.  This is what proves on
+         * the guest that EndFrame returned without touching the session, and it
+         * is the first line to look at when the decode thread stops: if the last
+         * line is "queued" and no worker/upload line follows, the worker is stuck
+         * in the driver; if no "queued" line follows a BeginFrame, the DDI thread
+         * is blocked somewhere else (e.g. by a consumer holding the sync). */
+        if (ok && (pipe->submit_seq <= 12u || (pipe->submit_seq % 120u) == 0u))
+            INFO("%s: queued job %llu t=%lld: %u B %ux%u (gen %llu, %u job(s) in "
+                 "flight)", __FUNCTION__, (unsigned long long)pipe->submit_seq,
+                 (long long)decoder_qpc_now(), size, send_w, send_h,
+                 (unsigned long long)pipe->generation, pipe->jobs_in_flight);
+        return ok;
     }
-    if (out->failed) {
-        ERROR("%s: the pipeline dropped this frame (%s, err=%u); the SEND may have "
-              "left the session in an unknown state, so it is flushed and the "
-              "pipeline generation moves on", __FUNCTION__,
-              out->failure ? out->failure : "no frame", out->error);
-        pipeline_quiesce(object, "job failure");
-        (void)decoder_flush_session(object, "pipeline job failure");
-        decoder_fail_frame(object, E_FAIL);
-        return FALSE;
-    }
-    return TRUE;
+}
+
+/* The two existing callers (H.264/HEVC, and the legacy AV1 show_existing units)
+ * keep the blocking-at-the-cap behaviour: a drain there is what keeps those
+ * codecs' in-flight window small.  AV1's new path calls _ex(..., TRUE). */
+static BOOL pipeline_queue_frame(VIRTIO_WDDM_VideoDecoder *object, const UINT8 *data,
+                                 UINT size, UINT send_w, UINT send_h,
+                                 BOOL produces_picture,
+                                 const VIRTIO_WDDM_PipelineTarget *target) {
+    return pipeline_queue_frame_ex(object, data, size, send_w, send_h, produces_picture,
+                                   target, FALSE);
+}
+
+static BOOL pipeline_queue_frame_nw(VIRTIO_WDDM_VideoDecoder *object,
+                                    const UINT8 *data, UINT size, UINT send_w,
+                                    UINT send_h, BOOL produces_picture,
+                                    const VIRTIO_WDDM_PipelineTarget *target) {
+    return pipeline_queue_frame_ex(object, data, size, send_w, send_h, produces_picture,
+                                   target, TRUE);
 }
 
 /* AV1FIX (2026-10-25): fetch one staged frame with the host wait and the copy
@@ -4903,7 +9048,7 @@ static BOOL decoder_get_frame_polled(VIRTIO_WDDM_VideoDecoder *object,
     timing->last_error = 0;
     for (;;) {
         before = decoder_qpc_now();
-        if (vm_get_frame(object->session, object->nv12, object->nv12_cap, info, 0)) {
+        if (vm_get_frame(decoder_session_borrow(object), object->nv12, object->nv12_cap, info, 0)) {
             timing->copy_ms = decoder_qpc_ms(before, decoder_qpc_now());
             timing->wait_ms = decoder_qpc_ms(start, before);
             timing->polls = polls;
@@ -4964,22 +9109,24 @@ static void decoder_send_geometry(VIRTIO_WDDM_VideoDecoder *object, UINT width,
     *send_h = h;
 }
 
-static BOOL decoder_decode_unit(VIRTIO_WDDM_VideoDecoder *object,
-                                const UINT8 *data, UINT size,
-                                UINT width, UINT height,
-                                VIRTIO_WDDM_DecodeTiming *timing,
-                                VM_FRAME_INFO *info) {
-    LONGLONG t0, t1, g0, g1;
-    UINT need, start, attempt, get_error, send_w, send_h;
-
-    timing->start_qpc = 0;
-    timing->send_ms = 0.0;
-    timing->get_ms = 0.0;
-    timing->elapsed_ms = 0;
-    timing->wait_ms = -1.0; /* -1 = not separable: wait and copy share one ioctl */
-    timing->copy_ms = -1.0;
-    timing->polls = 0;
-    timing->last_error = 0;
+/* VP9FIX (2026-10-26, round 25): the SEND half of a decode, split out of
+ * decoder_decode_unit() because a VP9 picture with show_frame=0 (a hidden
+ * alt-ref frame) must be handed to the host without waiting for a picture.
+ *
+ * Measured on the tablet (04-测试记录/25-VP9与AV1.md): t8_vp9.mkv is 30 fps with
+ * 102 hidden alt-ref frames in 896, and the host c2.qti.vp9.decoder produces no
+ * CAPTURE buffer for them -- crosvm logs "Skipping empty output buffer" and the
+ * guest's MAP_FRAME then times out after 1000 ms (err=121) and the retry after
+ * another 1000 ms.  Eight hidden frames in a 20 s run cost 16 s of the 19.5 s
+ * and produced the "3.6 fps" VP9 result.  The fix is not to send fewer frames
+ * (the references are needed) but to stop waiting for a picture the stream
+ * never asked to show. */
+static BOOL decoder_send_unit(VIRTIO_WDDM_VideoDecoder *object,
+                              const UINT8 *data, UINT size, UINT width, UINT height,
+                              VIRTIO_WDDM_DecodeTiming *timing, UINT *send_w_out,
+                              UINT *send_h_out) {
+    LONGLONG t0, t1;
+    UINT send_w, send_h;
 
     /* AV1FIX (2026-10-25): which geometry goes into S_FMT OUTPUT.
      *
@@ -5018,20 +9165,64 @@ static BOOL decoder_decode_unit(VIRTIO_WDDM_VideoDecoder *object,
      * session after the first frame. */
     t0 = decoder_qpc_now();
     timing->start_qpc = t0;
-    if (!vm_send(object->session, data, size, send_w, send_h, 0, NULL)) {
-        UINT error = vm_last_error();
-        VERBOSE("%s: vm_send(%s, %u byte(s)) was refused err=%u; reopening the session",
-                __FUNCTION__, decoder_codec_name(object->codec), size, error);
-        if (!decoder_reopen_session(object) ||
-            !vm_send(object->session, data, size, send_w, send_h, 0, NULL)) {
-            UINT retry_error = vm_last_error();
-            ERROR("%s: vm_send(%s, %u byte(s)) failed err=%u then err=%u -> E_FAIL",
-                  __FUNCTION__, decoder_codec_name(object->codec), size, error,
-                  retry_error);
-            decoder_fail_frame(object, E_FAIL);
-            return FALSE;
+    {
+        VM_SEND_OUT send_out;
+        memset(&send_out, 0, sizeof(send_out));
+        if (!vm_send(decoder_session_borrow(object), data, size, send_w, send_h, 0, &send_out)) {
+            UINT error = vm_last_error();
+            BOOL retried = FALSE;
+
+            /* P4-13 REQFIX: ERROR_NO_SYSTEM_RESOURCES (Win32 1450) is the host
+             * saying it could not allocate a buffer for THIS access unit, not
+             * that the session is gone.  Measured on the guest (1920x1152 AV1):
+             *   REQBUFS CAPTURE: asked 18 granted 1
+             *   REQBUFS OUTPUT: asked 2 refused (host -ENOMEM) -> configure rollback
+             * and the old code then closed the session and opened a new one, which
+             * dropped the decoder DPB and re-ran S_FMT/REQBUFS: 3,466 reopens and
+             * 3,471 failed sends in 116 s, every reopen demanding a new key frame,
+             * so the decoder never produced a single picture (the player kept
+             * presenting an empty NV12 surface = the green screen).
+             * Keep the session and drop this access unit; the next one retries on
+             * the buffers the session already owns.  Only a real "session lost"
+             * error still reopens. */
+            if (error != ERROR_NO_SYSTEM_RESOURCES) {
+                VERBOSE("%s: vm_send(%s, %u byte(s)) was refused err=%u; reopening the session",
+                        __FUNCTION__, decoder_codec_name(object->codec), size, error);
+                if (decoder_reopen_session(object) &&
+                    vm_send(decoder_session_borrow(object), data, size, send_w, send_h, 0, &send_out))
+                    retried = TRUE;
+            } else {
+                VERBOSE("%s: vm_send(%s, %u byte(s)) refused err=1450 (host buffer "
+                        "allocation), keeping the session and dropping this AU",
+                        __FUNCTION__, decoder_codec_name(object->codec), size);
+            }
+            if (!retried) {
+                UINT retry_error = vm_last_error();
+                object->send_fail_streak++;
+                object->send_fail_total++;
+                ERROR("%s: vm_send(%s, %u byte(s)) failed err=%u then err=%u -> E_FAIL "
+                      "(streak=%u total=%llu, session kept=%s)",
+                      __FUNCTION__, decoder_codec_name(object->codec), size, error,
+                      retry_error, object->send_fail_streak,
+                      (unsigned long long)object->send_fail_total,
+                      error == ERROR_NO_SYSTEM_RESOURCES ? "yes" : "no");
+                decoder_fail_frame(object, E_FAIL);
+                /* P4-13 REQFIX: not free for the host -- see decoder_send_backoff. */
+                decoder_send_backoff(object->send_fail_streak);
+                return FALSE;
+            }
+        } else if (!object->capture_count && send_out.CaptureCount) {
+            /* P4-13 REQFIX: log the capture depth the host actually granted
+             * (REQBUFS CAPTURE).  "asked 18 granted 1" is the failure this batch
+             * is about, and it was invisible in the UMD log until now. */
+            object->capture_count = send_out.CaptureCount;
+            INFO("%s: session granted %u capture buffer(s) (capture sizeimage=%u "
+                 "stride=%u, output sizeimage=%u)", __FUNCTION__,
+                 object->capture_count, send_out.CaptureSizeImage,
+                 send_out.CaptureStride, send_out.OutputSizeImage);
         }
     }
+    object->send_fail_streak = 0;
     t1 = decoder_qpc_now();
     timing->send_ms = decoder_qpc_ms(t0, t1);
     object->frame_sent = TRUE;
@@ -5043,6 +9234,36 @@ static BOOL decoder_decode_unit(VIRTIO_WDDM_VideoDecoder *object,
         object->last_send_qpc = now.QuadPart;
     }
     object->bytes_sent += size;
+    if (send_w_out)
+        *send_w_out = send_w;
+    if (send_h_out)
+        *send_h_out = send_h;
+    return TRUE;
+}
+
+static BOOL decoder_decode_unit(VIRTIO_WDDM_VideoDecoder *object,
+                                const UINT8 *data, UINT size,
+                                UINT width, UINT height,
+                                VIRTIO_WDDM_DecodeTiming *timing,
+                                VM_FRAME_INFO *info) {
+    LONGLONG g0, g1;
+    UINT need, start, attempt, get_error, send_w, send_h;
+
+    timing->start_qpc = 0;
+    timing->send_ms = 0.0;
+    timing->get_ms = 0.0;
+    timing->elapsed_ms = 0;
+    timing->wait_ms = -1.0; /* -1 = not separable: wait and copy share one ioctl */
+    timing->copy_ms = -1.0;
+    timing->polls = 0;
+    timing->last_error = 0;
+
+    /* The send half is shared with the hidden-picture path: see
+     * decoder_send_unit() and the show_frame=0 branch of the VP9 loop. */
+    if (!decoder_send_unit(object, data, size, width, height, timing, &send_w,
+                           &send_h))
+        return FALSE;
+
 
     /* P-BATCH P010: the scratch buffer has to hold whichever layout the host
      * returns -- 1 byte per sample (NV12) or 2 (P010) -- so it is sized for
@@ -5089,7 +9310,7 @@ static BOOL decoder_decode_unit(VIRTIO_WDDM_VideoDecoder *object,
             got = decoder_get_frame_polled(object, info, 1000, timing);
             get_error = timing->last_error;
         } else {
-            got = vm_get_frame(object->session, object->nv12, object->nv12_cap, info,
+            got = vm_get_frame(decoder_session_borrow(object), object->nv12, object->nv12_cap, info,
                                1000);
             get_error = got ? 0u : vm_last_error();
             timing->last_error = get_error;
@@ -5464,6 +9685,11 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
      * and the upload target come from that job instead of from this BeginFrame.
      * `pipeline_used` selects between the two in the upload tail below. */
     BOOL pipeline_used = FALSE;
+    /* §5.4 DEFERRED (round 23): this EndFrame only queued a job.  The pipeline
+     * tail below (upload, statistics, failure branches) is serial-path code and
+     * must not run: the picture is uploaded by decoder_texture_sync() when the
+     * application first reads the texture. */
+    BOOL pipeline_queued = FALSE;
     BOOL pipeline_fill = FALSE;
     VIRTIO_WDDM_PipelineFrame pipe_frame;
     UINT64 frame_readable = 0;
@@ -5477,6 +9703,16 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
     UINT target_mips;
     UINT view_mip;
     UINT view_slice;
+    /* VP9TRACE (2026-10-25): stage probe for the upload tail.  VP9 stops right
+     * after the decode ("first VP9 picture decoded") and never reaches the
+     * first `frame N` line, so one of the calls below never returned.  Each
+     * step is logged for the first frames (and every 60th after that) so the
+     * last line in the log names the call.  Diagnostic only. */
+    UINT64 trace_no;
+    BOOL trace_on;
+    /* round 46: start of this EndFrame, for the "waited=<us>" field of the AV1
+     * feed line (time this DDI itself spent before returning to the caller). */
+    LONGLONG t_ef0 = decoder_qpc_now();
 
     VIRTIO_WDDM_DDI_ENTRY("hDecode=%p priv=%p frame_open=%d bitstream=%u submits=%llu",
                           (void *)hDecode.pDrvPrivate, (void *)object,
@@ -5493,6 +9729,10 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
         return;
     }
     object->frame_open = FALSE;
+    if (pipeline_admission_terminal(object)) {
+        if (object->pending_error == S_OK) object->pending_error = E_FAIL;
+        return; /* reject before any builder/DPB mutation */
+    }
 
     view = object->output_view.pDrvPrivate;
     if (!view || view->magic != VIRTIO_WDDM_VIDEO_MAGIC_DECOUT ||
@@ -5686,6 +9926,33 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
                         decoder_flush_session(object, flush_reason);
                     }
                 }
+            }
+
+            /* VP9FIX (2026-10-26, round 25): a picture with show_frame=0 is an
+             * invisible alt-ref picture.  The host decoder updates its reference
+             * slots from it but never produces a CAPTURE buffer (crosvm:
+             * "Skipping empty output buffer"), so decoder_decode_unit() used to
+             * burn two 1000 ms MAP_FRAME timeouts on each one: 8 hidden frames
+             * cost 16 s of a 19.5 s VP9 session.  Send it and continue; there is
+             * no picture to upload and the client does not display it.
+             *
+             * Both the bitstream header and the client's DXVA_PicParams_VP9 say
+             * show_frame=0; the condition requires both so a header that failed
+             * to parse can never turn a shown picture into a skipped one. */
+            if (!hdr.show_existing_frame && !hdr.show_frame &&
+                object->vp9_pic.show_frame == 0u) {
+                memset(&timing, 0, sizeof(timing));
+                if (!decoder_send_unit(object, frame, frame_size, width, height,
+                                       &timing, NULL, NULL))
+                    return;
+                object->vp9_hidden_frames++;
+                if (object->vp9_hidden_frames <= 4u) {
+                    INFO("%s: VP9 hidden picture %llu (%u B, show_frame=0): sent to "
+                         "the host, no picture expected (send=%.2f ms)", __FUNCTION__,
+                         (unsigned long long)object->vp9_hidden_frames, frame_size,
+                         timing.send_ms);
+                }
+                continue;
             }
 
             if (!decoder_decode_unit(object, frame, frame_size, width, height, &timing,
@@ -6011,6 +10278,7 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
                     "for", __FUNCTION__);
         }
 
+#if VIRTIO_WDDM_AV1_LEGACY_BUILD
         au_need = 64u                                 /* temporal delimiter */
                   + 256u                              /* sequence header     */
                   + object->av1_prev_tile_group_size  /* catch-up tile group */
@@ -6023,15 +10291,30 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
         }
 
         /* 1. The previous picture's hidden catch-up frame, with the refresh
-         *    mask this picture's RefFrameMapTextureIndex just revealed. */
+         *    mask this picture's RefFrameMapTextureIndex just revealed.
+         *
+         * AV1FIX (2026-10-26, round 26): the catch-up is its OWN temporal unit
+         * and its own vm_send.  It used to be glued in front of this picture's
+         * frame header inside one buffer, so for every frame after the first two
+         * the host received a single input that described two pictures.  The
+         * vendor V4L2 wrapper answers exactly that with
+         *      [v4lav1D_438] Unsupported input buffer
+         * followed by "Skipping empty output buffer" -- the pair round 25
+         * counted 17 times -- and then produces nothing for that buffer at all,
+         * so the picture the client actually asked for was lost with it.
+         * One picture per input is what a V4L2 stateful decoder is specified
+         * for, and it is also what the source stream does (each IVF packet is
+         * one temporal unit, 896 of them in t6_av1.mkv). */
         if (object->av1_prev_pending) {
             unsigned prev_refresh = 0;
 
             object->av1_prev_pending = FALSE;
             if (av1_is_key) {
                 /* A new sequence starts here: the key frame resets the DPB, so
-                 * the previous picture's mask can no longer matter. */
+                 * the previous picture's mask can no longer matter (and neither
+                 * can its held output view: the slot it lived in is gone). */
                 av1_dpb_reset(&object->av1_dpb);
+                av1_prev_target_release(object);
             } else {
                 prev_refresh = av1_derive_refresh_flags(
                     object->av1_prev_texture,
@@ -6039,30 +10322,184 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
                 object->av1_masks_derived++;
                 if (prev_refresh != 0) {
                     Av1FrameParams hidden = object->av1_prev_frame;
+                    UINT cu_at = 0;
+
+                    /* show_frame must be 0 here, and showable_frame is then a
+                     * CODED bit; the writer emits it (5.9.2). */
                     hidden.show_frame = 0;
-                    au_n = av1_frame_header_obu(
-                        &object->av1_prev_seq, &hidden, &object->av1_dpb, NULL, 0,
-                        prev_refresh, object->av1_au + au_at,
-                        object->av1_au_cap - au_at);
+                    hidden.showable_frame = 1;
+                    au_n = av1_temporal_delimiter_obu(object->av1_au,
+                                                      object->av1_au_cap);
+                    if (au_n == 0) {
+                        decoder_fail_frame(object, E_FAIL);
+                        return;
+                    }
+                    cu_at = au_n;
+                    if (object->av1_prev_single) {
+                        /* one tile: re-emit the whole frame_obu (type 6) from the
+                         * stored tile payload, exactly like the current picture */
+                        Av1Tile one;
+
+                        one.offset = 0;
+                        one.size = object->av1_prev_tile_group_size;
+                        one.row = 0;
+                        one.column = 0;
+                        au_n = av1_frame_obu(&object->av1_prev_seq, &hidden,
+                                             &object->av1_dpb, &one, 1,
+                                             object->av1_prev_tile_group,
+                                             object->av1_prev_tile_group_size,
+                                             prev_refresh,
+                                             object->av1_au + cu_at,
+                                             object->av1_au_cap - cu_at);
+                    } else {
+                        au_n = av1_frame_header_obu(&object->av1_prev_seq, &hidden,
+                                                    &object->av1_dpb, NULL, 0,
+                                                    prev_refresh,
+                                                    object->av1_au + cu_at,
+                                                    object->av1_au_cap - cu_at);
+                    }
                     if (au_n == 0 ||
-                        object->av1_prev_tile_group_size >
-                            object->av1_au_cap - au_at - au_n) {
+                        (!object->av1_prev_single &&
+                         object->av1_prev_tile_group_size >
+                             object->av1_au_cap - cu_at - au_n)) {
                         ERROR("%s: rebuilding the hidden catch-up frame for the "
                               "previous picture failed (refresh=0x%02x) -> E_FAIL",
                               __FUNCTION__, prev_refresh);
                         decoder_fail_frame(object, E_FAIL);
                         return;
                     }
-                    au_at += au_n;
-                    memcpy(object->av1_au + au_at, object->av1_prev_tile_group,
-                           object->av1_prev_tile_group_size);
-                    catchup_bytes = au_n + object->av1_prev_tile_group_size;
-                    au_at += object->av1_prev_tile_group_size;
+                    /* §7 P3 (round 27) BUGFIX -- the catch-up TU used to be sent
+                     * 2 bytes long.  Neither branch advanced `cu_at` past the OBU it
+                     * had just written (the single-tile branch never added au_n; the
+                     * multi-tile branch copied the tile group over the frame header
+                     * at the SAME offset).  So every catch-up went to the host as
+                     * "temporal delimiter only": an empty temporal unit that updates
+                     * no DPB slot, which is exactly why the hidden pictures never
+                     * reached the host and the inter frames' references diverged.
+                     * The buffer content was written at the right place; only the
+                     * length was wrong, so the fix is the length. */
+                    cu_at += au_n;
+                    if (!object->av1_prev_single) {
+                        memcpy(object->av1_au + cu_at, object->av1_prev_tile_group,
+                               object->av1_prev_tile_group_size);
+                        cu_at += object->av1_prev_tile_group_size;
+                    }
+                    /* Send it on its own, and do not wait for a picture: a
+                     * hidden frame produces none, exactly like VP9.
+                     *
+                     * §7 P3 (round 27): with the pipeline armed this AU MUST go
+                     * through the queue, not straight to the session.  Two threads
+                     * send on one session (this DDI thread and the worker), so a
+                     * direct send here can be reordered against the queued pictures:
+                     * the host then decodes the catch-up before the picture it
+                     * references, against a DPB that has not seen that picture --
+                     * and this whole frame's references are wrong.  As a queued job
+                     * it is sent in seq order, before this picture's AU, and retired
+                     * by the worker right after the send (produces_picture=FALSE:
+                     * the host emits no CAPTURE buffer for it). */
+                    if (decoder_ctx_access(object)) {
+                        UINT cu_w = width;
+                        UINT cu_h = height;
+
+                        /* Same S_FMT(OUTPUT) geometry the serial catch-up used:
+                         * AV1 sends the CODED size, not the 64-row aligned surface
+                         * (decoder_send_geometry).  Passing the surface size here
+                         * would make this one buffer reconfigure the host's capture
+                         * queue (SOURCE_CHANGE) in the middle of the stream. */
+                        decoder_send_geometry(object, width, height, &cu_w, &cu_h);
+                        if (!pipeline_queue_frame(object, object->av1_au, cu_at,
+                                                  cu_w, cu_h, FALSE, NULL))
+                            return;
+                    } else {
+                        VIRTIO_WDDM_DecodeTiming ctiming;
+
+                        memset(&ctiming, 0, sizeof(ctiming));
+                        if (!decoder_send_unit(object, object->av1_au, cu_at,
+                                               width, height, &ctiming, NULL, NULL))
+                            return;
+                    }
+                    catchup_bytes = cu_at;
+                    decoder_av1_dump("catchup", object->av1_au, cu_at);
                     object->av1_catchups++;
+                    /* §7 P3 (round 28, show_existing_frame): the catch-up above put
+                     * the deferred HIDDEN picture into the host's DPB, but a hidden
+                     * picture is by definition never displayed: the host decodes it
+                     * and emits no CAPTURE buffer ("Skipping empty output buffer" ==
+                     * catch-up sends, measured in round 27).  The source stream
+                     * displays it with a show_existing_frame temporal unit, and that
+                     * is the one thing this UMD never sent (49.7% of t6_av1.mkv's
+                     * temporal units are exactly that: `show_existing_frame 1`,
+                     * `frame_to_show_map_idx` = one of the slots the hidden picture
+                     * refreshed).
+                     *
+                     * So: for every hidden picture the UMD deferred, once the next
+                     * picture's RefFrameMapTextureIndex has revealed which DPB slots
+                     * hold it (prev_refresh), send the 5-byte show_existing TU for one
+                     * of those slots.  The picture the host then emits is the deferred
+                     * one, and it belongs in the output view of the BeginFrame that
+                     * named it -- av1_prev_target, snapshotted at that earlier
+                     * EndFrame (a different texture: the client rotates a pool of
+                     * NV12 slices, 22 of them for PotPlayer).
+                     *
+                     * This is the same rule silime/libva-v4l2 src/backend.cpp:840-850
+                     * uses: for each DPB slot whose ref_frame_map entry is a surface
+                     * the driver is holding as a hidden picture, submit
+                     * av1_show_existing(slot) against THAT surface.  It sends no
+                     * compressed data and waits for no picture of its own: the picture
+                     * already exists inside the host.  Only hidden pictures get it --
+                     * a shown picture was sent normally and the host already owes it a
+                     * CAPTURE buffer, so a second show_existing would duplicate the
+                     * picture and shift the collector's one-job-one-picture order. */
+                    if (decoder_ctx_access(object) && decoder_ctx_access(object)->av1_show_existing &&
+                        object->av1_prev_hidden && prev_refresh != 0 &&
+                        object->av1_prev_target_valid &&
+                        object->av1_prev_target.texture) {
+                        unsigned slot = 0;
+                        UINT se_n;
+                        UINT se_w = width;
+                        UINT se_h = height;
+
+                        while (slot < AV1_NUM_REF_FRAMES &&
+                               !(prev_refresh & (1u << slot)))
+                            slot++;
+                        se_n = (slot < AV1_NUM_REF_FRAMES)
+                                   ? av1_show_existing_tu(slot, object->av1_au,
+                                                          object->av1_au_cap)
+                                   : 0u;
+                        if (se_n == 0) {
+                            object->av1_show_existing_skipped++;
+                        } else {
+                            decoder_send_geometry(object, width, height, &se_w, &se_h);
+                            if (!pipeline_queue_frame(object, object->av1_au, se_n, se_w,
+                                                      se_h, TRUE,
+                                                      &object->av1_prev_target))
+                                return;
+                            object->av1_show_existing++;
+                            if (object->av1_show_existing <= 8u)
+                                INFO("%s: show_existing_frame slot %u (mask 0x%02x, "
+                                     "%u B TU = TD 12 00 + FH 1a 01 %02x) -> the "
+                                     "hidden picture's own output view (texture %u), "
+                                     "no decode data and no wait for a new picture",
+                                     __FUNCTION__, slot, prev_refresh, se_n,
+                                     object->av1_au[4], object->av1_prev_texture);
+                        }
+                        /* The job took its own reference on the texture. */
+                        av1_prev_target_release(object);
+                    } else if (prev_refresh != 0 && object->av1_prev_hidden &&
+                               !decoder_ctx_access(object)) {
+                        object->av1_show_existing_skipped++;
+                        if (object->av1_show_existing_skipped == 1u)
+                            INFO("%s: show_existing_frame needs the pipeline (a "
+                                 "no-picture catch-up plus a picture-producing display "
+                                 "unit on one ordered queue) -> skipped on the serial "
+                                 "path", __FUNCTION__);
+                    }
+
                     if (object->av1_catchups <= 3u) {
                         INFO("%s: hidden DPB catch-up for the previous picture: "
                              "refresh_frame_flags=0x%02x (derived from texture %u, "
-                             "map %02x %02x %02x %02x %02x %02x %02x %02x), %u B",
+                             "map %02x %02x %02x %02x %02x %02x %02x %02x), %u B "
+                             "in its own temporal unit",
                              __FUNCTION__, prev_refresh, object->av1_prev_texture,
                              object->av1_pic.RefFrameMapTextureIndex[0],
                              object->av1_pic.RefFrameMapTextureIndex[1],
@@ -6071,9 +10508,10 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
                              object->av1_pic.RefFrameMapTextureIndex[4],
                              object->av1_pic.RefFrameMapTextureIndex[5],
                              object->av1_pic.RefFrameMapTextureIndex[6],
-                             object->av1_pic.RefFrameMapTextureIndex[7],
-                             object->av1_prev_tile_group_size);
+                             object->av1_pic.RefFrameMapTextureIndex[7], cu_at);
                     }
+                    /* Reuse the buffer from the start for this picture's TU. */
+                    au_at = 0;
                 }
                 /* The decoder has now applied the previous picture to its DPB
                  * (or not, with a mask of 0), which is the state this picture
@@ -6123,51 +10561,92 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
             }
         }
 
-        /* 3. This picture's frame header.  A key frame refreshes all slots by
-         *    definition; every other picture goes out with mask 0 and is
-         *    re-sent hidden once the next picture reveals its real mask. */
+        /* 3./4. This picture's temporal unit.  A key frame refreshes all slots by
+         * definition; every other picture goes out with mask 0 and is re-sent
+         * hidden once the next picture reveals its real mask.
+         *
+         * AV1FIX (2026-10-26, round 26): with one tile the frame header and the
+         * tile group go into ONE frame_obu (type 6), which is what the encoder
+         * emits and what the source stream contains; the two-OBU form is kept
+         * for a multi-tile frame.  See av1_frame_obu() in av1_params.h. */
         av1_refresh = av1_is_key ? 0xFFu : 0u;
-        au_n = av1_frame_header_obu(&object->av1_seq, &object->av1_frame,
-                                    &object->av1_dpb, NULL, 0, av1_refresh,
-                                    object->av1_au + au_at,
-                                    object->av1_au_cap - au_at);
-        if (au_n == 0) {
-            ERROR("%s: frame header synthesis failed (type=%u %ux%u tiles=%ux%u "
-                  "q=%u) -> E_FAIL", __FUNCTION__,
-                  object->av1_frame.frame_type, object->av1_frame.width,
-                  object->av1_frame.height, object->av1_frame.tile_cols,
-                  object->av1_frame.tile_rows, object->av1_frame.base_q_idx);
-            decoder_fail_frame(object, E_FAIL);
-            return;
-        }
-        au_at += au_n;
-        fh_size = au_n;
+        if (av1_tiles_n == 1u) {
+            au_n = av1_frame_obu(&object->av1_seq, &object->av1_frame,
+                                 &object->av1_dpb, av1_tiles, av1_tiles_n,
+                                 object->bitstream, object->bitstream_size,
+                                 av1_refresh, object->av1_au + au_at,
+                                 object->av1_au_cap - au_at);
+            if (au_n == 0) {
+                ERROR("%s: frame_obu synthesis failed (type=%u %ux%u q=%u, "
+                      "%u B tile) -> E_FAIL", __FUNCTION__,
+                      object->av1_frame.frame_type, object->av1_frame.width,
+                      object->av1_frame.height, object->av1_frame.base_q_idx,
+                      av1_tiles[0].size);
+                decoder_fail_frame(object, E_FAIL);
+                return;
+            }
+            fh_size = au_n;
+            tg_size = 0;
+            au_at += au_n;
+            /* keep the tile payload for the hidden re-send */
+            if (!decoder_reserve(&object->av1_prev_tile_group,
+                                 &object->av1_prev_tile_group_cap,
+                                 av1_tiles[0].size))
+                return;
+            memcpy(object->av1_prev_tile_group,
+                   object->bitstream + av1_tiles[0].offset, av1_tiles[0].size);
+            object->av1_prev_tile_group_size = av1_tiles[0].size;
+            object->av1_prev_single = TRUE;
+        } else {
+            au_n = av1_frame_header_obu(&object->av1_seq, &object->av1_frame,
+                                        &object->av1_dpb, NULL, 0, av1_refresh,
+                                        object->av1_au + au_at,
+                                        object->av1_au_cap - au_at);
+            if (au_n == 0) {
+                ERROR("%s: frame header synthesis failed (type=%u %ux%u tiles=%ux%u "
+                      "q=%u) -> E_FAIL", __FUNCTION__,
+                      object->av1_frame.frame_type, object->av1_frame.width,
+                      object->av1_frame.height, object->av1_frame.tile_cols,
+                      object->av1_frame.tile_rows, object->av1_frame.base_q_idx);
+                decoder_fail_frame(object, E_FAIL);
+                return;
+            }
+            au_at += au_n;
+            fh_size = au_n;
 
-        /* 4. The tile group, and a copy of it for the hidden re-send. */
-        au_n = av1_tile_group_obu(&object->av1_seq, &object->av1_frame, av1_tiles,
-                                  av1_tiles_n, object->bitstream,
-                                  object->bitstream_size,
-                                  object->av1_au + au_at,
-                                  object->av1_au_cap - au_at);
-        if (au_n == 0) {
-            ERROR("%s: tile group assembly failed (%u record(s), %u B bitstream, "
-                  "%ux%u tiles) -> E_FAIL", __FUNCTION__, av1_tiles_n,
-                  object->bitstream_size, object->av1_frame.tile_cols,
-                  object->av1_frame.tile_rows);
-            decoder_fail_frame(object, E_FAIL);
-            return;
+            au_n = av1_tile_group_obu(&object->av1_seq, &object->av1_frame,
+                                      av1_tiles, av1_tiles_n, object->bitstream,
+                                      object->bitstream_size,
+                                      object->av1_au + au_at,
+                                      object->av1_au_cap - au_at);
+            if (au_n == 0) {
+                ERROR("%s: tile group assembly failed (%u record(s), %u B "
+                      "bitstream, %ux%u tiles) -> E_FAIL", __FUNCTION__,
+                      av1_tiles_n, object->bitstream_size,
+                      object->av1_frame.tile_cols, object->av1_frame.tile_rows);
+                decoder_fail_frame(object, E_FAIL);
+                return;
+            }
+            if (!decoder_reserve(&object->av1_prev_tile_group,
+                                 &object->av1_prev_tile_group_cap, au_n))
+                return;
+            memcpy(object->av1_prev_tile_group, object->av1_au + au_at, au_n);
+            object->av1_prev_tile_group_size = au_n;
+            object->av1_prev_single = FALSE;
+            tg_size = au_n;
+            au_at += au_n;
         }
-        if (!decoder_reserve(&object->av1_prev_tile_group,
-                             &object->av1_prev_tile_group_cap, au_n))
-            return;
-        memcpy(object->av1_prev_tile_group, object->av1_au + au_at, au_n);
-        object->av1_prev_tile_group_size = au_n;
-        tg_size = au_n;
-        au_at += au_n;
 
         object->av1_au_size = au_at;
         send_data = object->av1_au;
         send_size = object->av1_au_size;
+        if (decoder_av1_dump_enabled()) {
+            decoder_av1_dump("picparams", &object->av1_pic,
+                             (UINT)sizeof(object->av1_pic));
+            decoder_av1_dump(object->av1_pic.format.show_frame ? "picture"
+                                                               : "hidden",
+                             object->av1_au, object->av1_au_size);
+        }
         /* AV1FIX (2026-10-25): the first four units of a session are logged
          * field by field.  The old line only fired while av1_frames == 0 -- i.e.
          * for EVERY unit of a session that never decoded anything -- and it
@@ -6176,7 +10655,12 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
          * values below are exactly the ones the host parses, so the next run can
          * be compared against `ffmpeg -bsf:v trace_headers` on the source file
          * without guessing which bit went wrong. */
-        if (object->av1_pic_buffers <= 4u) {
+        /* §7 P3 (round 28): the field-by-field unit line now covers the first 24
+         * pictures instead of 4.  The show_existing experiment has to be read
+         * against the source stream's own TU sequence (key, hidden 16, hidden 8,
+         * hidden 4, hidden 2, shown 1, show_existing 6, shown 3, ...), so 4 lines
+         * were not enough to tell which picture each display unit belongs to. */
+        if (object->av1_pic_buffers <= 24u) {
             INFO("%s: AV1 unit #%llu: %u B = TD(2) + %sseq(%u) + %scatch-up(%u) + "
                  "frame header(%u) + tile group(%u) | %u tile(s) %ux%u mask=0x%02x "
                  "| pic: type=%u show=%u oh=%u/%u primary_ref=%u refs=%u.%u.%u.%u."
@@ -6199,6 +10683,354 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
                  (UINT)(object->av1_pic.frame_refs[5].Index & 7u),
                  (UINT)(object->av1_pic.frame_refs[6].Index & 7u));
         }
+
+        /* AV1FIX (2026-10-26, round 26): a picture the client marked hidden
+         * (show_frame=0) is an alt-ref: it updates the host DPB and the client
+         * never displays it, so there is no CAPTURE buffer to wait for and
+         * nothing to upload.  This is the VP9FIX rule from round 25, which turned
+         * 8 x 2000 ms of timeouts into zero.
+         *
+         * §7 P3 (round 28) -- TWO MODES, and the default changed after measurement:
+         *
+         *  A) VIRTIO_WDDM_AV1_SHOWN_ALWAYS=1 (default): the picture is sent with
+         *     show_frame = 1 and refresh_frame_flags = 0 at ITS OWN EndFrame, so
+         *     the host owes it a CAPTURE buffer like any other picture, and the
+         *     hidden DPB catch-up (step 1, with the true mask) still re-decodes it
+         *     into the slots the encoder chose.  Cost: one extra host input per
+         *     hidden picture (~2 inputs per client AU).  Why: the host's output
+         *     delay is counted in INPUTS (round 28 measured 27 in -> 10 out, i.e.
+         *     17), so extra inputs are exactly what makes the FIRST picture come
+         *     out while the client is still starved; and a hidden input is not
+         *     displayable, i.e. it can never produce the picture the client's own
+         *     show_existing will display.
+         *
+         *  B) VIRTIO_WDDM_AV1_SHOWN_ALWAYS=0 (round 27 behaviour): the picture is
+         *     not sent here at all and is forwarded by the catch-up only; with
+         *     VIRTIO_WDDM_AV1_SHOW_EXISTING=1 a 5-byte show_existing_frame unit is
+         *     then queued with the next picture, targeting this picture's own
+         *     output view.  Round 28 measured what the host does with that unit:
+         *     it answers with an EMPTY output buffer (4 hidden + 4 show_existing
+         *     sends in the first second -> 8 "Skipping empty output buffer", 0
+         *     CAPTURE buffers), i.e. c2.qti.av1.decoder does not display a
+         *     reference.  ffmpeg proves the 5 bytes themselves are right, so this
+         *     is a host limitation, and mode A is the default because of it. */
+        if (object->av1_pic.format.show_frame == 0) {
+            object->av1_hidden_frames++;
+            if (decoder_ctx_access(object) && decoder_ctx_access(object)->av1_shown_always) {
+                if (object->av1_hidden_frames <= 4u) {
+                    INFO("%s: AV1 hidden picture %llu (%u B, show_frame=0): sent SHOWN "
+                         "so the host emits a picture for it (the client's own "
+                         "show_existing reuses this surface); the DPB catch-up with its "
+                         "true refresh mask follows with the next picture",
+                         __FUNCTION__, (unsigned long long)object->av1_hidden_frames,
+                         object->av1_au_size);
+                }
+            } else {
+                object->av1_frames++;
+                if (object->av1_frame.frame_type != AV1_FRAME_KEY) {
+                    object->av1_prev_frame = object->av1_frame;
+                    object->av1_prev_seq = object->av1_seq;
+                    object->av1_prev_texture = object->av1_pic.CurrPicTextureIndex;
+                    object->av1_prev_pending = TRUE;
+                    /* The picture is hidden, so no CAPTURE buffer will ever be
+                     * produced for it by decoding alone.  Remember (a) that it owes
+                     * a display and (b) which output view the client named for it,
+                     * so the show_existing_frame unit emitted with the next picture
+                     * can deliver the picture into THAT surface.  A release of an
+                     * older snapshot first: at most one hidden picture is deferred
+                     * at a time (each one is forwarded by the very next picture's
+                     * catch-up). */
+                    av1_prev_target_release(object);
+                    if (decoder_ctx_access(object) && decoder_ctx_access(object)->av1_show_existing) {
+                        object->av1_prev_target_valid =
+                            pipeline_capture_target_ex(object, &object->av1_prev_target,
+                                                       FALSE);
+                        object->av1_prev_hidden = object->av1_prev_target_valid;
+                        if (object->av1_prev_target_valid)
+                            object->av1_prev_target.texture->lpVtbl->AddRef(
+                                object->av1_prev_target.texture);
+                        else if (object->av1_hidden_frames <= 3u)
+                            INFO("%s: hidden picture %llu has no usable output view -> it "
+                                 "will be decoded (catch-up) but cannot be displayed by a "
+                                 "show_existing_frame unit", __FUNCTION__,
+                                 (unsigned long long)object->av1_hidden_frames);
+                    }
+                }
+                if (object->av1_hidden_frames <= 4u) {
+                    INFO("%s: AV1 hidden picture %llu (%u B, show_frame=0): deferred to "
+                         "the DPB catch-up of the next picture, no picture expected and "
+                         "no mask-0 duplicate on the wire%s", __FUNCTION__,
+                         (unsigned long long)object->av1_hidden_frames,
+                         object->av1_au_size,
+                         object->av1_prev_hidden
+                             ? "; its output view is held for the show_existing_frame unit"
+                             : "");
+                }
+                return; /* nothing was sent for this picture; the catch-up forwards it */
+            }
+        }
+        /* §7 P3 (round 28): on the wire every coded picture is a SHOWN frame.  A
+         * hidden one was sent above with the client's own header, so flip the bit
+         * the writer reads -- refresh_frame_flags stays 0 here and the catch-up
+         * carries the encoder's mask, which is what keeps the host DPB exact. */
+        object->av1_frame.show_frame = 1;
+
+#else /* !VIRTIO_WDDM_AV1_LEGACY_BUILD -- stateful DPB port, 2026-10-27 */
+
+        /* ------------------------------------------------------------------ *
+         * AV1 STATEFUL PORT (libva-v4l2 src/stateful/av1_bitstream.cc)
+         *
+         * The protocol lives in av1_dpb.h; this block is only the DDI's side of
+         * the reference's decoder loop:
+         *
+         *   tag this picture's output view  -> submit() returns 0..N units ->
+         *   queue/send them IN DECODE ORDER, each with the output view of the
+         *   tag it belongs to (the shared tail below owns the ONE unit that
+         *   belongs to this BeginFrame on the serial path).
+         *
+         * The three unit kinds submit() can return, oldest first:
+         *   - a hidden catch-up for a picture an earlier submit had to emit
+         *     provisionally (mask 0) before its exact mask was derivable; it
+         *     produces NO picture (the VP9 hidden-frame rule, round 25),
+         *   - the picture the previous submit held for the lookahead, now coded
+         *     with its EXACT refresh mask and sent once (no re-decode),
+         *   - this picture, when it needs no lookahead (a shown key frame).
+         * ------------------------------------------------------------------ */
+        {
+            Av1ReadyFrame ready[3];
+            unsigned nready = 0, ri, tag_now;
+            BOOL defer_ok, serial_current = FALSE;
+
+            /* 1. The tag: this BeginFrame's output view.  A held picture produces
+             *    its frame during a LATER EndFrame, so the view has to survive in
+             *    the tag table (the reference's ReadyFrame::tag). */
+            object->av1_tag_next = (object->av1_tag_next + 1u) & 7u;
+            tag_now = (unsigned)object->av1_tag_next;
+            defer_ok = (decoder_ctx_access(object) != NULL) && decoder_ctx_access(object)->av1_lookahead;
+            if (!av1_tag_store(object, tag_now, width, height)) {
+                ERROR("%s: AV1 picture has no usable output view to remember (pipeline "
+                      "deferral needs it) -> E_FAIL", __FUNCTION__);
+                av1_abort_picture(object);
+                decoder_fail_frame(object, E_FAIL);
+                return;
+            }
+
+            /* 2. Hand the picture to the builder.  It COPIES the tile payloads:
+             *    a deferred picture is assembled while BITSTREAM already carries
+             *    the next access unit. */
+            if (!av1_builder_begin_picture(&object->av1_builder, &object->av1_seq,
+                                           &object->av1_frame, av1_tiles, av1_tiles_n,
+                                           object->bitstream, object->bitstream_size,
+                                           width, height)) {
+                ERROR("%s: AV1 builder refused the picture (%u tile record(s), %u B "
+                      "bitstream) -> E_FAIL", __FUNCTION__, av1_tiles_n,
+                      object->bitstream_size);
+                av1_abort_picture(object);
+                decoder_fail_frame(object, E_FAIL);
+                return;
+            }
+
+            /* 3. submit_picture(): 0..N temporal units in decode order. */
+            {
+                LONGLONG t_sub0 = decoder_qpc_now();
+
+                nready = av1_builder_submit(&object->av1_builder, tag_now, defer_ok,
+                                            ready, 3);
+                /* 2026-10-27 (round 1027b): the feed-rate line the user asked for.
+                 * `gap` is the interval since the previous AU arrived, so a stall
+                 * anywhere upstream of this point shows up as one long gap; `build`
+                 * is what the builder itself cost (it copies the tile payloads and
+                 * serialises the headers, so it must stay in the sub-millisecond
+                 * range). */
+                {
+                    LONGLONG t_now = decoder_qpc_now();
+
+                    if (object->av1_pic_buffers <= 40u) {
+                        double gap = object->av1_feed_prev_qpc
+                                         ? decoder_qpc_ms(object->av1_feed_prev_qpc, t_now)
+                                         : -1.0;
+                        INFO("%s: av1 feed: au#%llu at t=%lld ms (gap=%.2f ms, "
+                             "build=%.2f ms, client=%u B/%u tile(s))", __FUNCTION__,
+                             (unsigned long long)object->av1_pic_buffers,
+                             (long long)t_now, gap,
+                             decoder_qpc_ms(t_sub0, t_now), object->bitstream_size,
+                             av1_tiles_n);
+                    }
+                    object->av1_feed_prev_qpc = t_now;
+                }
+            }
+            if (object->av1_pic_buffers <= 24u) {
+                INFO("%s: AV1 unit #%llu: submit -> %u unit(s), defer=%d, "
+                     "pending=%d provisional=%d | pic: type=%u show=%u oh=%u/%u "
+                     "primary_ref=%u refs=%u.%u.%u.%u.%u.%u.%u tex=%u map=%02x%02x"
+                     "%02x%02x%02x%02x%02x%02x | builder: submitted=%u deferred=%u "
+                     "catchups=%u provisional=%u interp=%u",
+                     __FUNCTION__, (unsigned long long)object->av1_pic_buffers, nready,
+                     (int)defer_ok, (int)object->av1_builder.pending.valid,
+                     (int)object->av1_builder.provisional.valid,
+                     (UINT)object->av1_pic.format.frame_type,
+                     (UINT)object->av1_pic.format.show_frame,
+                     (UINT)object->av1_pic.order_hint,
+                     (UINT)object->av1_pic.order_hint_bits,
+                     (UINT)object->av1_pic.primary_ref_frame,
+                     (UINT)(object->av1_pic.frame_refs[0].Index & 7u),
+                     (UINT)(object->av1_pic.frame_refs[1].Index & 7u),
+                     (UINT)(object->av1_pic.frame_refs[2].Index & 7u),
+                     (UINT)(object->av1_pic.frame_refs[3].Index & 7u),
+                     (UINT)(object->av1_pic.frame_refs[4].Index & 7u),
+                     (UINT)(object->av1_pic.frame_refs[5].Index & 7u),
+                     (UINT)(object->av1_pic.frame_refs[6].Index & 7u),
+                     (UINT)object->av1_pic.CurrPicTextureIndex,
+                     (UINT)object->av1_pic.RefFrameMapTextureIndex[0],
+                     (UINT)object->av1_pic.RefFrameMapTextureIndex[1],
+                     (UINT)object->av1_pic.RefFrameMapTextureIndex[2],
+                     (UINT)object->av1_pic.RefFrameMapTextureIndex[3],
+                     (UINT)object->av1_pic.RefFrameMapTextureIndex[4],
+                     (UINT)object->av1_pic.RefFrameMapTextureIndex[5],
+                     (UINT)object->av1_pic.RefFrameMapTextureIndex[6],
+                     (UINT)object->av1_pic.RefFrameMapTextureIndex[7],
+                     object->av1_builder.n_submit, object->av1_builder.n_deferred,
+                     object->av1_builder.n_catchup,
+                     object->av1_builder.n_provisional,
+                      (UINT)object->av1_pic.interp_filter);
+            }
+
+            /* 4. Send/queue the units in decode order. */
+            for (ri = 0; ri < nready; ri++) {
+                Av1ReadyFrame *rf = &ready[ri];
+                UINT sw = rf->width ? rf->width : width;
+                UINT sh = rf->height ? rf->height : height;
+                BOOL current = (rf->tag == tag_now);
+
+                /* Builder observation only: dpb-picture/dpb-catchup may never
+                 * reach SEND.  The worker's distinct "send" record is attempted,
+                 * not accepted, and shares the same process dump budget.
+                 * §7 P3 (round 47): the dump carries the fields that make the
+                 * unit identifiable when the bytes are replayed through ffmpeg:
+                 * which client picture it belongs to, its order hint, whether it
+                 * is coded to produce a picture, the refresh mask and the tag
+                 * whose output view it must land in. */
+                {
+                    char dump_meta[128];
+
+                    snprintf(dump_meta, sizeof(dump_meta),
+                             "pic=%llu oh=%u shown=%u refresh=0x%02x tag=%u",
+                             (unsigned long long)object->av1_pic_buffers,
+                             rf->order_hint, rf->shows_picture,
+                             rf->refresh_frame_flags, rf->tag);
+                    decoder_av1_dump_meta(rf->shows_picture ? "dpb-picture"
+                                                            : "dpb-catchup",
+                                          rf->au, rf->au_size, dump_meta);
+                }
+
+                if (current && rf->shows_picture && decoder_ctx_access(object) == NULL) {
+                    /* SERIAL path: the shared tail below sends, fetches and uploads
+                     * THIS picture (it owns the wait, the mapping and the
+                     * statistics).  Every other unit of this submit -- a catch-up,
+                     * or a picture released from the lookahead -- must be sent
+                     * here, before it, to keep decode order. */
+                    serial_current = TRUE;
+                    send_data = rf->au;
+                    send_size = rf->au_size;
+                    continue;
+                }
+
+                if (!rf->shows_picture) {
+                    object->av1_dpb_catchups++;
+                } else if (!current) {
+                    object->av1_dpb_deferred++;
+                }
+
+                if (decoder_ctx_access(object)) {
+                    VIRTIO_WDDM_PipelineTarget tgt;
+                    BOOL have_target = av1_tag_target(object, rf->tag, &tgt);
+
+                    if (rf->shows_picture && !current && !have_target) {
+                        /* Never route a deferred picture's frame to the CURRENT
+                         * output view: that surface belongs to another frame and
+                         * the picture would land in the wrong texture. */
+                        ERROR("%s: no output-view snapshot for the deferred picture "
+                              "(tag %u) -> E_FAIL", __FUNCTION__, rf->tag);
+                        av1_abort_picture(object);
+                        decoder_fail_frame(object, E_FAIL);
+                        return;
+                    }
+                    if (!pipeline_queue_frame_nw(object, rf->au, rf->au_size, sw, sh,
+                                                 rf->shows_picture ? TRUE : FALSE,
+                                                 (!current && have_target) ? &tgt
+                                                                           : NULL)) {
+                        av1_tag_release_slot(object, rf->tag);
+                        return; /* pipeline_queue_frame recorded the failure */
+                    }
+                    if (!current)
+                        av1_tag_release_slot(object, rf->tag);
+                } else {
+                    /* SERIAL path, a unit that is not this BeginFrame's picture:
+                     * send it and do not wait for a picture (a catch-up produces
+                     * none by construction; a released picture's output view
+                     * belongs to an earlier BeginFrame). */
+                    VIRTIO_WDDM_DecodeTiming ctiming;
+
+                    memset(&ctiming, 0, sizeof(ctiming));
+                    if (!decoder_send_unit(object, rf->au, rf->au_size, sw, sh,
+                                           &ctiming, NULL, NULL)) {
+                        av1_tag_release_slot(object, rf->tag);
+                        return;
+                    }
+                    av1_tag_release_slot(object, rf->tag);
+                }
+            }
+
+            /* 2026-10-27 (round 1027b): the second line the user asked for.  With
+             * `no_wait` this EndFrame has done nothing but enqueue (and possibly
+             * evict), so it returns S_OK immediately -- no wait, no fetch, no
+             * timeout, no upload.  The picture (if any) is uploaded by the read
+             * path or by the worker's drain. */
+            if (object->av1_pic_buffers <= 60u) {
+                /* round 46: the exact line the task book asks for.  `waited` is
+                 * how long THIS EndFrame took before returning to the caller
+                 * (microseconds); if it stays in the tens of us while the feed
+                 * gap is ~800 ms, the wait is NOT here. */
+                double waited_us = decoder_qpc_ms(t_ef0, decoder_qpc_now()) * 1000.0;
+
+                INFO("%s: av1 endframe: ret=0x%08lx waited=%.0f us ready=%u pending=%d "
+                     "deferred=%u (in flight %u, evicted %llu, dropped %llu, "
+                     "slot waits %llu)", __FUNCTION__, (unsigned long)S_OK, waited_us,
+                     nready, (int)object->av1_builder.pending.valid,
+                     (UINT)object->av1_dpb_deferred,
+                     decoder_ctx_access(object) ? (unsigned)decoder_ctx_access(object)->jobs_in_flight : 0u,
+                     decoder_ctx_access(object)
+                         ? (unsigned long long)decoder_ctx_access(object)->av1_slot_evictions
+                         : 0ull,
+                     decoder_ctx_access(object)
+                         ? (unsigned long long)decoder_ctx_access(object)->av1_feed_dropped
+                         : 0ull,
+                     decoder_ctx_access(object)
+                         ? (unsigned long long)decoder_ctx_access(object)->av1_feed_waits
+                         : 0ull);
+            }
+            if (!serial_current) {
+                /* This EndFrame produces no upload: the picture is held for the
+                 * lookahead (nready == 0) or every unit went to the pipeline. */
+                if (nready == 0) {
+                    object->av1_dpb_deferred++;
+                    if (object->av1_dpb_deferred <= 8u) {
+                        INFO("%s: AV1 picture #%llu held for the one-frame lookahead "
+                             "(submit produced 0 temporal units): its exact "
+                             "refresh_frame_flags is only derivable from the NEXT "
+                             "picture's reference map -- no picture is produced by "
+                             "this EndFrame, and that is the design (reference "
+                             "submit_picture()/PictureResult::current_deferred)",
+                             __FUNCTION__,
+                             (unsigned long long)object->av1_dpb_deferred);
+                    }
+                }
+                return;
+            }
+            /* serial_current: fall through to the shared tail, which sends this
+             * picture and uploads it into the output view of THIS BeginFrame. */
+        }
+#endif /* VIRTIO_WDDM_AV1_LEGACY_BUILD */
     } else {
 
         /* Build the bytes that go to the host: the assembled access unit, with
@@ -6303,7 +11135,7 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
         }
         object->pic_this_frame = FALSE;
 
-        if (object->frames > 0) {
+        if (decoder_stream_started(object)) {
             LARGE_INTEGER now;
             LONGLONG gap_ms = 0;
             BOOL params_changed = FALSE;
@@ -6389,25 +11221,25 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
          * one-shot-driver retry) is the shared decoder_decode_unit().  This is
          * the H.264 path and the HEVC path: both hand over one complete Annex-B
          * access unit with the parameter sets in front. */
-        if (object->pipeline != NULL) {
-            /* PIPELINE (2026-10-25): queue this access unit for the worker and
-             * upload the OLDEST finished job instead of waiting for this one.
-             * The worker's send of this AU and its host decode wait therefore
-             * overlap the upload below, which is where the frame budget is. */
+        if (decoder_ctx_access(object) != NULL) {
+            /* §5.4 DEFERRED (round 23): queue this access unit and return.  The
+             * worker's vm_send + host decode wait now overlap everything the
+             * application does until it first READS the texture this BeginFrame
+             * selected; the wait and the upload happen there
+             * (decoder_texture_sync), not here.  The old form waited for the
+             * previous job inside this very EndFrame and deadlocked the first
+             * frame of the stream (04-测试记录/22-并发mapping-上机.md §4.2). */
             UINT pipe_w = width;
             UINT pipe_h = height;
 
             decoder_send_geometry(object, width, height, &pipe_w, &pipe_h);
-            if (!pipeline_frame(object, send_data, send_size, pipe_w, pipe_h, &pipe_frame))
+            /* §7 P3 (round 27): every AU that reaches here is a picture the host
+             * will emit (H.264/HEVC always; AV1 because hidden pictures returned
+             * early above), so it asks the collector for exactly one picture. */
+            if (!pipeline_queue_frame(object, send_data, send_size, pipe_w, pipe_h,
+                                      TRUE, NULL))
                 return; /* the failure is recorded; the next BeginFrame reports it */
-            pipeline_used = TRUE;
-            pipeline_fill = pipe_frame.fill;
-            info = pipe_frame.info;
-            frame_readable = pipe_frame.readable;
-            t_send0 = pipe_frame.start_qpc;
-            send_ms = pipe_frame.send_ms;
-            get_ms = pipe_frame.fetch_ms;
-            elapsed = pipe_frame.queue_ms > 0.0 ? (UINT)pipe_frame.queue_ms : 0u;
+            pipeline_queued = TRUE;
         } else {
             if (!decoder_decode_unit(object, send_data, send_size, width, height,
                                      &timing, &info))
@@ -6422,7 +11254,14 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
          * for the one-frame lookahead that recovers its real mask when the next
          * picture's RefFrameMapTextureIndex arrives.  (This describes the AU
          * this EndFrame submitted, not the picture the upload writes, so it runs
-         * in both modes.) */
+         * in both modes.)
+         *
+         * AV1 STATEFUL PORT (2026-10-27): LEGACY ONLY -- with the builder driving
+         * the path, av1_dpb_update() and the pending/provisional bookkeeping run
+         * inside av1_builder_submit() (for EVERY unit it returns, in decode
+         * order), so repeating them here would apply the DPB update twice and
+         * corrupt the mirror. */
+#if VIRTIO_WDDM_AV1_LEGACY_BUILD
         if (object->codec == VIRTIO_WDDM_CODEC_AV1) {
             Av1FrameParams *av1_done = &object->av1_frame;
             object->av1_frames++;
@@ -6430,13 +11269,49 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
                 object->av1_key_frames++;
                 av1_dpb_update(&object->av1_dpb, av1_done, 0xFFu);
                 object->av1_prev_pending = FALSE;
+                av1_prev_target_release(object);
             } else {
                 object->av1_prev_frame = *av1_done;
                 object->av1_prev_seq = object->av1_seq;
                 object->av1_prev_texture = object->av1_pic.CurrPicTextureIndex;
                 object->av1_prev_pending = TRUE;
+                /* §7 P3 (round 28): this picture was SHOWN, i.e. it was just
+                 * submitted and the host owes it a CAPTURE buffer.  It must NOT get
+                 * a show_existing_frame unit later (that would display it twice and
+                 * shift the collector's one-job-one-picture order), so the "owes a
+                 * display" flag stays off and any snapshot from an older hidden
+                 * picture is dropped here. */
+                av1_prev_target_release(object);
             }
         }
+#endif
+        if (pipeline_queued) {
+            /* §5.4: nothing below this point belongs to the deferred path -- the
+             * upload, its statistics and every failure branch run on the thread
+             * that reads the texture.  Returning here is the whole point of the
+             * change: the decode thread must be free to assemble the next access
+             * unit while the host is still decoding this one. */
+            if (decoder_ctx_access(object) && decoder_ctx_access(object)->trace)
+                INFO("%s: deferred return t=%lld: EndFrame %llu handed the AU to the "
+                     "worker and returned (no wait, no upload on this thread)",
+                     __FUNCTION__, (long long)decoder_qpc_now(),
+                     (unsigned long long)decoder_ctx_access(object)->submit_seq);
+            return;
+        }
+    }
+
+    /* VP9TRACE (2026-10-25): stage probe.  trace_no is the 1-based frame number
+     * the upload tail is working on; trace_on keeps the log short (the first
+     * four frames plus every 60th). */
+    trace_no = (UINT64)object->frames + 1u;
+    trace_on = (trace_no <= 4u) ? TRUE : FALSE;
+    if (trace_on) {
+        INFO("%s: trace #%llu step 1: decoded %ux%u stride=%u size=%u fourcc=%08x "
+             "direct_ok=%d direct_active=%d nv12=%p nv12_cap=%u surface=%ux%u",
+             __FUNCTION__, (unsigned long long)trace_no, info.Width, info.Height,
+             info.Stride, info.Size, info.FourCC, (int)object->direct_ok,
+             (int)object->direct_active, (void *)object->nv12, object->nv12_cap,
+             width, height);
     }
 
     if (info.Width == 0 || info.Height == 0 || info.Width > width ||
@@ -6471,6 +11346,12 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
         decoder_drop_direct(object);
         decoder_fail_frame(object, E_FAIL);
         return;
+    }
+    if (trace_on) {
+        INFO("%s: trace #%llu step 2: src=%p readable=%llu (pool=%d) target=%p",
+             __FUNCTION__, (unsigned long long)trace_no, (const void *)frame_src,
+             (unsigned long long)frame_readable,
+             (int)(!pipeline_used && object->direct_active), (void *)resource->base.pResource);
     }
 
     /* PIPELINE: the upload target snapshot.  In the pipeline the picture being
@@ -6570,6 +11451,14 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
             return;
         }
     }
+    if (trace_on) {
+        INFO("%s: trace #%llu step 3: read_need ok stride=%u height=%u readable=%llu "
+             "subresource=%u/%u tex=%p fmt=%u %ux%u", __FUNCTION__,
+             (unsigned long long)trace_no, stride, info.Height,
+             (unsigned long long)frame_readable, subresource,
+             target_array * target_mips, (void *)target_texture, (UINT)dst_format,
+             target_w, target_h);
+    }
 
     /* Luma statistics for the on-device log: the same numbers P2-1's test
      * printed, so a frame can be compared against the known-good reference.
@@ -6600,6 +11489,12 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
             }
         }
         y_mean = y_samples ? (double)y_sum / (double)y_samples : 0.0;
+    }
+    if (trace_on) {
+        INFO("%s: trace #%llu step 4: luma done want_stats=%d ymean=%.2f "
+             "nonzero=%llu/%llu -> upload", __FUNCTION__,
+             (unsigned long long)trace_no, (int)want_stats, y_mean,
+             (unsigned long long)y_nonzero, (unsigned long long)y_samples);
     }
 
     /* P2-2j: the frame belongs in the subresource the application selected with
@@ -6673,12 +11568,23 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
     }
 
     t_up0 = decoder_qpc_now();
+    if (trace_on) {
+        INFO("%s: trace #%llu step 5: upload begin tex=%p sub=%u %ux%u stride=%u "
+             "fourcc=%08x src=%p (mip %u slice %u of %u x %u mips)", __FUNCTION__,
+             (unsigned long long)trace_no, (void *)target_texture, subresource,
+             info.Width, info.Height, upload_stride, upload_fourcc,
+             (const void *)upload_src, view_mip, view_slice, target_array, mips);
+    }
     hr = virtio_wddm_dxvk_video_upload_frame(device->base.pCtx1,
                                             target_texture, subresource,
                                             upload_src, info.Width, info.Height,
                                             upload_stride, upload_fourcc);
     t_up1 = decoder_qpc_now();
     up_ms = decoder_qpc_ms(t_up0, t_up1);
+    if (trace_on) {
+        INFO("%s: trace #%llu step 6: upload returned 0x%08lx in %.2f ms", __FUNCTION__,
+             (unsigned long long)trace_no, (unsigned long)hr, up_ms);
+    }
     if (FAILED(hr)) {
         ERROR("%s: %s upload into %ux%u texture (subresource %u = mip %u slice %u) "
               "failed: 0x%08lx -> E_FAIL",
@@ -6692,7 +11598,18 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
     /* P-BATCH ZEROCOPY: the pixels are in the texture now (UpdateSubresource
      * copied them into DXVK's staging buffer synchronously), so the capture
      * buffer can go straight back to the device. */
+    if (trace_on) {
+        INFO("%s: trace #%llu step 7: drop_direct begin (active=%d index=%u)", __FUNCTION__,
+             (unsigned long long)trace_no, (int)object->direct_active,
+             object->direct_map.Index);
+    }
     decoder_drop_direct(object);
+    if (trace_on) {
+        INFO("%s: trace #%llu step 8: drop_direct done (active=%d releases=%llu failures=%llu)",
+             __FUNCTION__, (unsigned long long)trace_no, (int)object->direct_active,
+             (unsigned long long)object->direct_releases,
+             (unsigned long long)object->direct_release_failures);
+    }
 
     if (pipeline_fill) {
         /* The placeholder picture is not a decoded frame: it must not move
@@ -6700,7 +11617,7 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
         INFO("%s: pipeline placeholder written into subresource %u (tex=%p) "
              "while job %llu is still in flight",
              __FUNCTION__, subresource, (void *)target_texture,
-             (unsigned long long)object->pipeline->submit_seq);
+             (unsigned long long)decoder_ctx_access(object)->submit_seq);
         return;
     }
 
@@ -6711,12 +11628,22 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
      * this shows the decoded picture, the upload landed where the log says;
      * if it shows zeros, the write never reached the texture the renderer
      * samples. First 3 frames only -- a readback waits for the GPU. */
-    if (object->frames <= 3u) {
+    if (object->frames <= 3u && decoder_texstats_enabled()) {
         double ma = -1.0, mb = -1.0, mc = -1.0;
         UINT sampled = 0;
-        HRESULT shr = virtio_wddm_dxvk_video_tex_stats(
+        HRESULT shr;
+        if (trace_on) {
+            INFO("%s: trace #%llu step 9: tex_stats begin (tex=%p sub=%u %ux%u fmt=%u)",
+                 __FUNCTION__, (unsigned long long)trace_no, (void *)target_texture,
+                 subresource, target_w, target_h, (UINT)dst_format);
+        }
+        shr = virtio_wddm_dxvk_video_tex_stats(
             device->base.pDev1, device->base.pCtx1, target_texture, subresource,
             &ma, &mb, &mc, &sampled);
+        if (trace_on) {
+            INFO("%s: trace #%llu step 10: tex_stats returned 0x%08lx", __FUNCTION__,
+                 (unsigned long long)trace_no, (unsigned long)shr);
+        }
         if (SUCCEEDED(shr)) {
             INFO("%s: (P2-2J diag v3) texture readback tex=%p sub=%u fmt=%u %ux%u: "
                  "Ymean=%.2f Umean=%.2f Vmean=%.2f (%u px)", __FUNCTION__,
@@ -6782,8 +11709,8 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
                  "drain_wait=%.2f ms, %u job(s) in flight, gen %llu", __FUNCTION__,
                  (unsigned long long)frame_no, pipe_frame.send_ms, pipe_frame.fetch_ms,
                  pipe_frame.queue_ms, pipe_frame.lead_ms, pipe_frame.wait_ms,
-                 (unsigned)object->pipeline->jobs_in_flight,
-                 (unsigned long long)object->pipeline->generation);
+                 (unsigned)decoder_ctx_access(object)->jobs_in_flight,
+                 (unsigned long long)decoder_ctx_access(object)->generation);
         }
     } else {
         VERBOSE("%s: frame %llu in %lu ms: %ux%u stride=%u size=%u (send=%.2f get=%.2f "
@@ -7432,6 +12359,21 @@ static HRESULT APIENTRY virtio_wddm_video_video_processor_blt(
     UINT stream_count, CONST D3D11_1DDI_VIDEO_PROCESSOR_STREAM *pStreams) {
     VIRTIO_WDDM_Device *device = hDevice.pDrvPrivate;
     VIRTIO_WDDM_DdiStamp ddi = video_ddi_enter();
+    HRESULT read_gate=tritonReadGate(&device->base);
+    if(FAILED(read_gate)) return read_gate;
+
+    if (g_pipeline_trace) {
+        /* §5.4b trace: the render thread reached a blit.  If a run stops before
+         * this line, the application never asked for another picture; if it stops
+         * after it (at the sync inside the stream loop), the read path is where it
+         * went. */
+        static volatile LONG blt_logs;
+        LONG bn = InterlockedIncrement(&blt_logs);
+
+        if (bn <= 200)
+            INFO("%s: enter #%ld streams=%u t=%lld", __FUNCTION__, bn, stream_count,
+                 (long long)decoder_qpc_now());
+    }
 
     VIRTIO_WDDM_VideoProcessor *object =
         video_processor_from_handle(hProcessor, __FUNCTION__);
@@ -7451,6 +12393,51 @@ static HRESULT APIENTRY virtio_wddm_video_video_processor_blt(
         return E_INVALIDARG;
     }
 
+    /* Identity refresh uses current strong COM resources and the view's original
+     * COM descriptor. Existing external DDI serialization still governs wrapper
+     * rotation/destroy vs BLT; no new concurrency guarantee is introduced. */
+    VIRTIO_WDDM_Resource *refresh_output = output->resource.pDrvPrivate;
+    if (!refresh_output || !refresh_output->base.pResource) return E_INVALIDARG;
+    HRESULT refresh_hr = virtio_wddm_dxvk_video_refresh_view(
+        output->refresh_device, output->refresh_enum, refresh_output->base.pResource,
+        TRUE, &output->dxvk_view);
+    if (FAILED(refresh_hr)) return refresh_hr;
+    for (UINT vi=0; vi<stream_count; ++vi) {
+        if (!pStreams[vi].Enable) continue;
+        VIRTIO_WDDM_VideoProcessorInputView *iv=pStreams[vi].hInputSurface.pDrvPrivate;
+        if (!iv || iv->magic != VIRTIO_WDDM_VIDEO_MAGIC_VIEW || !iv->dxvk_view) return E_INVALIDARG;
+        VIRTIO_WDDM_Resource *ir=iv->resource.pDrvPrivate;
+        if (!ir || !ir->base.pResource) return E_INVALIDARG;
+        refresh_hr=virtio_wddm_dxvk_video_refresh_view(
+            iv->refresh_device, iv->refresh_enum, ir->base.pResource, FALSE, &iv->dxvk_view);
+        if (FAILED(refresh_hr)) return refresh_hr;
+    }
+
+    /* VP_IDENTITY_DIAG_BEGIN */
+    /* Observe within existing DDI entry lifetime. No new concurrency guarantee:
+     * raw wrapper/view access has the same external serialization assumption as BLT. */
+    if (virtio_vp_identity_enabled()) {
+        VIRTIO_WDDM_Resource *or = output->resource.pDrvPrivate;
+        ULONG_PTR actual = virtio_wddm_dxvk_video_view_resource_identity(output->dxvk_view,TRUE);
+        virtio_vp_identity_emit(1,or && actual != (ULONG_PTR)or->base.pResource,
+            "kind=vp_output device=%p frame=%u view=%p wrapper=%p rtres=%p current=%p actual=0x%llx image=0x%016llx km=0x%08x mip=%u slice=%u array=%u",
+            device,output_frame,output->dxvk_view,or,or ? or->base.hRTResource.handle : NULL,
+            or ? or->base.pResource : NULL,(unsigned long long)actual,or ? (unsigned long long)or->image : 0,
+            or ? or->base.hKMAllocation : 0,output->mip_slice,output->first_array_slice,output->array_size);
+        for (UINT vi=0; vi<stream_count; ++vi) {
+            if (!pStreams[vi].Enable) continue;
+            VIRTIO_WDDM_VideoProcessorInputView *iv=pStreams[vi].hInputSurface.pDrvPrivate;
+            if (!iv || iv->magic != VIRTIO_WDDM_VIDEO_MAGIC_VIEW || !iv->dxvk_view) continue;
+            VIRTIO_WDDM_Resource *ir=iv->resource.pDrvPrivate;
+            ULONG_PTR ia=virtio_wddm_dxvk_video_view_resource_identity(iv->dxvk_view,FALSE);
+            virtio_vp_identity_emit(1,ir && ia != (ULONG_PTR)ir->base.pResource,
+                "kind=vp_input device=%p frame=%u stream=%u enable=%u view=%p wrapper=%p rtres=%p current=%p actual=0x%llx image=0x%016llx km=0x%08x mip=%u slice=%u array=%u",
+                device,output_frame,vi,(unsigned)pStreams[vi].Enable,iv->dxvk_view,ir,ir ? ir->base.hRTResource.handle : NULL,
+                ir ? ir->base.pResource : NULL,(unsigned long long)ia,ir ? (unsigned long long)ir->image : 0,
+                ir ? ir->base.hKMAllocation : 0,iv->mip_slice,iv->first_array_slice,iv->array_size);
+        }
+    }
+    /* VP_IDENTITY_DIAG_END */
     VIRTIO_WDDM_VideoStream streams[VIRTIO_WDDM_VIDEO_MAX_INPUT_STREAMS];
     for (UINT i = 0; i < stream_count; i++) {
         CONST D3D11_1DDI_VIDEO_PROCESSOR_STREAM *in = &pStreams[i];
@@ -7478,6 +12465,29 @@ static HRESULT APIENTRY virtio_wddm_video_video_processor_blt(
                       (void *)input);
                 return E_INVALIDARG;
             }
+            /* §5.4 DEFERRED (round 23): THIS is where the decoded picture is
+             * read.  Wait for the media + the upload of exactly this subresource
+             * before the blit records any GPU command that samples it, and do not
+             * present a stale picture if the job failed: a DDI entry point that
+             * returns an HRESULT propagates the error, unlike Triton's void hook. */
+            if (input->resource.pDrvPrivate) {
+                VIRTIO_WDDM_Resource *ires = input->resource.pDrvPrivate;
+                UINT imips = ires->base.MipLevels ? ires->base.MipLevels : 1u;
+                UINT isub = input->mip_slice + input->first_array_slice * imips;
+                HRESULT shr;
+
+                if (ires->base.pResource) {
+                    shr = decoder_texture_sync_hook((void *)ires->base.pResource,isub,FALSE,TR_READ_WAIT,NULL);
+                    if (FAILED(shr)) {
+                        tritonReadFailure(&device->base,shr);
+                        ERROR("%s: stream %u: no picture for tex=%p subresource %u "
+                              "(sync 0x%08lx) -> refusing the blit instead of "
+                              "presenting stale pixels", __FUNCTION__, i,
+                              (void *)ires->base.pResource, isub, (unsigned long)shr);
+                        return shr;
+                    }
+                }
+            }
             input_view = input->dxvk_view;
         } else if (in->Enable) {
             ERROR("%s: stream %u is enabled but has no input surface", __FUNCTION__, i);
@@ -7492,9 +12502,27 @@ static HRESULT APIENTRY virtio_wddm_video_video_processor_blt(
         };
     }
 
+    void *read_textures[VIRTIO_WDDM_VIDEO_MAX_INPUT_STREAMS]={0};
+    UINT64 read_tickets[VIRTIO_WDDM_VIDEO_MAX_INPUT_STREAMS]={0};
+    UINT pinned=0;
+    for(UINT ri=0;ri<stream_count;++ri) {
+        const D3D11_1DDI_VIDEO_PROCESSOR_STREAM *in=&pStreams[ri];
+        if(!in->Enable || !in->hInputSurface.pDrvPrivate) continue;
+        VIRTIO_WDDM_VideoProcessorInputView *iv=in->hInputSurface.pDrvPrivate;
+        VIRTIO_WDDM_Resource *res=iv->resource.pDrvPrivate;
+        if(!res || !res->base.pResource) continue;
+        UINT sub=iv->mip_slice+iv->first_array_slice*(res->base.MipLevels ? res->base.MipLevels : 1u);
+        HRESULT admit=decoder_texture_sync_hook(res->base.pResource,sub,FALSE,TR_READ_ADMIT,&read_tickets[pinned]);
+        if(FAILED(admit)) {
+            for(UINT u=0;u<pinned;++u) decoder_texture_sync_hook(read_textures[u],0,TRUE,TR_READ_RELEASE,&read_tickets[u]);
+            tritonReadFailure(&device->base,admit); return admit;
+        }
+        read_textures[pinned++]=res->base.pResource;
+    }
     HRESULT hr = virtio_wddm_dxvk_video_blt(object->dxvk_context, object->dxvk_processor,
-                                            output->dxvk_view, output_frame,
-                                            stream_count, streams);
+                                             output->dxvk_view, output_frame,
+                                             stream_count, streams);
+    for(UINT u=0;u<pinned;++u) decoder_texture_sync_hook(read_textures[u],0,TRUE,TR_READ_RELEASE,&read_tickets[u]);
 
     /* One line per process for the first blit: enough to prove on the guest
      * that pixels went through DXVK, without flooding a per-frame log. */
@@ -7547,7 +12575,7 @@ static HRESULT APIENTRY virtio_wddm_video_video_processor_blt(
 
         /* P2-2J diag v3: what did the blit actually write into the render
          * target? First 3 blits only (a readback waits for the GPU). */
-        if (blit_no <= 3 && device) {
+        if (blit_no <= 3 && device && decoder_texstats_enabled()) {
             VIRTIO_WDDM_Resource *ores = output->resource.pDrvPrivate;
             if (ores && ores->base.pResource) {
                 UINT omips = ores->base.MipLevels ? ores->base.MipLevels : 1u;
@@ -7708,6 +12736,9 @@ static HRESULT APIENTRY virtio_wddm_video_create_video_processor_input_view(
         return hr;
     }
 
+    virtio_wddm_dxvk_video_retain_refresh_context(enumeration->dxvk_device, enumeration->dxvk_enum);
+    object->refresh_device = enumeration->dxvk_device;
+    object->refresh_enum = enumeration->dxvk_enum;
     object->magic = VIRTIO_WDDM_VIDEO_MAGIC_VIEW;
     VERBOSE("%s: view=%p res=%p fourcc=0x%x slice=%u/%u dxvk=%p", __FUNCTION__,
             (void *)object, pArgs->hDrvResource.pDrvPrivate, pArgs->FourCC,
@@ -7732,6 +12763,9 @@ static VOID APIENTRY virtio_wddm_video_destroy_video_processor_input_view(
     if (object && object->magic == VIRTIO_WDDM_VIDEO_MAGIC_VIEW) {
         virtio_wddm_dxvk_video_destroy_input_view(object->dxvk_view);
         object->dxvk_view = NULL;
+        virtio_wddm_dxvk_video_release_refresh_context(object->refresh_device, object->refresh_enum);
+        object->refresh_device = NULL;
+        object->refresh_enum = NULL;
         object->magic = 0;
     }
 }
@@ -7783,6 +12817,9 @@ static HRESULT APIENTRY virtio_wddm_video_create_video_processor_output_view(
         return hr;
     }
 
+    virtio_wddm_dxvk_video_retain_refresh_context(enumeration->dxvk_device, enumeration->dxvk_enum);
+    object->refresh_device = enumeration->dxvk_device;
+    object->refresh_enum = enumeration->dxvk_enum;
     object->magic = VIRTIO_WDDM_VIDEO_MAGIC_VIEW;
     /* P2-2J diag v2: the renderer's present target, in the same tex= space. */
     INFO("%s: view=%p res=%p tex=%p slice=%u/%u dxvk=%p (P2-2J diag v2)",
@@ -7801,6 +12838,9 @@ static VOID APIENTRY virtio_wddm_video_destroy_video_processor_output_view(
     if (object && object->magic == VIRTIO_WDDM_VIDEO_MAGIC_VIEW) {
         virtio_wddm_dxvk_video_destroy_output_view(object->dxvk_view);
         object->dxvk_view = NULL;
+        virtio_wddm_dxvk_video_release_refresh_context(object->refresh_device, object->refresh_enum);
+        object->refresh_device = NULL;
+        object->refresh_enum = NULL;
         object->magic = 0;
     }
 }
@@ -7980,6 +13020,85 @@ static VOID APIENTRY virtio_wddm_video_get_capture_handle(
 /* Table population                                                          */
 /* ------------------------------------------------------------------------- */
 
+/* 2026-10-27 (round 46): time the three decode DDIs at the table entry, so the
+ * measurement covers every return path without touching the function bodies.
+ * One summary line per DDI when the 60th call completes -- the same window as
+ * the per-AU feed log -- plus the running counters stay readable in the stats
+ * the harness already parses.  The counters are per decoder object and the D3D11
+ * runtime calls these three from the decode thread only. */
+static void decoder_ddi_note(VIRTIO_WDDM_VideoDecoder *object, UINT which,
+                             LONGLONG t0) {
+    static const char *const names[3] = {"BeginFrame", "SubmitBuffers", "EndFrame"};
+    double ms;
+
+    if (!object || which > 2u || t0 == 0)
+        return;
+    ms = decoder_qpc_ms(t0, decoder_qpc_now());
+    object->ddi_n[which]++;
+    object->ddi_sum[which] += ms;
+    if (ms > object->ddi_max[which])
+        object->ddi_max[which] = ms;
+    if (object->ddi_n[which] == 60u)
+        INFO("ddi timing: %s n=60 sum=%.1f avg=%.2f max=%.2f ms (round 46)",
+             names[which], object->ddi_sum[which], object->ddi_sum[which] / 60.0,
+             object->ddi_max[which]);
+}
+
+static HRESULT APIENTRY virtio_wddm_video_decoder_begin_frame_timed(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecode,
+    CONST D3D11_1DDIARG_VIDEODECODERBEGINFRAME *pArgs) {
+    VIRTIO_WDDM_VideoDecoder *runtime=hDecode.pDrvPrivate;
+    VIRTIO_WDDM_DecodePipeline *pin=runtime_ctx_pin(runtime);
+    if(runtime_is_life(runtime) && !pin) return E_ABORT;
+    if(pin && !life_runtime_enter(pin)) { life_unref(pin); return E_ABORT; }
+    RUNTIME_CTX_SCOPE scope;
+    runtime_scope_enter(&scope,runtime,pin);
+    LONGLONG t0 = decoder_qpc_now();
+    HRESULT hr = virtio_wddm_video_video_decoder_begin_frame(hDevice, hDecode, pArgs);
+
+    decoder_ddi_note(hDecode.pDrvPrivate, 0u, t0);
+    life_runtime_leave(pin);
+    runtime_scope_leave(&scope);
+    return hr;
+    
+}
+
+static HRESULT APIENTRY virtio_wddm_video_decoder_submit_buffers_timed(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecode, UINT count,
+    CONST D3D11_1DDI_VIDEO_DECODER_BUFFER_DESC *pBuffers) {
+    VIRTIO_WDDM_VideoDecoder *runtime=hDecode.pDrvPrivate;
+    VIRTIO_WDDM_DecodePipeline *pin=runtime_ctx_pin(runtime);
+    if(runtime_is_life(runtime) && !pin) return E_ABORT;
+    if(pin && !life_runtime_enter(pin)) { life_unref(pin); return E_ABORT; }
+    RUNTIME_CTX_SCOPE scope;
+    runtime_scope_enter(&scope,runtime,pin);
+    LONGLONG t0 = decoder_qpc_now();
+    HRESULT hr = virtio_wddm_video_video_decoder_submit_buffers(hDevice, hDecode, count,
+                                                                pBuffers);
+
+    decoder_ddi_note(hDecode.pDrvPrivate, 1u, t0);
+    life_runtime_leave(pin);
+    runtime_scope_leave(&scope);
+    return hr;
+    
+}
+
+static VOID APIENTRY virtio_wddm_video_decoder_end_frame_timed(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecode) {
+    VIRTIO_WDDM_VideoDecoder *runtime=hDecode.pDrvPrivate;
+    VIRTIO_WDDM_DecodePipeline *pin=runtime_ctx_pin(runtime);
+    if(runtime_is_life(runtime) && !pin) { decoder_end_pin_failed(runtime); return; }
+    if(pin && !life_runtime_enter(pin)) { life_unref(pin); decoder_end_pin_failed(runtime); return; }
+    RUNTIME_CTX_SCOPE scope;
+    runtime_scope_enter(&scope,runtime,pin);
+    LONGLONG t0 = decoder_qpc_now();
+
+    virtio_wddm_video_video_decoder_end_frame(hDevice, hDecode);
+    decoder_ddi_note(hDecode.pDrvPrivate, 2u, t0);
+    life_runtime_leave(pin);
+    runtime_scope_leave(&scope);
+}
+
 /* The 11.1 table, in WDK order. Kept as one list because the same entries have
  * to land in the 11.1, 2.0 and 2.1 tables, which all start with these 81
  * pointers in this order (2.0 adds 13, 2.1 adds 15 more after them). */
@@ -7995,9 +13114,9 @@ static VOID APIENTRY virtio_wddm_video_get_capture_handle(
     X(pfnCreateVideoDecoder, virtio_wddm_video_create_video_decoder) \
     X(pfnDestroyVideoDecoder, virtio_wddm_video_destroy_video_decoder) \
     X(pfnVideoDecoderExtension, virtio_wddm_video_video_decoder_extension) \
-    X(pfnVideoDecoderBeginFrame, virtio_wddm_video_video_decoder_begin_frame) \
-    X(pfnVideoDecoderEndFrame, virtio_wddm_video_video_decoder_end_frame) \
-    X(pfnVideoDecoderSubmitBuffers, virtio_wddm_video_video_decoder_submit_buffers) \
+    X(pfnVideoDecoderBeginFrame, virtio_wddm_video_decoder_begin_frame_timed) \
+    X(pfnVideoDecoderEndFrame, virtio_wddm_video_decoder_end_frame_timed) \
+    X(pfnVideoDecoderSubmitBuffers, virtio_wddm_video_decoder_submit_buffers_timed) \
     X(pfnCalcPrivateVideoProcessorEnumSize, virtio_wddm_video_calc_private_video_processor_enum_size) \
     X(pfnCreateVideoProcessorEnum, virtio_wddm_video_create_video_processor_enum) \
     X(pfnDestroyVideoProcessorEnum, virtio_wddm_video_destroy_video_processor_enum) \
@@ -8203,7 +13322,7 @@ static HRESULT APIENTRY virtio_wddm_retrieve_subobject(
 
     INFO("%s: RetrieveSubObject(id=%u) -> table=%p size=%zu via=%s relocate=%d",
          __FUNCTION__, SubDeviceID, (void *)table, (size_t)need, via, (int)relocate);
-    INFO("%s: video DDI installed (build=HEVC-MAIN10-20261025/1.0.0.21, id=%u size=%zu): "
+    INFO("%s: video DDI installed (build=CONCURRENT-MAPPING-20261025/1.0.0.22, id=%u size=%zu): "
          "decoder=H.264 "
          "VLD NoFGT + VP9 VLD Profile0 + HEVC VLD Main + AV1 VLD Profile0 + HEVC VLD "
          "Main10 when a P010 surface exists / output NV12 or P010, Main10 = P010 only "
@@ -8213,7 +13332,10 @@ static HRESULT APIENTRY virtio_wddm_retrieve_subobject(
          "(VM_IOCTL_MAP_FRAME, staging GET_FRAME fallback), VP9 boundary checks + "
          "paired MAP_FRAME/RELEASE_FRAME, AV1: coded S_FMT geometry + timeout is "
          "not a refusal + capture buffer requeued on every failed get + segmented "
-         "host-wait/copy timing, HEVC Main10: VM_OPEN_CODEC_HEVC_MAIN10 (driver "
+         "host-wait/copy timing, P4-13 REQFIX: vm_send err=1450 (host buffer "
+         "allocation) keeps the session and drops only that AU + send-failure "
+         "backoff + granted capture depth, HEVC Main10: VM_OPEN_CODEC_HEVC_MAIN10 "
+         "(driver "
          "1.0.0.21 asks S_FMT CAPTURE for V4L2_PIX_FMT_P010, NV12 fallback) + "
          "10-bit SPS synthesis (profile_idc 2) + P010 two-plane upload",
          __FUNCTION__, SubDeviceID, (size_t)need);

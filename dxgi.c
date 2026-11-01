@@ -16,6 +16,56 @@
 #include "dxgi.h"
 #include "resource.h"
 
+/* VP_IDENTITY_DIAG_BEGIN */
+#include "vp_identity_trace.h"
+#include <stdarg.h>
+static volatile LONG vp_identity_rotation_seq;
+static volatile LONG vp_identity_event_seq;
+static volatile LONG vp_identity_counts[4];
+BOOL virtio_vp_identity_enabled(void) {
+    char value[2] = {0};
+    return GetEnvironmentVariableA("VIRTIO_WDDM_VP_IDENTITY_TRACE", value, sizeof(value)) == 1 && value[0] == '1';
+}
+void virtio_vp_identity_rotation(void) {
+    if (virtio_vp_identity_enabled()) InterlockedIncrement(&vp_identity_rotation_seq);
+}
+void virtio_vp_identity_emit(unsigned category, BOOL mismatch, const char *format, ...) {
+    static const LONG limits[4] = {100, 150, 50, 32};
+    if (!virtio_vp_identity_enabled() || category > 2) return;
+    unsigned bucket = mismatch ? 3 : category;
+    LONG count = InterlockedIncrement(&vp_identity_counts[bucket]);
+    if (count > limits[bucket]) {
+        if (count == limits[bucket] + 1) {
+            LARGE_INTEGER end_qpc;
+            QueryPerformanceCounter(&end_qpc);
+            INFO("VP_IDENTITY truncated bucket=%u limit=%ld pid=%lu tid=%lu qpc=%lld event_seq=%ld rotation_seq=%ld", bucket, limits[bucket], GetCurrentProcessId(), GetCurrentThreadId(), (long long)end_qpc.QuadPart,
+                 InterlockedIncrement(&vp_identity_event_seq),InterlockedCompareExchange(&vp_identity_rotation_seq,0,0));
+        }
+        return;
+    }
+    char detail[1536];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(detail, sizeof(detail), format, args);
+    va_end(args);
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    INFO("VP_IDENTITY event_seq=%ld rotation_seq=%ld bucket=%u bucket_event=%ld mismatch=%u pid=%lu tid=%lu qpc=%lld %s",
+         InterlockedIncrement(&vp_identity_event_seq), InterlockedCompareExchange(&vp_identity_rotation_seq,0,0),
+         bucket, count, (unsigned)mismatch, GetCurrentProcessId(), GetCurrentThreadId(), (long long)qpc.QuadPart, detail);
+}
+static void vp_identity_rotation_members(VIRTIO_WDDM_Device *device, DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES *args, const char *phase) {
+    if (!virtio_vp_identity_enabled()) return;
+    for (size_t i=0; i<args->Resources; ++i) {
+        VIRTIO_WDDM_Resource *r=(void *)args->pResources[i];
+        virtio_vp_identity_emit(0,FALSE,"kind=rotation phase=%s device=%p members=%u index=%u wrapper=%p rtres=%p current=%p image=0x%016llx memory=0x%016llx km=0x%08x fmt=%u",
+            phase,device,args->Resources,(unsigned)i,r,r->base.hRTResource.handle,r->base.pResource,
+            (unsigned long long)r->image,(unsigned long long)r->memory,r->base.hKMAllocation,(unsigned)r->base.Format);
+    }
+}
+/* VP_IDENTITY_DIAG_END */
+
+
 /*
 
 Presentable formats:
@@ -194,6 +244,12 @@ HRESULT APIENTRY virtio_wddm_present(DXGI_DDI_ARG_PRESENT *pArgs) {
          src ? src->base.hKMAllocation : 0, (unsigned) pArgs->hDstResource,
          pArgs->Flags.Value, (unsigned long long)device->base.presentFenceValue);
 
+    /* VP_IDENTITY_DIAG_BEGIN */
+    virtio_vp_identity_emit(2,FALSE,"kind=present device=%p wrapper=%p rtres=%p current=%p image=0x%016llx km=0x%08x flags=0x%08x fence=%llu",
+        device,src,src ? src->base.hRTResource.handle : NULL,src ? src->base.pResource : NULL,
+        src ? (unsigned long long)src->image : 0,src ? src->base.hKMAllocation : 0,pArgs->Flags.Value,
+        (unsigned long long)device->base.presentFenceValue);
+    /* VP_IDENTITY_DIAG_END */
     // Looks like Blt could be zero for primaries
     //ASSERT(pArgs->Flags.Blt);
     ASSERT(pArgs->hDstResource == 0);
@@ -342,6 +398,10 @@ HRESULT APIENTRY virtio_wddm_rotate_resource_identities(DXGI_DDI_ARG_ROTATE_RESO
     }
 
     VIRTIO_WDDM_Device *device = (void *) pArgs->hDevice;
+    /* VP_IDENTITY_DIAG_BEGIN */
+    virtio_vp_identity_rotation();
+    vp_identity_rotation_members(device,pArgs,"before");
+    /* VP_IDENTITY_DIAG_END */
     VIRTIO_WDDM_Resource first = *(VIRTIO_WDDM_Resource *) pArgs->pResources[0];
 
     for (size_t i = 0; i < pArgs->Resources - 1; i++) {
@@ -361,6 +421,9 @@ HRESULT APIENTRY virtio_wddm_rotate_resource_identities(DXGI_DDI_ARG_ROTATE_RESO
     last->base.hRTResource = res;
     last->base.pViewList = views;
 
+    /* VP_IDENTITY_DIAG_BEGIN */
+    vp_identity_rotation_members(device,pArgs,"after");
+    /* VP_IDENTITY_DIAG_END */
     for (size_t i = 0; i < pArgs->Resources; i++) {
         VIRTIO_WDDM_Resource *resource = (void *) pArgs->pResources[i];
         tritonResourceRecreateViews(&device->base, &resource->base);

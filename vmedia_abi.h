@@ -18,12 +18,28 @@
 #include <stdint.h>
 
 #define VMEDIA_ABI_VERSION  1
-/* 1.0.0.21 = HEVC-MAIN10: VM_OPEN_CODEC_HEVC_MAIN10 (4) and the P010 CAPTURE
- * negotiation behind it.  No IOCTL or struct layout change against 1.0.0.20. */
-#define VMEDIA_DRIVER_VERSION 0x00010015u
+/* 1.0.0.24 = SESSION-OWNERSHIP (2026-10-26).  The driver keeps two sessions per
+ * function, hands out a generation *token* at OPEN (VM_OPEN_OUT.SessionToken)
+ * and checks it on every later IOCTL, so a replaced decoder's CLOSE/FLUSH/SEND/
+ * RELEASE can never touch the session that replaced it.  SEND moved to a second
+ * IOCTL code (VM_IOCTL_SEND_BITSTREAM_EX) because its header is followed by the
+ * access unit: a longer header under the old code would shift the bitstream.
+ * A driver older than VMEDIA_SESSION_OWNERSHIP_MIN_VERSION answers the EX code
+ * with ERROR_INVALID_FUNCTION; this client then falls back to the legacy code
+ * (and logs once). */
+#define VMEDIA_DRIVER_VERSION 0x0001001Au
+#define VMEDIA_TAG_MIN_VERSION 0x0001001Au
+/* First driver version that reads VM_OPEN_OUT.SessionToken and the SessionToken
+ * field of the extended CLOSE/FLUSH/RELEASE/GET_FRAME/MAP_FRAME/SEND_EX input
+ * structs (media-wdm 1.0.0.24).  Below it every request is "legacy" (token 0)
+ * and the driver serves it as long as it is the only session. */
+#define VMEDIA_SESSION_OWNERSHIP_MIN_VERSION 0x00010018u
+/* How many sessions one driver function keeps alive (2: Chromium opens two
+ * decoder wrappers).  A client may hold this many OPEN handles at once. */
+#define VMEDIA_MAX_SESSIONS 2u
 #define VMEDIA_DEVICE_TYPE 0x22u
 
-/* CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800..0x806, METHOD_BUFFERED, FILE_ANY_ACCESS) */
+/* CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800..0x807, METHOD_BUFFERED, FILE_ANY_ACCESS) */
 #define VM_IOCTL_OPEN                0x00222000u  /* open a decoder/encoder session */
 #define VM_IOCTL_SEND_BITSTREAM      0x00222004u  /* send one H.264 access unit */
 #define VM_IOCTL_GET_FRAME           0x00222008u  /* block for one decoded NV12 frame */
@@ -31,6 +47,10 @@
 #define VM_IOCTL_FLUSH               0x00222010u  /* P3-2: drop queued AUs/frames, new session */
 #define VM_IOCTL_MAP_FRAME           0x00222014u  /* P-BATCH ZEROCOPY: decoded frame, mapped */
 #define VM_IOCTL_RELEASE_FRAME       0x00222018u  /* P-BATCH ZEROCOPY: unmap + requeue */
+#define VM_IOCTL_SEND_BITSTREAM_EX   0x0022201Cu  /* SESSION-OWNERSHIP: SEND + SessionToken */
+#define VM_IOCTL_SEND_BITSTREAM_TAG  0x00222020u  /* TAG: EX header + Tag u64 */
+#define VM_IOCTL_GET_FRAME_TAG       0x00222024u  /* TAG: Info + Tag/token */
+#define VM_IOCTL_MAP_FRAME_TAG       0x00222028u  /* TAG: Map + Tag/token */
 
 /* Device interface class advertised with WdfDeviceCreateDeviceInterface. */
 #define VMEDIA_INTERFACE_GUID \
@@ -99,13 +119,17 @@ typedef struct _VM_OPEN_IN {
 
 
 typedef struct _VM_OPEN_OUT {
-    uint32_t       SessionId;  /* virtio-media session id */
+    uint32_t       SessionId;  /* virtio-media (host) session id */
     uint32_t       IsDecoder;  /* 1 if this function decoded the card name as decoder */
     uint32_t       DeviceCaps;  /* virtio-media device_caps */
     uint32_t       DeviceType;  /* virtio-media device_type */
     uint32_t       PoolSize;  /* mapped media_host bytes (0 for encoder) */
-    uint32_t       DriverVersion;  /* 0x00010007 */
-    uint32_t       Reserved0;  /* 0 */
+    uint32_t       DriverVersion;  /* 0x00010018 in 1.0.0.24 */
+    uint32_t       SessionToken;  /* SESSION-OWNERSHIP: the generation this OPEN
+                                   * created.  Non-zero on a 1.0.0.24+ driver,
+                                   * 0 on an older one (it was Reserved0).
+                                   * Send it back in every later IOCTL; a FLUSH
+                                   * replaces it with a new one. */
     uint32_t       Reserved1;  /* 0 */
 } VM_OPEN_OUT;
 
@@ -115,6 +139,17 @@ typedef struct _VM_SEND_IN {
     uint32_t       Size;  /* H.264 bytes following this header */
     uint32_t       Flags;  /* bit 0 = request DECODER_CMD STOP after STREAMON */
 } VM_SEND_IN;
+
+/* SESSION-OWNERSHIP (1.0.0.24): VM_IOCTL_SEND_BITSTREAM_EX input, followed by
+ * `Size` bytes of access unit.  The first four fields are a VM_SEND_IN. */
+typedef struct _VM_SEND_IN_EX {
+    uint32_t       Width;
+    uint32_t       Height;
+    uint32_t       Size;
+    uint32_t       Flags;
+    uint32_t       SessionToken;  /* VM_OPEN_OUT.SessionToken (0 = legacy) */
+    uint32_t       Reserved0;     /* must be 0 */
+} VM_SEND_IN_EX;
 
 typedef struct _VM_SEND_OUT {
     uint32_t       Width;  /* capture width accepted by S_FMT */
@@ -130,6 +165,10 @@ typedef struct _VM_SEND_OUT {
 typedef struct _VM_GET_FRAME_IN {
     uint32_t       TimeoutMs;  /* 0 = poll once, else wait up to this many ms */
     uint32_t       Flags;  /* must be 0 */
+    uint32_t       SessionToken;  /* SESSION-OWNERSHIP: VM_OPEN_OUT.SessionToken
+                                   * (0 = legacy client).  An older driver reads
+                                   * only the first 8 bytes and ignores this. */
+    uint32_t       Reserved0;     /* must be 0 */
 } VM_GET_FRAME_IN;
 
 typedef struct _VM_FRAME_INFO {
@@ -144,22 +183,35 @@ typedef struct _VM_FRAME_INFO {
 } VM_FRAME_INFO;
 
 typedef struct _VM_CLOSE_IN {
-    uint32_t       SessionId;  /* 0 = the current session */
+    uint32_t       SessionId;  /* virtio-media host session id (informational) */
     uint32_t       Flags;  /* must be 0 */
+    uint32_t       SessionToken;  /* SESSION-OWNERSHIP: VM_OPEN_OUT.SessionToken.
+                                   * A CLOSE whose token is not the live session is
+                                   * IGNORED by the driver (success, one log line)
+                                   * instead of tearing down somebody else's
+                                   * session.  0 = legacy (accepted only while it
+                                   * is the only open session). */
+    uint32_t       Reserved0;     /* must be 0 */
 } VM_CLOSE_IN;
 
 /* P3-2: drop everything queued and restart the host session (seek / loop /
  * pause-resume). The next SEND must be an IDR with SPS/PPS. */
 typedef struct _VM_FLUSH_IN {
-    uint32_t       SessionId;  /* 0 = the current session */
+    uint32_t       SessionId;  /* virtio-media host session id (informational) */
     uint32_t       Flags;  /* must be 0 */
+    uint32_t       SessionToken;  /* SESSION-OWNERSHIP: the token to flush; the
+                                   * answer carries the replacement's token and
+                                   * the old one is dead from then on. */
+    uint32_t       Reserved0;     /* must be 0 */
 } VM_FLUSH_IN;
 
 typedef struct _VM_FLUSH_OUT {
-    uint32_t       SessionId;  /* session id that replaces the flushed one */
+    uint32_t       SessionId;  /* host session id that replaces the flushed one */
     uint32_t       DroppedAu;  /* access units queued but never dequeued */
     uint32_t       DroppedFrames;  /* decoded frames the client never picked up */
-    uint32_t       Reserved0;  /* 0 */
+    uint32_t       SessionToken;  /* SESSION-OWNERSHIP: the NEW generation token.
+                                   * Use it for every IOCTL from now on; 0 means
+                                   * the driver predates 1.0.0.24 (Reserved0). */
 } VM_FLUSH_OUT;
 
 /* Offsets inside the VM_IOCTL_GET_FRAME output buffer. */
@@ -187,9 +239,26 @@ typedef struct _VM_FLUSH_OUT {
  * frame. */
 #define VMEDIA_MAP_FRAME_MIN_DRIVER_VERSION 0x00010012u
 
+/* CONCURRENT-MAPPING (1.0.0.22): first driver version whose MAP_FRAME may be
+ * called while other capture buffers are still mapped, and whose RELEASE_FRAME
+ * frees exactly the index it is given.  A driver below this answers the second
+ * MAP_FRAME with ERROR_BAD_COMMAND, so a UMD that keeps more than one frame in
+ * flight has to check VM_OPEN_OUT.DriverVersion against it first. */
+#define VMEDIA_MULTI_MAPPING_MIN_DRIVER_VERSION 0x00010016u
+
+/* CONCURRENT-MAPPING: VM_RELEASE_FRAME_IN.Index value that means "release every
+ * mapping of this session" (the pre-1.0.0.22 "whatever is mapped"). */
+#define VM_RELEASE_ALL_INDEX 0xFFFFFFFFu
+
 typedef struct _VM_MAP_FRAME_IN {
     uint32_t       TimeoutMs;  /* 0 = poll once, else wait up to this many ms */
     uint32_t       Flags;      /* must be 0 */
+    uint32_t       SessionToken;  /* SESSION-OWNERSHIP: VM_OPEN_OUT.SessionToken
+                                   * (0 = legacy client).  A replaced session's
+                                   * MAP_FRAME is refused and nothing is checked
+                                   * out, so it can never read another session's
+                                   * frames. */
+    uint32_t       Reserved0;     /* must be 0 */
 } VM_MAP_FRAME_IN;
 
 typedef struct _VM_FRAME_MAP {
@@ -209,22 +278,49 @@ typedef struct _VM_FRAME_MAP {
 } VM_FRAME_MAP;
 
 typedef struct _VM_RELEASE_FRAME_IN {
-    uint32_t       SessionId;  /* 0 = the current session */
+    uint32_t       SessionId;  /* virtio-media host session id (informational) */
     uint32_t       Index;      /* VM_FRAME_MAP.Index, or 0xFFFFFFFF */
+    uint32_t       SessionToken;  /* SESSION-OWNERSHIP: VM_OPEN_OUT.SessionToken.
+                                   * A release from a replaced session is refused
+                                   * (ERROR_BAD_COMMAND) and the live session's
+                                   * mapping for the same index is untouched. */
+    uint32_t       Reserved0;     /* must be 0 */
 } VM_RELEASE_FRAME_IN;
+
+/* TAG v1.0.0.26. Tag is an internal job id, not application PTS.
+ * SEND payload starts at 32; GET_TAG pixels start at 48. Legacy offsets stay 16/32.
+ * Tag must be in [1, INT64_MAX]; no fallback is allowed for tag APIs. */
+typedef struct _VM_SEND_IN_TAG {
+    uint32_t Width, Height, Size, Flags, SessionToken, Reserved0;
+    uint64_t Tag;
+} VM_SEND_IN_TAG;
+typedef struct _VM_FRAME_TAG_OUT {
+    VM_FRAME_INFO Info;
+    uint64_t Tag;
+    uint32_t SessionToken, Reserved0;
+} VM_FRAME_TAG_OUT;
+typedef struct _VM_FRAME_MAP_TAG_OUT {
+    VM_FRAME_MAP Map;
+    uint64_t Tag;
+    uint32_t SessionToken, Reserved0;
+} VM_FRAME_MAP_TAG_OUT;
+typedef char vm_assert_send_tag[(sizeof(VM_SEND_IN_TAG) == 32) ? 1 : -1];
+typedef char vm_assert_frame_tag[(sizeof(VM_FRAME_TAG_OUT) == 48) ? 1 : -1];
+typedef char vm_assert_map_tag[(sizeof(VM_FRAME_MAP_TAG_OUT) == 64) ? 1 : -1];
 
 /* Compile-time layout checks. */
 typedef char vm_assert_VM_OPEN_IN_size[(sizeof(VM_OPEN_IN) == 8) ? 1 : -1];
 typedef char vm_assert_VM_OPEN_OUT_size[(sizeof(VM_OPEN_OUT) == 32) ? 1 : -1];
 typedef char vm_assert_VM_SEND_IN_size[(sizeof(VM_SEND_IN) == 16) ? 1 : -1];
+typedef char vm_assert_VM_SEND_IN_EX_size[(sizeof(VM_SEND_IN_EX) == 24) ? 1 : -1];
 typedef char vm_assert_VM_SEND_OUT_size[(sizeof(VM_SEND_OUT) == 32) ? 1 : -1];
-typedef char vm_assert_VM_GET_FRAME_IN_size[(sizeof(VM_GET_FRAME_IN) == 8) ? 1 : -1];
+typedef char vm_assert_VM_GET_FRAME_IN_size[(sizeof(VM_GET_FRAME_IN) == 16) ? 1 : -1];
 typedef char vm_assert_VM_FRAME_INFO_size[(sizeof(VM_FRAME_INFO) == 32) ? 1 : -1];
-typedef char vm_assert_VM_CLOSE_IN_size[(sizeof(VM_CLOSE_IN) == 8) ? 1 : -1];
-typedef char vm_assert_VM_FLUSH_IN_size[(sizeof(VM_FLUSH_IN) == 8) ? 1 : -1];
+typedef char vm_assert_VM_CLOSE_IN_size[(sizeof(VM_CLOSE_IN) == 16) ? 1 : -1];
+typedef char vm_assert_VM_FLUSH_IN_size[(sizeof(VM_FLUSH_IN) == 16) ? 1 : -1];
 typedef char vm_assert_VM_FLUSH_OUT_size[(sizeof(VM_FLUSH_OUT) == 16) ? 1 : -1];
-typedef char vm_assert_VM_MAP_FRAME_IN_size[(sizeof(VM_MAP_FRAME_IN) == 8) ? 1 : -1];
+typedef char vm_assert_VM_MAP_FRAME_IN_size[(sizeof(VM_MAP_FRAME_IN) == 16) ? 1 : -1];
 typedef char vm_assert_VM_FRAME_MAP_size[(sizeof(VM_FRAME_MAP) == 48) ? 1 : -1];
-typedef char vm_assert_VM_RELEASE_FRAME_IN_size[(sizeof(VM_RELEASE_FRAME_IN) == 8) ? 1 : -1];
+typedef char vm_assert_VM_RELEASE_FRAME_IN_size[(sizeof(VM_RELEASE_FRAME_IN) == 16) ? 1 : -1];
 
 #endif /* VMEDIA_ABI_H */

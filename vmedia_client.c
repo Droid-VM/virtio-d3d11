@@ -29,6 +29,16 @@ struct _VM_SESSION {
     uint32_t session_id;
     uint32_t kind;
     uint32_t codec; /* VM_OPEN_CODEC_*: what the host session was opened for */
+    /* SESSION-OWNERSHIP (1.0.0.24): the driver's generation token for THIS
+     * session.  Every IOCTL carries it back, so the driver can tell this
+     * session's requests from a replaced decoder's.  0 = the driver predates
+     * 1.0.0.24 and every request is served as a legacy one. */
+    uint32_t token;
+    uint32_t driver_version; /* VM_OPEN_OUT.DriverVersion */
+    /* 1 while the driver is known to accept VM_IOCTL_SEND_BITSTREAM_EX; 0 once
+     * it answered ERROR_INVALID_FUNCTION (a pre-1.0.0.24 driver), so the
+     * fallback costs exactly one failed ioctl per session. */
+    uint32_t send_ex;
 };
 
 /* Per-thread: see the header comment.  vm_last_error() is only meaningful on
@@ -103,6 +113,12 @@ VM_SESSION * VM_CALL vm_open_codec(uint32_t kind, uint32_t codec, VM_OPEN_OUT *o
     session->session_id = out->SessionId;
     session->kind = kind;
     session->codec = codec;
+    /* SESSION-OWNERSHIP: the generation token, and whether this driver knows
+     * about one at all.  Both come from the OPEN answer, so a UMD built against
+     * this header still runs against a 1.0.0.23 driver (token 0 = legacy). */
+    session->token = out->SessionToken;
+    session->driver_version = out->DriverVersion;
+    session->send_ex = (out->DriverVersion >= VMEDIA_SESSION_OWNERSHIP_MIN_VERSION) ? 1u : 0u;
     set_error(0);
     return session;
 }
@@ -117,12 +133,14 @@ int VM_CALL vm_send(VM_SESSION *session,
                     uint32_t width, uint32_t height,
                     uint32_t flags, VM_SEND_OUT *out)
 {
-    VM_SEND_IN *in;
+    VM_SEND_IN_EX *in;
     VM_SEND_OUT local_out;
     uint8_t *buffer;
     DWORD returned = 0;
     int ok;
     size_t total;
+    size_t header;
+    DWORD code;
 
     if (session == NULL || (data == NULL && size != 0)) {
         set_error(ERROR_INVALID_PARAMETER);
@@ -132,7 +150,11 @@ int VM_CALL vm_send(VM_SESSION *session,
         out = &local_out;
     }
 
-    total = sizeof(VM_SEND_IN) + (size_t)size;
+    /* SESSION-OWNERSHIP (1.0.0.24): the token travels in the header, which is
+     * why SEND has its own IOCTL code -- the access unit follows the header
+     * immediately, so a longer header under the old code would shift it. */
+    header = session->send_ex ? sizeof(VM_SEND_IN_EX) : sizeof(VM_SEND_IN);
+    total = header + (size_t)size;
     if (total > 0xFFFFFFFFu) {
         set_error(ERROR_BUFFER_OVERFLOW);
         return 0;
@@ -142,29 +164,118 @@ int VM_CALL vm_send(VM_SESSION *session,
         set_error(ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     }
-    in = (VM_SEND_IN *)buffer;
+    in = (VM_SEND_IN_EX *)buffer;
     in->Width = width;
     in->Height = height;
     in->Size = size;
     in->Flags = flags;
+    in->SessionToken = session->token;
+    in->Reserved0 = 0;
     if (size != 0) {
-        memcpy(buffer + sizeof(VM_SEND_IN), data, size);
+        memcpy(buffer + header, data, size);
     }
 
-    ok = DeviceIoControl(session->handle, VM_IOCTL_SEND_BITSTREAM,
+    code = session->send_ex ? VM_IOCTL_SEND_BITSTREAM_EX : VM_IOCTL_SEND_BITSTREAM;
+    ok = DeviceIoControl(session->handle, code,
                          buffer, (DWORD)total,
                          out, (DWORD)sizeof(*out), &returned, NULL);
-    HeapFree(GetProcessHeap(), 0, buffer);
     if (!ok) {
-        set_error(GetLastError());
+        DWORD err = GetLastError();
+        if (session->send_ex && err == ERROR_INVALID_FUNCTION) {
+            /* The driver does not know the EX code: a pre-1.0.0.24 one.  Fall
+             * back to the legacy header for the rest of the session (the access
+             * unit is re-sent unchanged; nothing reached the device). */
+            session->send_ex = 0;
+            session->token = 0;
+            HeapFree(GetProcessHeap(), 0, buffer);
+            return vm_send(session, data, size, width, height, flags, out);
+        }
+        HeapFree(GetProcessHeap(), 0, buffer);
+        set_error(err);
         return 0;
     }
+    HeapFree(GetProcessHeap(), 0, buffer);
     if (returned < sizeof(*out)) {
         set_error(ERROR_INVALID_DATA);
         return 0;
     }
     set_error(0);
     return 1;
+}
+
+static int tag_session(VM_SESSION *s)
+{
+    if (!s || !s->token) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+    if (s->driver_version < VMEDIA_TAG_MIN_VERSION) { set_error(ERROR_NOT_SUPPORTED); return 0; }
+    return 1;
+}
+
+int VM_CALL vm_send_tag(VM_SESSION *s, const void *data, uint32_t size,
+    uint32_t width, uint32_t height, uint32_t flags, uint64_t tag, VM_SEND_OUT *out)
+{
+    VM_SEND_OUT local;
+    VM_SEND_IN_TAG *in;
+    DWORD returned = 0, err;
+    size_t total = sizeof(*in) + (size_t)size;
+    int ok;
+    if (!tag_session(s)) return 0;
+    if (!data || !size || !tag || tag > INT64_MAX || (flags & ~1u)) {
+        set_error(ERROR_INVALID_PARAMETER); return 0;
+    }
+    if (total > UINT32_MAX || total < size) { set_error(ERROR_BUFFER_OVERFLOW); return 0; }
+    in = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, total);
+    if (!in) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+    in->Width = width; in->Height = height; in->Size = size; in->Flags = flags;
+    in->SessionToken = s->token; in->Tag = tag;
+    memcpy((uint8_t *)in + sizeof(*in), data, size);
+    if (!out) out = &local;
+    ok = DeviceIoControl(s->handle, VM_IOCTL_SEND_BITSTREAM_TAG, in, (DWORD)total,
+                         out, sizeof(*out), &returned, NULL);
+    err = ok ? (returned == sizeof(*out) ? 0 : ERROR_INVALID_DATA) : GetLastError();
+    HeapFree(GetProcessHeap(), 0, in);
+    set_error(err); return err == 0;
+}
+
+int VM_CALL vm_get_frame_tag(VM_SESSION *s, void *pixels, uint32_t capacity,
+    VM_FRAME_TAG_OUT *out, uint32_t timeout_ms)
+{
+    VM_GET_FRAME_IN in = { timeout_ms, 0, 0, 0 };
+    VM_FRAME_TAG_OUT *buf;
+    DWORD returned = 0, err = 0;
+    int ok;
+    if (!tag_session(s)) return 0;
+    if (!pixels || !out) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+    if (capacity > UINT32_MAX - sizeof(*buf)) { set_error(ERROR_BUFFER_OVERFLOW); return 0; }
+    buf = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*buf) + capacity);
+    if (!buf) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+    in.SessionToken = s->token;
+    ok = DeviceIoControl(s->handle, VM_IOCTL_GET_FRAME_TAG, &in, sizeof(in), buf,
+                         (DWORD)(sizeof(*buf) + capacity), &returned, NULL);
+    if (!ok) err = GetLastError();
+    else if (returned < sizeof(*buf) || buf->Info.Size > capacity ||
+             returned - sizeof(*buf) < buf->Info.Size || !buf->Tag || buf->Tag > INT64_MAX ||
+             buf->SessionToken != s->token) err = ERROR_INVALID_DATA;
+    else { *out = *buf; memcpy(pixels, (uint8_t *)buf + sizeof(*buf), buf->Info.Size); }
+    HeapFree(GetProcessHeap(), 0, buf);
+    set_error(err); return err == 0;
+}
+
+int VM_CALL vm_map_frame_tag(VM_SESSION *s, VM_FRAME_MAP_TAG_OUT *out, uint32_t timeout_ms)
+{
+    VM_MAP_FRAME_IN in = { timeout_ms, 0, 0, 0 };
+    DWORD returned = 0, err;
+    if (!tag_session(s)) return 0;
+    if (!out) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+    memset(out, 0, sizeof(*out)); in.SessionToken = s->token;
+    if (!DeviceIoControl(s->handle, VM_IOCTL_MAP_FRAME_TAG, &in, sizeof(in), out,
+                         sizeof(*out), &returned, NULL)) { set_error(GetLastError()); return 0; }
+    if (returned != sizeof(*out) || !out->Tag || out->Tag > INT64_MAX ||
+        out->SessionToken != s->token || !out->Map.UserVa || !out->Map.Size) {
+        err = ERROR_INVALID_DATA;
+        if (returned >= sizeof(VM_FRAME_MAP)) (void)vm_release_frame(s, out->Map.Index);
+        set_error(err); return 0;
+    }
+    set_error(0); return 1;
 }
 
 int VM_CALL vm_get_frame(VM_SESSION *session,
@@ -198,6 +309,8 @@ int VM_CALL vm_get_frame(VM_SESSION *session,
 
     in.TimeoutMs = timeout_ms;
     in.Flags = 0;
+    in.SessionToken = session->token;   /* SESSION-OWNERSHIP (1.0.0.24) */
+    in.Reserved0 = 0;
     ok = DeviceIoControl(session->handle, VM_IOCTL_GET_FRAME,
                          &in, (DWORD)sizeof(in),
                          buffer, out_len, &returned, NULL);
@@ -245,6 +358,8 @@ int VM_CALL vm_map_frame(VM_SESSION *session, VM_FRAME_MAP *map, uint32_t timeou
     memset(map, 0, sizeof(*map));
     in.TimeoutMs = timeout_ms;
     in.Flags = 0;
+    in.SessionToken = session->token;   /* SESSION-OWNERSHIP (1.0.0.24) */
+    in.Reserved0 = 0;
     ok = DeviceIoControl(session->handle, VM_IOCTL_MAP_FRAME,
                          &in, (DWORD)sizeof(in),
                          map, (DWORD)sizeof(*map), &returned, NULL);
@@ -275,6 +390,8 @@ int VM_CALL vm_release_frame(VM_SESSION *session, uint32_t index)
     }
     in.SessionId = session->session_id;
     in.Index = index;
+    in.SessionToken = session->token;   /* SESSION-OWNERSHIP (1.0.0.24) */
+    in.Reserved0 = 0;
     ok = DeviceIoControl(session->handle, VM_IOCTL_RELEASE_FRAME,
                          &in, (DWORD)sizeof(in),
                          NULL, 0, &returned, NULL);
@@ -306,6 +423,8 @@ int VM_CALL vm_flush(VM_SESSION *session, VM_FLUSH_OUT *out)
     memset(out, 0, sizeof(*out));
     in.SessionId = session->session_id;
     in.Flags = 0;
+    in.SessionToken = session->token;   /* SESSION-OWNERSHIP (1.0.0.24) */
+    in.Reserved0 = 0;
     ok = DeviceIoControl(session->handle, VM_IOCTL_FLUSH,
                          &in, (DWORD)sizeof(in),
                          out, (DWORD)sizeof(*out), &returned, NULL);
@@ -313,11 +432,18 @@ int VM_CALL vm_flush(VM_SESSION *session, VM_FLUSH_OUT *out)
         set_error(GetLastError());
         return 0;
     }
-    if (returned < sizeof(*out) || out->SessionId == 0) {
+    if (returned < sizeof(*out)) {
         set_error(ERROR_INVALID_DATA);
         return 0;
     }
-    session->session_id = out->SessionId;
+    /* SESSION-OWNERSHIP: a FLUSH **bumps the generation** -- the old token is
+     * dead from here on, and using it would get every later IOCTL refused.  An
+     * old driver leaves the field 0 (it was Reserved0), which keeps the session
+     * on the legacy path. */
+    session->token = out->SessionToken;
+    if (out->SessionId != 0 || out->SessionToken != 0) {
+        session->session_id = out->SessionId;
+    }
     set_error(0);
     return 1;
 }
@@ -332,6 +458,8 @@ void VM_CALL vm_close(VM_SESSION *session)
     }
     in.SessionId = session->session_id;
     in.Flags = 0;
+    in.SessionToken = session->token;   /* SESSION-OWNERSHIP (1.0.0.24) */
+    in.Reserved0 = 0;
     DeviceIoControl(session->handle, VM_IOCTL_CLOSE, &in, (DWORD)sizeof(in),
                     NULL, 0, &returned, NULL);
     CloseHandle(session->handle);
