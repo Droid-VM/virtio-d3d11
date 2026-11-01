@@ -12,6 +12,32 @@
 #include "dxvk.h"
 #include "resource.h"
 
+#include <triton_close_trace.h>
+#include <stdint.h>
+
+/* Values only: never retains a ref or dereferences an object while emitting. */
+typedef struct {
+    TR_CLOSE_SNAPSHOT identity;
+    unsigned long long image, memory, callback;
+    void *wrapper;
+    UINT primary, shared;
+    DWORD pid, tid;
+} RESOURCE_CLOSE_TRACE;
+
+static void resource_close_trace_emit(const char *path, const char *phase,
+    ULONGLONG operation, ULONGLONG event, RESOURCE_CLOSE_TRACE s,
+    HRESULT hr, BOOL failed)
+{
+    if (!failed && !virtio_close_trace_enabled()) return;
+    virtio_wddm_log(__FILE__, __LINE__, failed ? "ERROR" : "INFO",
+        "CLOSE_TRACE domain=umd-common level=%s path=%s phase=%s operation_id=%llu event_seq=%llu pid=%lu tid=%lu device=%p hRTDevice=%p resource=%p owner_hRTResource=%p hResource=%p alloc=0x%08x KMResource_field=0x%08x NumAllocations=%u HandleList=%p HandleList0=0x%08x wrapper=%p image_u64=0x%016llx memory_u64=0x%016llx callback_u64=0x%016llx primary=%u shared=%u hr=0x%08lx",
+        failed ? "ERROR" : "INFO", path, phase, operation, event, s.pid, s.tid,
+        s.identity.device, s.identity.rtdev, s.identity.resource,
+        s.identity.owner_rtres, s.identity.rtres, s.identity.allocation,
+        s.identity.kmres, s.identity.count, (void *)NULL, s.identity.handle0,
+        s.wrapper, s.image, s.memory, s.callback, s.primary, s.shared, hr);
+}
+
 SIZE_T APIENTRY virtio_wddm_calc_resource_size(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATERESOURCE *pArgs) {
     return sizeof(VIRTIO_WDDM_Resource);
 }
@@ -655,9 +681,24 @@ static HRESULT create_shared_3d_resource(VIRTIO_WDDM_Device *device, D3D11_TEXTU
          alloc_priv._3d.height, alloc_priv._3d.depth, alloc_priv._3d.array_size,
          alloc_priv._3d.last_level, alloc_priv._3d.nr_samples,
          alloc_priv._3d.size);
+    RESOURCE_CLOSE_TRACE trace = {
+        .identity = { .device = device, .rtdev = device->base.hRTDevice.handle,
+            .rtres = allocate.hResource, .owner_rtres = hRTResource,
+            .count = allocate.NumAllocations },
+        .callback = (unsigned long long)(uintptr_t)device->base.KTCallbacks.pfnAllocateCb,
+        .primary = primary, .pid = GetCurrentProcessId(), .tid = GetCurrentThreadId(),
+    };
+    const ULONGLONG alloc_operation = virtio_close_trace_next();
+    resource_close_trace_emit("resource_direct_alloc", "before_requested_no_HandleList",
+        alloc_operation, alloc_operation, trace, S_OK, FALSE);
     SetLastError(ERROR_SUCCESS);
     HRESULT hr = device->base.KTCallbacks.pfnAllocateCb(device->base.hRTDevice.handle, &allocate);
     DWORD last_error = GetLastError();
+    const ULONGLONG alloc_completed = virtio_close_trace_next();
+    trace.identity.allocation = alloc_info.hAllocation;
+    trace.identity.kmres = allocate.hKMResource;
+    resource_close_trace_emit("resource_direct_alloc", "after_returned_no_HandleList",
+        alloc_operation, alloc_completed, trace, hr, FAILED(hr));
     VERBOSE("%s: pfnAllocateCb end hr=0x%08lx last_error=%lu kmres=0x%08x allocation=0x%08x gpuva=0x%016llx",
          __FUNCTION__, hr, last_error, allocate.hKMResource,
          alloc_info.hAllocation, alloc_info.GpuVirtualAddress);
@@ -680,8 +721,19 @@ static HRESULT create_shared_3d_resource(VIRTIO_WDDM_Device *device, D3D11_TEXTU
         D3DDDICB_DEALLOCATE deallocate = {
             .hResource = hRTResource, .NumAllocations = 0, .HandleList = NULL,
         };
+        RESOURCE_CLOSE_TRACE cleanup_trace = trace;
+        cleanup_trace.identity.rtdev = device->base.hRTDevice.handle;
+        cleanup_trace.identity.rtres = deallocate.hResource;
+        cleanup_trace.identity.count = deallocate.NumAllocations;
+        cleanup_trace.callback = (unsigned long long)(uintptr_t)device->base.KTCallbacks.pfnDeallocateCb;
+        const ULONGLONG cleanup_operation = virtio_close_trace_next();
+        resource_close_trace_emit("resource_create_rollback", "before",
+            cleanup_operation, cleanup_operation, cleanup_trace, S_OK, FALSE);
         HRESULT cleanup_hr = device->base.KTCallbacks.pfnDeallocateCb(
             device->base.hRTDevice.handle, &deallocate);
+        const ULONGLONG cleanup_completed = virtio_close_trace_next();
+        resource_close_trace_emit("resource_create_rollback", "after",
+            cleanup_operation, cleanup_completed, cleanup_trace, cleanup_hr, FAILED(cleanup_hr));
         INFO("r60 layout failure cleanup allocation=0x%08x query=0x%08lx deallocate=0x%08lx",
              alloc_info.hAllocation, hr, cleanup_hr);
         if (SUCCEEDED(cleanup_hr)) {
@@ -1357,17 +1409,50 @@ void APIENTRY virtio_wddm_destroy_resource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HR
     VIRTIO_WDDM_Device *device = hDevice.pDrvPrivate;
     VIRTIO_WDDM_Resource *resource = hResource.pDrvPrivate;
     VERBOSE("%s: resource=%p", __FUNCTION__, resource);
+    const RESOURCE_CLOSE_TRACE trace = {
+        .identity = { .device = device, .rtdev = device->base.hRTDevice.handle,
+            .rtres = resource->base.hRTResource.handle,
+            .allocation = resource->base.hKMAllocation, .kmres = resource->base.hKMResource,
+            .resource = resource, .owner_rtres = resource->base.hRTResource.handle },
+        .image = (unsigned long long)resource->image,
+        .memory = (unsigned long long)resource->memory,
+        .callback = (unsigned long long)(uintptr_t)device->base.KTCallbacks.pfnDeallocateCb,
+        .wrapper = resource->base.pResource,
+        .primary = resource->base.IsPresentable, .shared = resource->base.IsShared,
+        .pid = GetCurrentProcessId(), .tid = GetCurrentThreadId(),
+    };
+    const ULONGLONG destroy_operation = virtio_close_trace_next();
+    resource_close_trace_emit("destroy_resource", "entry", destroy_operation,
+        destroy_operation, trace, S_OK, FALSE);
 
     if (resource->base.pResource) {
+        const ULONGLONG operation = virtio_close_trace_next();
+        resource_close_trace_emit("resource_wrapper_release", "before", operation,
+            operation, trace, S_OK, FALSE);
         ID3D11Resource_Release(resource->base.pResource);
+        const ULONGLONG completed = virtio_close_trace_next();
+        resource_close_trace_emit("resource_wrapper_release", "after_void_no_status", operation,
+            completed, trace, S_OK, FALSE);
     }
 
     if (resource->image != VK_NULL_HANDLE) {
+        const ULONGLONG operation = virtio_close_trace_next();
+        resource_close_trace_emit("resource_vkDestroyImage", "before", operation,
+            operation, trace, S_OK, FALSE);
         device->vk_DestroyImage(device->vk, resource->image, NULL);
+        const ULONGLONG completed = virtio_close_trace_next();
+        resource_close_trace_emit("resource_vkDestroyImage", "after_void_no_status", operation,
+            completed, trace, S_OK, FALSE);
     }
 
     if (resource->memory != VK_NULL_HANDLE) {
+        const ULONGLONG operation = virtio_close_trace_next();
+        resource_close_trace_emit("resource_vkFreeMemory", "before", operation,
+            operation, trace, S_OK, FALSE);
         device->vk_FreeMemory(device->vk, resource->memory, NULL);
+        const ULONGLONG completed = virtio_close_trace_next();
+        resource_close_trace_emit("resource_vkFreeMemory", "after_void_no_status", operation,
+            completed, trace, S_OK, FALSE);
     }
 
     if (resource->base.hKMAllocation != 0) {
@@ -1376,13 +1461,30 @@ void APIENTRY virtio_wddm_destroy_resource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HR
            .NumAllocations = 0,
            .HandleList = NULL,
         };
+        RESOURCE_CLOSE_TRACE callback_trace = trace;
+        callback_trace.identity.rtdev = device->base.hRTDevice.handle;
+        callback_trace.identity.rtres = deallocate.hResource;
+        callback_trace.identity.count = deallocate.NumAllocations;
+        callback_trace.callback = (unsigned long long)(uintptr_t)device->base.KTCallbacks.pfnDeallocateCb;
+        const ULONGLONG operation = virtio_close_trace_next();
+        resource_close_trace_emit("resource_only_deallocate", "before", operation,
+            operation, callback_trace, S_OK, FALSE);
         HRESULT hr = device->base.KTCallbacks.pfnDeallocateCb(device->base.hRTDevice.handle, &deallocate);
+        const ULONGLONG completed = virtio_close_trace_next();
+        resource_close_trace_emit("resource_only_deallocate", "after", operation,
+            completed, callback_trace, hr, FAILED(hr));
         if (FAILED(hr)) {
             ERROR("%s: Failed to deallocate: 0x%08lx", __FUNCTION__, hr);
         }
     }
 
+    const ULONGLONG zero_operation = virtio_close_trace_next();
+    resource_close_trace_emit("destroy_resource", "before_private_zero", zero_operation,
+        zero_operation, trace, S_OK, FALSE);
     memset(resource, 0, sizeof(*resource));
+    const ULONGLONG zero_completed = virtio_close_trace_next();
+    resource_close_trace_emit("destroy_resource", "after_private_zero_return_pending", zero_operation,
+        zero_completed, trace, S_OK, FALSE);
 }
 
 #include <stdio.h>

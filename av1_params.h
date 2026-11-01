@@ -75,12 +75,22 @@
 #define AV1_OBU_TEMPORAL_DELIMITER 2
 #define AV1_OBU_FRAME_HEADER 3
 #define AV1_OBU_TILE_GROUP 4
+#define AV1_OBU_METADATA 5
+#define AV1_OBU_FRAME 6
 
 /* Restoration types (5.9.20). */
 #define AV1_RESTORE_NONE 0
 
 /* Interpolation filters (5.9.11). */
-#define AV1_INTERP_SWITCHABLE 3
+/* AV1/GStreamer/DXVA interpolation-filter enum (5.9.14 InterpFilter):
+ *   0 EIGHTTAP_SMOOTH, 1 EIGHTTAP, 2 EIGHTTAP_SHARP, 3 BILINEAR,
+ *   4 SWITCHABLE.
+ * DXVA_PicParams_AV1::interp_filter uses these values, so SWITCHABLE is 4 --
+ * comparing it against 3 (this constant used to be 3) made every switchable
+ * frame code "is_filter_switchable=0 + interpolation_filter=0", which desyncs
+ * the tile entropy decoder from the first block on.  t6_av1's 890 inter
+ * pictures are all switchable. */
+#define AV1_INTERP_SWITCHABLE 4
 
 /* TX modes (5.9.21). */
 #define AV1_ONLY_4X4 0
@@ -97,6 +107,13 @@
 #define AV1_GM_ABS_ALPHA_BITS 12
 #define AV1_GM_ABS_TRANS_ONLY_BITS 9
 #define AV1_GM_ABS_TRANS_BITS 12
+/* Fixed-point precisions the global-motion syntax is relative to (5.9.24; the
+ * reference decoder calls them WARPEDMODEL_PREC_BITS / GM_ALPHA_PREC_BITS /
+ * GM_TRANS_PREC_BITS).  Each gm parameter is coded as a signed subexp DELTA from
+ * the SAME parameter of the primary reference frame, in these precisions. */
+#define AV1_WARPEDMODEL_PREC_BITS 12
+#define AV1_GM_ALPHA_PREC_BITS 12
+#define AV1_GM_TRANS_PREC_BITS 6
 
 /* Segmentation feature ids (5.9.18). */
 #define AV1_SEG_LVL_ALT_Q 0
@@ -143,6 +160,13 @@ typedef struct {
     unsigned enable_cdef;
     unsigned enable_restoration;
     unsigned film_grain_params_present;
+    /* Both of these are sequence-header syntax elements that DXVA does not
+     * carry, so they are DERIVED from the picture and re-emitted when they
+     * change.  They used to be hardcoded to 1, which cost two bits in every
+     * frame header and made our temporal units differ from the source stream
+     * for no reason (round 26 byte diff: the only remaining difference). */
+    unsigned enable_superres;     /* 0 unless some frame is superres-scaled */
+    unsigned separate_uv_delta_q; /* 0 unless the U/V delta_q values differ */
 
     unsigned color_range; /* 0 = studio (DXVA carries no range) */
     unsigned level_idx;   /* seq_level_idx; av1_level_from_size() picks one */
@@ -169,13 +193,28 @@ typedef struct {
     unsigned force_integer_mv;
     unsigned order_hint;
     unsigned primary_ref_frame; /* 0..7, 7 = NONE */
-    unsigned show_frame;        /* the UMD forces 1, see the file comment */
+    /* show_frame / showable_frame come from the CLIENT (DXVA_PicParams_AV1
+     * format.show_frame / format.showable_frame).  They used to be forced to 1,
+     * which made the host produce -- or rather try to produce -- a picture for
+     * every hidden alt-ref frame the client was never going to display, and the
+     * UMD then waited 2 x 1000 ms for a CAPTURE buffer that never came (round 26
+     * measured 62 AUs in 60 s = 0.97 s per AU, exactly one timeout each). */
+    unsigned show_frame;
+    unsigned showable_frame;    /* only coded when show_frame == 0 (5.9.2) */
 
     unsigned width;  /* upscaled frame width  (pixels) */
     unsigned height; /* upscaled frame height (pixels) */
     unsigned superres_denom; /* 8 = no superres, else 9..16 */
 
     unsigned ref_frame_idx[AV1_REFS_PER_FRAME]; /* DPB slot per reference */
+    /* DPB identity mirror (AV1 stateful port, 2026-10-27).  DXVA names every
+     * picture by a TEXTURE INDEX, and the client's RefFrameMapTextureIndex[] is
+     * its view of the DPB *before* this picture updates it -- exactly the
+     * information the reference implementation derives refresh_frame_flags and
+     * the reference remap from.  `texture` is this picture's own index
+     * (CurrPicTextureIndex), `ref_texture` the eight slots of that map. */
+    unsigned texture;
+    uint8_t ref_texture[AV1_NUM_REF_FRAMES];
 
     unsigned allow_high_precision_mv;
     unsigned interpolation_filter;
@@ -259,14 +298,30 @@ typedef struct {
 } Av1FrameParams;
 
 /* Decoder picture buffer mirror: what the host decoder's DPB holds after the
- * pictures forwarded so far.  Only the per-slot order hint is needed (for
- * skip_mode presence and the error-resilient ref_order_hint syntax); the
- * reference *surfaces* never matter because the host owns them, but the slot
- * contents and their order hints do, and both follow the (derived) refresh
- * mask. */
+ * pictures forwarded so far.
+ *
+ * AV1 STATEFUL PORT (2026-10-27; libva-v4l2 src/stateful/av1_bitstream.h
+ * `Av1Dpb::Slot`): a slot now carries what the DECODER derives from it, not just
+ * the order hint:
+ *
+ *   texture     -- the DPB slot's identity, i.e. the picture that lives there.
+ *                  derive_refresh_frame_flags() and choose_refresh_flags() are
+ *                  both defined in terms of it, and the reference remap in
+ *                  av1_frame_prepare() resolves a client slot to the slot we
+ *                  actually refreshed.
+ *   order_hint  -- skip_mode presence and the error-resilient ref_order_hint
+ *                  syntax (unchanged).
+ *   gm          -- the saved global-motion matrix of the picture in the slot
+ *                  ([ref][6], ref = LAST..ALTREF).  global_motion_params()
+ *                  codes each parameter as a signed subexp DELTA from the
+ *                  primary reference frame's value (5.9.24), so the writer
+ *                  needs the slot's copy; without it every frame was coded
+ *                  against the identity defaults. */
 typedef struct {
     unsigned valid[AV1_NUM_REF_FRAMES];
     unsigned order_hint[AV1_NUM_REF_FRAMES];
+    unsigned texture[AV1_NUM_REF_FRAMES];
+    int gm[AV1_NUM_REF_FRAMES][AV1_TOTAL_REFS_PER_FRAME][6];
 } Av1Dpb;
 
 /* ------------------------------------------------------------------------- */
@@ -378,11 +433,100 @@ static inline void av1_bw_put_subexp(Av1BitWriter *bw, uint32_t range_max,
         av1_bw_put_ns(bw, range_max - range_offset, value - range_offset);
 }
 
+/* recenter_finite_nonneg() / recenter_nonneg() (5.9.24, the encoder half of
+ * decode_signed_subexp_with_ref): map an absolute value onto the symbol the
+ * decoder will inverse-map, biasing towards values close to the reference. */
+static inline uint32_t av1_recenter_nonneg(uint32_t r, uint32_t v) {
+    if (v > (r << 1))
+        return v;
+    if (v >= r)
+        return (v - r) << 1;
+    return ((r - v) << 1) - 1;
+}
+
+static inline uint32_t av1_recenter_finite_nonneg(uint32_t n, uint32_t r,
+                                                  uint32_t v) {
+    if ((r << 1) <= n)
+        return av1_recenter_nonneg(r, v);
+    return av1_recenter_nonneg(n - 1u - r, n - 1u - v);
+}
+
+/* write_signed_primitive_refsubexpfin(n, k, ref, v) -- the AV1 syntax element
+ * that codes a SIGNED value in [-n+1, n-1] as a delta from `ref`:
+ *
+ *     coded = recenter_finite_nonneg(2n-1, ref + n-1, v + n-1)
+ *     subexp(2n-1, k=3, coded)
+ *
+ * This is what global_motion_params() (5.9.24) uses for every gm parameter.
+ * The old code wrote the value biased by the midpoint through a plain subexp
+ * (an ABSOLUTE code), which is a different symbol whenever the reference frame
+ * carries a non-identity transform: the decoder inverse-centred our symbol
+ * against ITS reference and landed on a different matrix.  Identity-only
+ * content codes no bits at all either way, which is why this never showed up
+ * on real streams. */
+static inline void av1_bw_put_signed_refsubexp(Av1BitWriter *bw, uint32_t n,
+                                               int32_t ref, int32_t value) {
+    uint32_t scaled_n, r, v;
+
+    if (n <= 1)
+        return;
+    scaled_n = (n << 1) - 1u;
+    r = (uint32_t)(ref + (int32_t)n - 1);
+    v = (uint32_t)(value + (int32_t)n - 1);
+    if (r > scaled_n)
+        r = scaled_n; /* defensive: ref/v are in [0, 2n-1] by construction */
+    if (v > scaled_n)
+        v = scaled_n;
+    av1_bw_put_subexp(bw, scaled_n,
+                      av1_recenter_finite_nonneg(scaled_n, r, v));
+}
+
 /* trailing_bits() + byte alignment: a one bit, then zeros to the byte. */
 static inline void av1_bw_trailing_bits(Av1BitWriter *bw) {
     av1_bw_put(bw, 1, 1);
     while (bw->bits & 7u)
         av1_bw_put(bw, 0, 1);
+}
+
+/* A complete type-3 OBU ends in trailing_bits; an embedded type-6 frame
+ * header only byte-aligns before tile_group payload. */
+static inline void av1_frame_header_align(Av1BitWriter *bw,
+                                          unsigned standalone_header) {
+    if (standalone_header) {
+        av1_bw_trailing_bits(bw);
+    } else {
+        while (bw->bits & 7u)
+            av1_bw_put(bw, 0, 1);
+    }
+}
+
+/* DXVA CDEF union: low six bits are primary, high two are secondary. The
+ * serializer stores primary in the syntax nibble and secondary in two bits. */
+static inline unsigned av1_cdef_pack_dxva(unsigned primary, unsigned secondary) {
+    return ((primary & 0x3fu) << 2) | (secondary & 0x3u);
+}
+
+/* One production qmatrix syntax writer shared by the full header and tests. */
+static inline void av1_write_qmatrix_params(Av1BitWriter *bw,
+                                             const Av1SeqParams *seq,
+                                             const Av1FrameParams *f) {
+    av1_bw_put(bw, f->using_qmatrix ? 1u : 0u, 1);
+    if (f->using_qmatrix) {
+        av1_bw_put(bw, f->qm_y & 15u, 4);
+        av1_bw_put(bw, f->qm_u & 15u, 4);
+        if (seq->separate_uv_delta_q)
+            av1_bw_put(bw, f->qm_v & 15u, 4);
+    }
+}
+
+/* Account an accepted direct tag mapping. Kept as the same production helper
+ * used by the collector so the native test can exercise the real increments. */
+static inline void av1_note_tag_mapping(uint64_t *direct_maps,
+                                        unsigned *mappings_out) {
+    if (direct_maps)
+        ++*direct_maps;
+    if (mappings_out)
+        ++*mappings_out;
 }
 
 static inline unsigned av1_bw_bytes(const Av1BitWriter *bw) {
@@ -562,17 +706,24 @@ static inline unsigned av1_sequence_header_payload(const Av1SeqParams *seq,
         unsigned bits = seq->order_hint_bits ? seq->order_hint_bits : 1u;
         av1_bw_put(&bw, bits - 1u, 3); /* order_hint_bits_minus_1 */
     }
-    av1_bw_put(&bw, 1, 1); /* enable_superres */
+    av1_bw_put(&bw, seq->enable_superres ? 1u : 0u, 1);
     av1_bw_put(&bw, seq->enable_cdef ? 1u : 0u, 1);
     av1_bw_put(&bw, seq->enable_restoration ? 1u : 0u, 1);
 
-    /* color_config() */
+    /* color_config().  DXVA_PicParams_AV1 carries no colour description, so the
+     * BT.709 / SDR triplet is emitted (AV1FIX round 26: it used to emit
+     * color_description_present_flag = 0, which is legal but made our sequence
+     * header 3 bytes shorter than every encoder's and left the host without the
+     * matrix coefficients; t6_av1.mkv's own header says 1/1/1). */
     av1_bw_put(&bw, seq->bit_depth > 8 ? 1u : 0u, 1); /* high_bitdepth */
     if (seq->profile == 2 && seq->bit_depth > 8)
         av1_bw_put(&bw, seq->bit_depth == 12 ? 1u : 0u, 1); /* twelve_bit */
     if (seq->profile != 1)
         av1_bw_put(&bw, seq->mono_chrome ? 1u : 0u, 1);
-    av1_bw_put(&bw, 0, 1); /* color_description_present_flag */
+    av1_bw_put(&bw, 1, 1);     /* color_description_present_flag */
+    av1_bw_put(&bw, 1, 8);     /* color_primaries          = CP_BT_709   */
+    av1_bw_put(&bw, 1, 8);     /* transfer_characteristics = TC_BT_709   */
+    av1_bw_put(&bw, 1, 8);     /* matrix_coefficients      = MC_BT_709   */
     if (seq->mono_chrome) {
         av1_bw_put(&bw, seq->color_range ? 1u : 0u, 1);
     } else {
@@ -583,8 +734,8 @@ static inline unsigned av1_sequence_header_payload(const Av1SeqParams *seq,
                 av1_bw_put(&bw, seq->subsampling_y ? 1u : 0u, 1);
         }
         if (seq->subsampling_x && seq->subsampling_y)
-            av1_bw_put(&bw, 0, 2); /* chroma_sample_position = UNKNOWN */
-        av1_bw_put(&bw, 1, 1);     /* separate_uv_delta_q */
+            av1_bw_put(&bw, 1, 2); /* chroma_sample_position = CSP_VERTICAL */
+        av1_bw_put(&bw, seq->separate_uv_delta_q ? 1u : 0u, 1);
     }
     av1_bw_put(&bw, seq->film_grain_params_present ? 1u : 0u, 1);
 
@@ -629,12 +780,16 @@ static inline unsigned av1_tile_size_bytes(const Av1Tile *tiles, unsigned ntiles
     return bytes > 4u ? 4u : bytes;
 }
 
-/* superres_params(): coded_denom is denom - 9.  The sequence header always
- * sets enable_superres, so use_superres is always coded here. */
-static inline void av1_write_superres(Av1BitWriter *bw, const Av1FrameParams *f) {
+/* superres_params() (5.9.6).  use_superres is only coded when the sequence
+ * header enabled superres, and the sequence header only enables it when a frame
+ * actually uses it (see av1_seq_from_pic). */
+static inline void av1_write_superres(Av1BitWriter *bw, const Av1SeqParams *seq,
+                                      const Av1FrameParams *f) {
     unsigned denom = f->superres_denom ? f->superres_denom : AV1_SUPERRES_NUM;
     unsigned use = denom != AV1_SUPERRES_NUM;
 
+    if (!seq->enable_superres)
+        return;
     av1_bw_put(bw, use, 1);
     if (use)
         av1_bw_put(bw, denom - AV1_SUPERRES_DENOM_MIN, 3);
@@ -651,7 +806,7 @@ static inline void av1_write_frame_size(Av1BitWriter *bw, const Av1SeqParams *se
         av1_bw_put(bw, f->height ? f->height - 1u : 0,
                    av1_dim_bits(seq->max_height ? seq->max_height - 1u : 0));
     }
-    av1_write_superres(bw, f);
+    av1_write_superres(bw, seq, f);
 }
 
 static inline void av1_write_render_size(Av1BitWriter *bw) {
@@ -766,11 +921,32 @@ static inline void av1_write_tile_info(Av1BitWriter *bw, const Av1SeqParams *seq
     unsigned rows = av1_max_u(1u, av1_min_u(f->tile_rows, sb_rows));
     unsigned cols_log2, rows_log2, bytes, start, i, widest = 0;
     unsigned max_tile_height_sb;
+    unsigned max_log2_tile_cols =
+        av1_tile_log2(1u, av1_min_u(sb_cols, AV1_MAX_TILE_COLS));
+    unsigned max_log2_tile_rows =
+        av1_tile_log2(1u, av1_min_u(sb_rows, AV1_MAX_TILE_ROWS));
 
     if (cols > AV1_MAX_TILE_COLS)
         cols = AV1_MAX_TILE_COLS;
     if (rows > AV1_MAX_TILE_ROWS)
         rows = AV1_MAX_TILE_ROWS;
+
+    /* AV1FIX (2026-10-26, round 26): a 1x1 grid has a 3-bit uniform encoding
+     * (uniform_tile_spacing_flag = 1 plus the two zero log2 increments) and an
+     * 11-bit non-uniform one.  Both describe the same single tile, so the
+     * decoder did not care, but the encoder's form is the cheap one and using it
+     * makes our header byte-for-byte identical to the source stream for the
+     * common single-tile case (verified against ffmpeg's trace_headers: TU0
+     * uniform_tile_spacing_flag=1, tile_cols_log2=0, tile_rows_log2=0). */
+    if (cols == 1u && rows == 1u && min_log2_tile_cols == 0 &&
+        min_log2_tiles == 0) {
+        av1_bw_put(bw, 1, 1); /* uniform_tile_spacing_flag */
+        if (max_log2_tile_cols > 0)
+            av1_bw_put(bw, 0, 1); /* increment_tile_cols_log2: stays 0 */
+        if (max_log2_tile_rows > 0)
+            av1_bw_put(bw, 0, 1); /* increment_tile_rows_log2: stays 0 */
+        return;
+    }
 
     av1_bw_put(bw, 0, 1); /* uniform_tile_spacing_flag */
 
@@ -846,6 +1022,7 @@ static inline unsigned av1_frame_header_payload(const Av1SeqParams *seq,
                                                 const Av1Tile *tiles,
                                                 unsigned ntiles,
                                                 unsigned refresh_frame_flags,
+                                                unsigned standalone_header,
                                                 uint8_t *out, unsigned cap) {
     Av1BitWriter bw;
     unsigned is_intra, order_bits;
@@ -864,7 +1041,13 @@ static inline unsigned av1_frame_header_payload(const Av1SeqParams *seq,
     av1_bw_put(&bw, 0, 1); /* show_existing_frame */
     av1_bw_put(&bw, f->frame_type, 2);
     av1_bw_put(&bw, f->show_frame ? 1u : 0u, 1);
-    /* showable_frame is inferred when show_frame == 1 (5.9.2). */
+    /* showable_frame is INFERRED when show_frame == 1 (5.9.2: "if (show_frame)
+     * showable_frame = frame_type != KEY_FRAME"), and CODED when it is 0.  The
+     * previous version never wrote it, so every hidden catch-up frame's header
+     * was one bit short and everything after it (beginning with
+     * error_resilient_mode) was misparsed. */
+    if (!f->show_frame)
+        av1_bw_put(&bw, f->showable_frame ? 1u : 0u, 1);
     if (f->frame_type == AV1_FRAME_SWITCH ||
         (f->frame_type == AV1_FRAME_KEY && f->show_frame)) {
         /* error_resilient_mode inferred 1 */
@@ -970,7 +1153,14 @@ static inline unsigned av1_frame_header_payload(const Av1SeqParams *seq,
         } else {
             av1_bw_put(&bw, 0, 1);
         }
-        av1_bw_put(&bw, diff_uv ? 1u : 0u, 1); /* separate_uv_delta_q == 1 */
+        /* diff_uv_delta is only coded when the SEQUENCE header set
+         * separate_uv_delta_q (5.9.17); av1_seq_from_pic() derives that from
+         * these very deltas. */
+        if (seq->separate_uv_delta_q) {
+            av1_bw_put(&bw, diff_uv ? 1u : 0u, 1);
+        } else {
+            diff_uv = 0;
+        }
         if (u_dc) {
             av1_bw_put(&bw, 1, 1);
             av1_bw_put_su(&bw, u_dc, 7);
@@ -998,12 +1188,7 @@ static inline unsigned av1_frame_header_payload(const Av1SeqParams *seq,
             }
         }
     }
-    av1_bw_put(&bw, f->using_qmatrix ? 1u : 0u, 1);
-    if (f->using_qmatrix) {
-        av1_bw_put(&bw, f->qm_y & 15u, 4);
-        av1_bw_put(&bw, f->qm_u & 15u, 4);
-        av1_bw_put(&bw, f->qm_v & 15u, 4);
-    }
+    av1_write_qmatrix_params(&bw, seq, f);
 
     /* segmentation_params() (5.9.18).  update_data is FORCED to 1 (and coded
      * as such) so every feature value comes from this header: the DXVA values
@@ -1159,65 +1344,100 @@ static inline unsigned av1_frame_header_payload(const Av1SeqParams *seq,
         av1_bw_put(&bw, f->allow_warped_motion ? 1u : 0u, 1);
     av1_bw_put(&bw, f->reduced_tx_set ? 1u : 0u, 1);
 
-    /* global_motion_params() (5.9.24).  Syntax order per reference is
-     * 2,3,(4,5),0,1, and the widths depend on the transform type and on
-     * allow_high_precision_mv for the translation-only case. */
+    /* global_motion_params() (5.9.24).  The syntax order per reference is
+     * 2,3 (rot/zoom) then 0,1 (translation) then 4,5 (affine shear), NOT
+     * 0..5: ffmpeg's cbs_av1 and libaom both read it that way, and the old
+     * 0,1,2,3,4,5 order mis-coded every reference that carried global motion
+     * (the widths are the same, so the header stayed the same length and the
+     * damage only showed up in the decoded picture).
+     *
+     * AV1 STATEFUL PORT (2026-10-27; libva-v4l2 av1_bitstream.cc
+     * write_global_motion_params()): every parameter is coded as a SIGNED
+     * subexp DELTA from the same parameter of the frame's PRIMARY REFERENCE
+     * (the DPB slot ref_frame_idx[primary_ref_frame] holds), with the identity
+     * defaults as the base when primary_ref_frame == PRIMARY_REF_NONE.
+     * `>> trans_prec_diff` / `>> alpha_prec_diff` convert our precision-12
+     * matrix into the precision the syntax codes. */
     if (!is_intra) {
+        const int *base = NULL;
+        int prev[6];
+
+        if (f->primary_ref_frame != AV1_PRIMARY_REF_NONE) {
+            unsigned slot = f->ref_frame_idx[f->primary_ref_frame] & 7u;
+            if (dpb->valid[slot])
+                base = &dpb->gm[slot][0][0];
+        }
         for (i = 0; i < AV1_REFS_PER_FRAME; i++) {
             unsigned type = f->wm_type[i];
+            int32_t wm[6];
+            int32_t alpha_prec_diff;
+            int32_t trans_prec_diff;
+            int32_t trans_bits;
+
             if (type > AV1_WM_AFFINE)
                 type = AV1_WM_IDENTITY;
-            if (type == AV1_WM_IDENTITY) {
-                av1_bw_put(&bw, 0, 1); /* is_global */
-                continue;
+            for (j = 0; j < 6; j++) {
+                wm[j] = f->wm_params[i][j];
+                /* Identity default (5.9.24): the two diagonal scale entries are
+                 * 1.0 in precision-12 fixed point, everything else is 0. */
+                prev[j] = base ? base[i * 6 + j]
+                               : (((j % 3u) == 2u)
+                                      ? (1 << AV1_WARPEDMODEL_PREC_BITS)
+                                      : 0);
             }
-            av1_bw_put(&bw, 1, 1); /* is_global */
+            av1_bw_put(&bw, (type != AV1_WM_IDENTITY) ? 1u : 0u, 1); /* is_global */
+            if (type == AV1_WM_IDENTITY)
+                continue;
             if (type == AV1_WM_ROTZOOM) {
                 av1_bw_put(&bw, 1, 1); /* is_rot_zoom */
             } else {
                 av1_bw_put(&bw, 0, 1);
                 av1_bw_put(&bw, (type == AV1_WM_AFFINE) ? 0u : 1u, 1);
             }
-            for (j = 0; j < 6; j++) {
-                unsigned abs_bits;
-                /* j: 0,1 -> params 0,1 (translation); j: 2,3 -> 2,3 (rot/zoom);
-                 * j: 4,5 -> 4,5 (affine shear). */
-                if (j < 2) {
-                    if (type < AV1_WM_TRANSLATION)
-                        continue;
-                    abs_bits = (type == AV1_WM_TRANSLATION)
-                                   ? AV1_GM_ABS_TRANS_ONLY_BITS -
-                                         (f->allow_high_precision_mv ? 0u : 1u)
-                                   : AV1_GM_ABS_TRANS_BITS;
-                } else if (j < 4) {
-                    if (type < AV1_WM_ROTZOOM)
-                        continue;
-                    abs_bits = AV1_GM_ABS_TRANS_BITS;
-                } else {
-                    if (type != AV1_WM_AFFINE)
-                        continue;
-                    abs_bits = AV1_GM_ABS_ALPHA_BITS;
-                }
-                {
-                    /* The syntax codes the parameter biased by its 2^abs_bits
-                     * midpoint (range 2*2^abs_bits+1), so negative motion
-                     * parameters stay inside the unsigned symbol range. */
-                    int32_t mid = (int32_t)(1u << abs_bits);
-                    int64_t v = (int64_t)f->wm_params[i][j] + mid;
-                    uint32_t range_max = 2u * (1u << abs_bits) + 1u;
-                    if (v < 0)
-                        v = 0;
-                    if (v > (int64_t)range_max)
-                        v = (int64_t)range_max;
-                    av1_bw_put_subexp(&bw, range_max, (uint32_t)v);
-                }
+
+            alpha_prec_diff = AV1_WARPEDMODEL_PREC_BITS - AV1_GM_ALPHA_PREC_BITS;
+            if (type >= AV1_WM_ROTZOOM) {
+                /* alpha (2, 3): rot/zoom, centred on +-1.0 */
+                av1_bw_put_signed_refsubexp(
+                    &bw, (1u << AV1_GM_ABS_ALPHA_BITS) + 1u,
+                    (prev[2] >> alpha_prec_diff) - (1 << AV1_GM_ALPHA_PREC_BITS),
+                    (wm[2] >> alpha_prec_diff) - (1 << AV1_GM_ALPHA_PREC_BITS));
+                av1_bw_put_signed_refsubexp(
+                    &bw, (1u << AV1_GM_ABS_ALPHA_BITS) + 1u,
+                    (prev[3] >> alpha_prec_diff),
+                    (wm[3] >> alpha_prec_diff));
             }
+            if (type >= AV1_WM_AFFINE) {
+                /* alpha (4, 5): affine shear */
+                av1_bw_put_signed_refsubexp(
+                    &bw, (1u << AV1_GM_ABS_ALPHA_BITS) + 1u,
+                    (prev[4] >> alpha_prec_diff),
+                    (wm[4] >> alpha_prec_diff));
+                av1_bw_put_signed_refsubexp(
+                    &bw, (1u << AV1_GM_ABS_ALPHA_BITS) + 1u,
+                    (prev[5] >> alpha_prec_diff) - (1 << AV1_GM_ALPHA_PREC_BITS),
+                    (wm[5] >> alpha_prec_diff) - (1 << AV1_GM_ALPHA_PREC_BITS));
+            }
+            trans_bits = (type == AV1_WM_TRANSLATION)
+                             ? (int32_t)AV1_GM_ABS_TRANS_ONLY_BITS -
+                                   (f->allow_high_precision_mv ? 0 : 1)
+                             : (int32_t)AV1_GM_ABS_TRANS_BITS;
+            trans_prec_diff = (type == AV1_WM_TRANSLATION)
+                                  ? (int32_t)AV1_WARPEDMODEL_PREC_BITS - 3 +
+                                        (f->allow_high_precision_mv ? 0 : 1)
+                                  : (int32_t)AV1_WARPEDMODEL_PREC_BITS -
+                                        (int32_t)AV1_GM_TRANS_PREC_BITS;
+            av1_bw_put_signed_refsubexp(&bw, (1u << trans_bits) + 1u,
+                                        prev[0] >> trans_prec_diff,
+                                        wm[0] >> trans_prec_diff);
+            av1_bw_put_signed_refsubexp(&bw, (1u << trans_bits) + 1u,
+                                        prev[1] >> trans_prec_diff,
+                                        wm[1] >> trans_prec_diff);
         }
     }
 
-    /* film_grain_params() (5.9.30).  The UMD forces show_frame = 1, so every
-     * frame carries the grain parameters when the sequence allows grain. */
-    if (seq->film_grain_params_present && f->show_frame) {
+    /* film_grain_params() (5.9.30): coded when show_frame || showable_frame. */
+    if (seq->film_grain_params_present && (f->show_frame || f->showable_frame)) {
         av1_bw_put(&bw, f->apply_grain ? 1u : 0u, 1);
         if (f->apply_grain) {
             unsigned num_pos_luma, num_pos_chroma;
@@ -1277,11 +1497,11 @@ static inline unsigned av1_frame_header_payload(const Av1SeqParams *seq,
         }
     }
 
-    av1_bw_trailing_bits(&bw);
+    av1_frame_header_align(&bw, standalone_header);
     return bw.overflow ? 0u : av1_bw_bytes(&bw);
 }
 
-/* Full frame_header OBU. */
+/* Full frame_header OBU (the multi-tile form; one tile uses av1_frame_obu). */
 static inline unsigned av1_frame_header_obu(const Av1SeqParams *seq,
                                             const Av1FrameParams *f,
                                             const Av1Dpb *dpb,
@@ -1291,11 +1511,57 @@ static inline unsigned av1_frame_header_obu(const Av1SeqParams *seq,
                                             uint8_t *out, unsigned cap) {
     uint8_t payload[4096];
     unsigned size = av1_frame_header_payload(seq, f, dpb, tiles, ntiles,
-                                             refresh_frame_flags, payload,
+                                             refresh_frame_flags, 1u, payload,
                                              sizeof(payload));
     if (size == 0)
         return 0;
     return av1_write_obu(out, cap, AV1_OBU_FRAME_HEADER, payload, size);
+}
+
+/* frame_obu (5.10): the frame header and its tile group in ONE OBU (type 6).
+ *
+ * AV1FIX (2026-10-26, round 26): this is the form every AV1 encoder emits, and
+ * the only form the source streams contain (all 896 packets of t6_av1.mkv are
+ * OBU_FRAME).  The UMD used to emit FRAME_HEADER + TILE_GROUP as two OBUs, which
+ * is also legal -- ffmpeg decodes both to identical pictures -- but with the two
+ * separate OBUs the host produced a picture for the key frame and for nothing
+ * else, so the temporal unit is now byte-for-byte the encoder's shape.
+ *
+ * Single tile only: with one tile a tile_group has no tg_start/tg_end and no
+ * per-tile size fields, so the OBU payload is exactly
+ *      frame_header (byte aligned) || tile bytes
+ * A multi-tile frame keeps the two-OBU form (av1_tile_group_obu). */
+static inline unsigned av1_frame_obu(const Av1SeqParams *seq,
+                                     const Av1FrameParams *f,
+                                     const Av1Dpb *dpb,
+                                     const Av1Tile *tiles, unsigned ntiles,
+                                     const uint8_t *data, unsigned data_size,
+                                     unsigned refresh_frame_flags,
+                                     uint8_t *out, unsigned cap) {
+    uint8_t fh[4096];
+    unsigned fhn, total, leb, at, i;
+
+    if (!out || !tiles || ntiles != 1u || !data || cap < 16u)
+        return 0;
+    if (tiles[0].size == 0 ||
+        (uint64_t)tiles[0].offset + tiles[0].size > (uint64_t)data_size)
+        return 0;
+    /* Type 6: byte_alignment(), not standalone OBU trailing_bits(). */
+    fhn = av1_frame_header_payload(seq, f, dpb, tiles, ntiles,
+                                   refresh_frame_flags, 0u, fh, sizeof(fh));
+    if (fhn == 0)
+        return 0;
+    total = fhn + tiles[0].size;
+    at = 1u;
+    leb = av1_leb128(out + at, cap - at, total);
+    if (leb == 0 || at + leb + total > cap)
+        return 0;
+    out[0] = (uint8_t)((AV1_OBU_FRAME << 3) | 0x02u);
+    at += leb;
+    for (i = 0; i < fhn; i++)
+        out[at + i] = fh[i];
+    memcpy(out + at + fhn, data + tiles[0].offset, tiles[0].size);
+    return at + total;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1407,6 +1673,74 @@ static inline unsigned av1_tile_group_obu(const Av1SeqParams *seq,
 }
 
 /* ------------------------------------------------------------------------- */
+/* show_existing_frame temporal unit (5.9.2 / 5.10)                           */
+/* ------------------------------------------------------------------------- */
+
+/* A D3D11 AV1 client never asks for a show_existing_frame picture: DXVA has no
+ * way to express one (DXVA_PicParams_AV1 has no show_existing field), so the
+ * client displays the reference itself and only sends the coded pictures.  The
+ * HOST, however, is a stateful V4L2 decoder that only emits a CAPTURE buffer for
+ * a picture the bitstream tells it to display.  The source stream of t6_av1.mkv
+ * is the proof of what is missing (ffmpeg trace_headers, first 24 TUs):
+ *
+ *   TU1  key      show_frame=1  order_hint=0   refresh=0xFF (inferred)
+ *   TU2  inter    show_frame=0  order_hint=16  refresh=0x01
+ *   TU3  inter    show_frame=0  order_hint=8   refresh=0x08
+ *   TU4  inter    show_frame=0  order_hint=4   refresh=0x20
+ *   TU5  inter    show_frame=0  order_hint=2   refresh=0x40
+ *   TU6  inter    show_frame=1  order_hint=1   refresh=0x00
+ *   TU7  show_existing_frame  frame_to_show_map_idx=6      <-- we never send this
+ *   TU8  inter    show_frame=1  order_hint=3   refresh=0x00
+ *   TU9  show_existing_frame  frame_to_show_map_idx=5
+ *   ...
+ *
+ * 445 of the stream's 896 temporal units are show_existing_frame (49.7%), and
+ * every displayed alt-ref goes through one.  Without them the host decodes the
+ * hidden pictures and never displays them (measured: "Skipping empty output
+ * buffer" == hidden sends, and the shown pictures stay inside the decoder's
+ * output delay), which is why AV1 showed 0-1 frames while H.264/VP9 showed
+ * hundreds.
+ *
+ * The bytes are exactly what silime/libva-v4l2 src/av1.cpp:45-48 emits
+ * (`av1_show_existing`):
+ *
+ *   0x12 0x00            OBU_TEMPORAL_DELIMITER, has_size=1, size=0
+ *   0x1a 0x01            OBU_FRAME_HEADER,     has_size=1, size=1
+ *   0x80 | (slot << 4)   uncompressed_header(): show_existing_frame f(1)=1,
+ *                        frame_to_show_map_idx f(3)=slot, then RETURN
+ *
+ * uncompressed_header() returns immediately after those four bits, so the rest
+ * of the byte is zero padding: no frame_type, no tile info, no tile group.  The
+ * TU carries no compressed data at all -- the host copies the picture it already
+ * decoded into that DPB slot and emits it as a CAPTURE buffer.
+ *
+ * `slot` is a DPB slot that HOLDS the picture: av1_derive_refresh_flags() below
+ * recovers exactly that set from the next picture's RefFrameMapTextureIndex (a
+ * texture is only in that map because it was written there), so the caller picks
+ * one set bit of the derived refresh mask.  The reference implementation makes
+ * the same choice (`params.ref_frame_map[slot] == hidden surface`).
+ *
+ * Preconditions the caller owns: the referenced slot must have been refreshed by
+ * the picture just decoded (so the host's DPB holds it), the referenced picture
+ * must have been coded with showable_frame=1 (the hidden catch-up is), and the
+ * sequence must have film_grain_params_present=0 -- with grain, a show_existing
+ * frame header loads the grain parameters of the reference, which is a
+ * table lookup and codes no bits, so the 4 bits above are still complete; the
+ * caller refuses when our sequence header says grain is on because the reference
+ * picture's grain state would then have to match. */
+static inline unsigned av1_show_existing_tu(unsigned slot, uint8_t *out,
+                                            unsigned cap) {
+    if (!out || cap < 5u || slot >= AV1_NUM_REF_FRAMES)
+        return 0;
+    out[0] = 0x12; /* OBU_TEMPORAL_DELIMITER, size 0 */
+    out[1] = 0x00;
+    out[2] = (uint8_t)((AV1_OBU_FRAME_HEADER << 3) | 0x02u); /* 0x1a */
+    out[3] = 0x01;                                          /* payload size 1 */
+    out[4] = (uint8_t)(0x80u | ((slot & 7u) << 4));
+    return 5u;
+}
+
+/* ------------------------------------------------------------------------- */
 /* DPB mirror and refresh mask derivation                                     */
 /* ------------------------------------------------------------------------- */
 
@@ -1415,10 +1749,18 @@ static inline void av1_dpb_reset(Av1Dpb *dpb) {
 }
 
 /* decode_frame_wrapup (7.20): every refreshed slot stores the picture's order
- * hint; a shown key frame resets the DPB first. */
+ * hint, its texture index and its saved global-motion matrix; a shown key frame
+ * resets the DPB first.
+ *
+ * AV1 STATEFUL PORT (2026-10-27): the texture index is what makes the mirror
+ * usable at all -- derive_refresh_flags() and choose_refresh_flags() are both
+ * expressed in terms of WHICH PICTURE a slot holds, and the reference remap
+ * (av1_frame_prepare) resolves a client-provided slot through it.  The reference
+ * stores exactly the same three things per slot (surface, order_hint,
+ * gm_params). */
 static inline void av1_dpb_update(Av1Dpb *dpb, const Av1FrameParams *f,
                                   unsigned refresh_frame_flags) {
-    unsigned i;
+    unsigned i, r, j;
 
     if (f->frame_type == AV1_FRAME_KEY && f->show_frame)
         av1_dpb_reset(dpb);
@@ -1426,6 +1768,14 @@ static inline void av1_dpb_update(Av1Dpb *dpb, const Av1FrameParams *f,
         if (refresh_frame_flags & (1u << i)) {
             dpb->valid[i] = 1;
             dpb->order_hint[i] = f->order_hint;
+            dpb->texture[i] = f->texture & 0xFFu;
+            for (r = 0; r < AV1_NUM_REF_FRAMES; r++)
+                for (j = 0; j < 6; j++)
+                    dpb->gm[i][r][j] = (r < AV1_REFS_PER_FRAME)
+                                           ? f->wm_params[r][j]
+                                           : ((j % 3u) == 2u
+                                                  ? (1 << AV1_WARPEDMODEL_PREC_BITS)
+                                                  : 0);
         }
     }
 }
@@ -1442,6 +1792,68 @@ static inline unsigned av1_derive_refresh_flags(unsigned curr_pic_texture,
             mask |= 1u << i;
     }
     return mask;
+}
+
+/* choose_refresh_flags(): the BEST-EFFORT mask for a picture that has no
+ * successor to derive the exact one from (libva-v4l2
+ * Av1AccessUnitBuilder::choose_refresh_flags()).
+ *
+ * VA/DXVA never carries refresh_frame_flags, so a frame with no successor has
+ * no exact answer.  The invariant that keeps every future reference resolvable
+ * is "our DPB must still contain every texture the client's map lists", so this
+ * refreshes every slot that is EMPTY or holds a texture the map no longer
+ * lists; if all eight are live and distinct it evicts the oldest by order hint.
+ * Never used while a successor exists. */
+static inline unsigned av1_choose_refresh_flags(const Av1Dpb *dpb,
+                                                const Av1FrameParams *f) {
+    unsigned mask = 0, j, k, oldest;
+
+    for (j = 0; j < AV1_NUM_REF_FRAMES; j++) {
+        int in_map = 0;
+
+        for (k = 0; k < AV1_NUM_REF_FRAMES; k++) {
+            if (f->ref_texture[k] != 0xFFu &&
+                (f->ref_texture[k] & 0xFFu) == (dpb->texture[j] & 0xFFu) &&
+                dpb->valid[j])
+                in_map = 1;
+        }
+        if (!dpb->valid[j] || !in_map)
+            mask |= 1u << j;
+    }
+    if (mask != 0)
+        return mask;
+    oldest = 0;
+    for (j = 1; j < AV1_NUM_REF_FRAMES; j++) {
+        if ((int)dpb->order_hint[j] < (int)dpb->order_hint[oldest])
+            oldest = j;
+    }
+    return 1u << oldest;
+}
+
+/* Resolve a client-provided reference slot to the slot OUR DPB refreshed it in.
+ * DXVA names each reference by `ref_frame_idx[i]` = an index into the CLIENT's
+ * DPB view; the host's DPB is the one our own refresh masks built, so the two
+ * numbering only agree while every mask we sent was the exact derived one.  The
+ * reference does this remap (av1_bitstream.cc build_frame_header()) and so do we:
+ * look up the texture the client means, then find the slot that holds it. */
+static inline void av1_frame_prepare(const Av1Dpb *dpb, Av1FrameParams *f) {
+    unsigned i, j;
+
+    if (f->frame_type == AV1_FRAME_KEY || f->frame_type == AV1_FRAME_INTRA_ONLY)
+        return;
+    for (i = 0; i < AV1_REFS_PER_FRAME; i++) {
+        unsigned slot = f->ref_frame_idx[i] & 7u;
+        unsigned want = f->ref_texture[slot] & 0xFFu;
+
+        if (want == 0xFFu)
+            continue;
+        for (j = 0; j < AV1_NUM_REF_FRAMES; j++) {
+            if (dpb->valid[j] && (dpb->texture[j] & 0xFFu) == want) {
+                f->ref_frame_idx[i] = j;
+                break;
+            }
+        }
+    }
 }
 
 #endif /* VIRTIO_WDDM_AV1_PARAMS_H */

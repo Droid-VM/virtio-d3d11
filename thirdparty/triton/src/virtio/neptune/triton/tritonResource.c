@@ -1,3 +1,4 @@
+#include "triton_close_trace.h"
 /*
  * Copyright 2026 Turing Software LLC
  * SPDX-License-Identifier: MIT
@@ -50,7 +51,7 @@ tritonCalcPrivateOpenedResourceSize(D3D10DDI_HDEVICE hDevice,
  * virtio_wddm_video_create_video_decoder) and a build without video simply leaves
  * it NULL.  `whole` = "every subresource of this resource" (a whole-resource
  * copy, a hazard, an SRV read); otherwise `subresource` is the one being read. */
-typedef void (*TRITON_TEXTURE_SYNC_HOOK)(void *resource, UINT subresource, BOOL whole);
+typedef HRESULT (*TRITON_TEXTURE_SYNC_HOOK)(void *resource, UINT subresource, BOOL whole, UINT action, UINT64 *ticket);
 
 static TRITON_TEXTURE_SYNC_HOOK g_texture_sync_hook;
 
@@ -59,10 +60,18 @@ void tritonSetTextureSyncHook(TRITON_TEXTURE_SYNC_HOOK hook)
     g_texture_sync_hook = hook;
 }
 
-static void tritonSyncTexture(PTRITON_RESOURCE r, UINT subresource, BOOL whole)
+static HRESULT tritonSyncTexture(PTRITON_DEVICE pD,PTRITON_RESOURCE r, UINT subresource, BOOL whole, BOOL nowait, UINT64 *ticket)
 {
-    if (g_texture_sync_hook && r && r->pResource)
-        g_texture_sync_hook((void *)r->pResource, subresource, whole);
+    HRESULT hr=tritonReadGate(pD);
+    if(FAILED(hr)) return hr;
+    hr=(g_texture_sync_hook && r && r->pResource)
+       ? g_texture_sync_hook((void *)r->pResource,subresource,whole,nowait ? TR_READ_NOWAIT : TR_READ_WAIT,NULL) : S_OK;
+    if(SUCCEEDED(hr) && g_texture_sync_hook && r && r->pResource)
+        hr=g_texture_sync_hook(r->pResource,subresource,whole,TR_READ_ADMIT,ticket);
+    return tritonReadFailure(pD,hr);
+}
+static void tritonReadUnpin(PTRITON_RESOURCE r,UINT64 *ticket) {
+    if(g_texture_sync_hook && r && r->pResource) g_texture_sync_hook(r->pResource,0,TRUE,TR_READ_RELEASE,ticket);
 }
 
 /* Translate the DDI's combined Usage/CpuAccess/Bind flag salad into the
@@ -245,7 +254,21 @@ tritonRegisterSharedBlob(PTRITON_DEVICE pD, PTRITON_RESOURCE r,
     cb.NumAllocations   = 1;
     cb.pAllocationInfo2 = &ai;
 
+    const BOOL close_trace = virtio_close_trace_enabled();
+    const DWORD trace_pid = GetCurrentProcessId(), trace_tid = GetCurrentThreadId();
+    TR_CLOSE_SNAPSHOT trace = { pD, pD->hRTDevice.handle, cb.hResource,
+        0, 0, cb.NumAllocations, 0, r, r->hRTResource.handle };
+    const ULONGLONG operation = virtio_close_trace_next();
+    if (close_trace)
+        virtio_close_trace_emit("triton_shared_alloc", "before_requested", operation,
+            operation, trace_pid, trace_tid, trace, S_OK, FALSE);
     HRESULT hr = pD->KTCallbacks.pfnAllocateCb(pD->hRTDevice.handle, &cb);
+    const ULONGLONG completed = virtio_close_trace_next();
+    trace.allocation = ai.hAllocation;
+    trace.kmres = cb.hKMResource;
+    if (close_trace || FAILED(hr) || !ai.hAllocation)
+        virtio_close_trace_emit("triton_shared_alloc", "after_returned_no_HandleList", operation,
+            completed, trace_pid, trace_tid, trace, hr, FAILED(hr) || !ai.hAllocation);
     if (FAILED(hr) || !ai.hAllocation) {
         TR_LOG("shared: pfnAllocateCb failed hr=0x%08lx", hr);
         return FALSE;
@@ -276,6 +299,9 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
         return;
     }
 
+    r->decodeReadMapPin=0;
+    r->decodeReadMapTicket=0;
+    r->decodeReadMapSubresource=0;
     r->hRTResource = hRTResource;
     r->Format      = pArgs->Format;
     r->MipLevels   = pArgs->MipLevels;
@@ -509,6 +535,12 @@ tritonDestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
     PTRITON_RESOURCE r = (PTRITON_RESOURCE)(hResource.pDrvPrivate);
     if (!r) return;
     PTRITON_DEVICE pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
+    if(r->decodeReadMapPin) {
+        TR_LOG("FATAL DestroyResource while CPU mapped: preserving resource/ticket; no unsafe unpin");
+        return; /* invalid runtime sequence, bounded reclamation not supported */
+    }
+    if(g_texture_sync_hook && r->pResource)
+        g_texture_sync_hook(r->pResource,0,TRUE,TR_READ_FORGET,NULL);
 
     /* Consumer: drop the transport-context attach rig before the host
      * texture; the imported texture keeps the dmabuf alive on its own. */
@@ -531,7 +563,22 @@ tritonDestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
         memset(&da, 0, sizeof(da));
         da.NumAllocations = 1;
         da.HandleList     = &r->hKMAllocation;
-        pD->KTCallbacks.pfnDeallocateCb(pD->hRTDevice.handle, &da);
+        const BOOL close_trace = virtio_close_trace_enabled();
+        const DWORD trace_pid = GetCurrentProcessId(), trace_tid = GetCurrentThreadId();
+        /* Snapshot before callback; KMResource_field may legitimately be zero.
+         * Do not add ownership state merely to improve diagnostic output. */
+        const TR_CLOSE_SNAPSHOT trace = { pD, pD->hRTDevice.handle, da.hResource,
+            r->hKMAllocation, r->hKMResource, da.NumAllocations, r->hKMAllocation,
+            r, r->hRTResource.handle };
+        const ULONGLONG operation = virtio_close_trace_next();
+        if (close_trace)
+            virtio_close_trace_emit("triton_resource_free", "before", operation, operation,
+                trace_pid, trace_tid, trace, S_OK, FALSE);
+        HRESULT hr = pD->KTCallbacks.pfnDeallocateCb(pD->hRTDevice.handle, &da);
+        const ULONGLONG completed = virtio_close_trace_next();
+        if (close_trace || FAILED(hr))
+            virtio_close_trace_emit("triton_resource_free", "after", operation, completed,
+                trace_pid, trace_tid, trace, hr, FAILED(hr));
         r->hKMAllocation = 0;
     }
 }
@@ -717,8 +764,20 @@ tritonResourceMap(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource,
     PTRITON_RESOURCE r  = (PTRITON_RESOURCE)(hResource.pDrvPrivate);
     if (!pD || !r || !r->pResource || !pMapped) return;
 
+    if(InterlockedCompareExchange(&r->decodeReadMapPin,1,0)!=0) {
+        pMapped->pData=NULL; pMapped->RowPitch=pMapped->DepthPitch=0;
+        tritonSetError(pD,DXGI_DDI_ERR_WASSTILLDRAWING); return;
+    }
+    r->decodeReadMapSubresource=Subresource;
     /* §5.4: a Map is a read of this subresource (CPU access to the pixels). */
-    tritonSyncTexture(r, Subresource, FALSE);
+    HRESULT syncHr=tritonSyncTexture(pD,r,Subresource,FALSE,
+                                     (Flags & D3D10_DDI_MAP_FLAG_DONOTWAIT)!=0,&r->decodeReadMapTicket);
+    if(FAILED(syncHr)) {
+        InterlockedExchange(&r->decodeReadMapPin,0);
+        pMapped->pData=NULL; pMapped->RowPitch=pMapped->DepthPitch=0;
+        if(syncHr==DXGI_ERROR_WAS_STILL_DRAWING) tritonSetError(pD,DXGI_DDI_ERR_WASSTILLDRAWING);
+        return;
+    }
 
     UINT mapFlags = 0;
     if (Flags & D3D10_DDI_MAP_FLAG_DONOTWAIT) mapFlags |= D3D11_MAP_FLAG_DO_NOT_WAIT;
@@ -727,6 +786,8 @@ tritonResourceMap(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource,
     HRESULT hr = ID3D11DeviceContext1_Map(pD->pCtx1, r->pResource, Subresource,
                                           (D3D11_MAP)DDIMap, mapFlags, &m);
     if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+        tritonReadUnpin(r,&r->decodeReadMapTicket);
+        InterlockedExchange(&r->decodeReadMapPin,0);
         /* DO_NOT_WAIT + GPU busy: propagate to runtime so the app gets the
          * DXGI status from the next API call instead of reading garbage. */
         tritonSetError(pD, DXGI_DDI_ERR_WASSTILLDRAWING);
@@ -737,6 +798,8 @@ tritonResourceMap(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource,
         return;
     }
     if (FAILED(hr)) {
+        tritonReadUnpin(r,&r->decodeReadMapTicket);
+        InterlockedExchange(&r->decodeReadMapPin,0);
         TR_LOG_LIMITED("ResourceMap failed res=%p %ux%u sub=%u map=%u flags=0x%x hr=0x%08lx",
                r, r->Width, r->Height, Subresource, DDIMap, Flags, hr);
         tritonSetError(pD, hr);
@@ -744,6 +807,7 @@ tritonResourceMap(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource,
         pMapped->RowPitch = pMapped->DepthPitch = 0;
         return;
     }
+    InterlockedExchange(&r->decodeReadMapPin,2); /* MAPPED, not merely reserving */
     pMapped->pData      = m.pData;
     pMapped->RowPitch   = m.RowPitch;
     pMapped->DepthPitch = m.DepthPitch;
@@ -756,7 +820,11 @@ tritonResourceUnmap(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource, UINT
     PTRITON_DEVICE   pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     PTRITON_RESOURCE r  = (PTRITON_RESOURCE)(hResource.pDrvPrivate);
     if (!pD || !r || !r->pResource) return;
+    if(r->decodeReadMapSubresource!=Subresource ||
+       InterlockedCompareExchange(&r->decodeReadMapPin,3,2)!=2) return;
     ID3D11DeviceContext1_Unmap(pD->pCtx1, r->pResource, Subresource);
+    tritonReadUnpin(r,&r->decodeReadMapTicket);
+    InterlockedExchange(&r->decodeReadMapPin,0);
 }
 
 BOOL APIENTRY
@@ -828,14 +896,16 @@ void APIENTRY
 tritonResourceCopy(D3D10DDI_HDEVICE hDevice,
                    D3D10DDI_HRESOURCE hDst, D3D10DDI_HRESOURCE hSrc)
 {
+    UINT64 ticket=0;
     TR_TRACE();
     PTRITON_DEVICE   pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     PTRITON_RESOURCE d  = (PTRITON_RESOURCE)(hDst.pDrvPrivate);
     PTRITON_RESOURCE s  = (PTRITON_RESOURCE)(hSrc.pDrvPrivate);
     if (!pD || !d || !s || !d->pResource || !s->pResource) return;
     /* §5.4: the source of a whole-resource copy is read, every subresource. */
-    tritonSyncTexture(s, 0, TRUE);
+    if(FAILED(tritonSyncTexture(pD,s,0,TRUE,FALSE,&ticket))) return;
     ID3D11DeviceContext1_CopyResource(pD->pCtx1, d->pResource, s->pResource);
+    tritonReadUnpin(s,&ticket);
 }
 
 void APIENTRY
@@ -845,16 +915,18 @@ tritonResourceCopyRegion(D3D10DDI_HDEVICE hDevice,
                          D3D10DDI_HRESOURCE hSrc, UINT SrcSubresource,
                          const D3D10_DDI_BOX *pSrcBox)
 {
+    UINT64 ticket=0;
     TR_TRACE();
     PTRITON_DEVICE   pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     PTRITON_RESOURCE d  = (PTRITON_RESOURCE)(hDst.pDrvPrivate);
     PTRITON_RESOURCE s  = (PTRITON_RESOURCE)(hSrc.pDrvPrivate);
     if (!pD || !d || !s || !d->pResource || !s->pResource) return;
     /* §5.4: CopySubresourceRegion reads SrcSubresource. */
-    tritonSyncTexture(s, SrcSubresource, FALSE);
+    if(FAILED(tritonSyncTexture(pD,s,SrcSubresource,FALSE,FALSE,&ticket))) return;
     ID3D11DeviceContext1_CopySubresourceRegion(
         pD->pCtx1, d->pResource, DstSubresource, DstX, DstY, DstZ,
         s->pResource, SrcSubresource, (const D3D11_BOX *)(pSrcBox));
+    tritonReadUnpin(s,&ticket);
 }
 
 void APIENTRY
@@ -864,16 +936,18 @@ tritonResourceCopyRegion_11_1(D3D10DDI_HDEVICE hDevice,
                               D3D10DDI_HRESOURCE hSrc, UINT SrcSubresource,
                               const D3D10_DDI_BOX *pSrcBox, UINT CopyFlags)
 {
+    UINT64 ticket=0;
     TR_TRACE();
     PTRITON_DEVICE   pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     PTRITON_RESOURCE d  = (PTRITON_RESOURCE)(hDst.pDrvPrivate);
     PTRITON_RESOURCE s  = (PTRITON_RESOURCE)(hSrc.pDrvPrivate);
     if (!pD || !d || !s || !d->pResource || !s->pResource) return;
     /* §5.4: CopySubresourceRegion1 reads SrcSubresource. */
-    tritonSyncTexture(s, SrcSubresource, FALSE);
+    if(FAILED(tritonSyncTexture(pD,s,SrcSubresource,FALSE,FALSE,&ticket))) return;
     ID3D11DeviceContext1_CopySubresourceRegion1(
         pD->pCtx1, d->pResource, DstSubresource, DstX, DstY, DstZ,
         s->pResource, SrcSubresource, (const D3D11_BOX *)(pSrcBox), CopyFlags);
+    tritonReadUnpin(s,&ticket);
 }
 
 void APIENTRY
@@ -882,15 +956,17 @@ tritonResourceResolveSubresource(D3D10DDI_HDEVICE hDevice,
                                  D3D10DDI_HRESOURCE hSrc, UINT SrcSubresource,
                                  DXGI_FORMAT Format)
 {
+    UINT64 ticket=0;
     TR_TRACE();
     PTRITON_DEVICE   pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     PTRITON_RESOURCE d  = (PTRITON_RESOURCE)(hDst.pDrvPrivate);
     PTRITON_RESOURCE s  = (PTRITON_RESOURCE)(hSrc.pDrvPrivate);
     if (!pD || !d || !s || !d->pResource || !s->pResource) return;
     /* §5.4: ResolveSubresource reads SrcSubresource. */
-    tritonSyncTexture(s, SrcSubresource, FALSE);
+    if(FAILED(tritonSyncTexture(pD,s,SrcSubresource,FALSE,FALSE,&ticket))) return;
     ID3D11DeviceContext1_ResolveSubresource(
         pD->pCtx1, d->pResource, DstSubresource, s->pResource, SrcSubresource, Format);
+    tritonReadUnpin(s,&ticket);
 }
 
 /* D3D11 tracks hazards on the immediate context; nothing to do here -- except
@@ -902,18 +978,20 @@ tritonResourceResolveSubresource(D3D10DDI_HDEVICE hDevice,
 void APIENTRY
 tritonResourceReadAfterWriteHazard(D3D10DDI_HDEVICE hDev, D3D10DDI_HRESOURCE hRes)
 {
+    UINT64 ticket=0;
     PTRITON_RESOURCE r = (PTRITON_RESOURCE)(hRes.pDrvPrivate);
-    (void)hDev;
-    tritonSyncTexture(r, 0, TRUE);
+    PTRITON_DEVICE pD=(PTRITON_DEVICE)hDev.pDrvPrivate;
+    if(SUCCEEDED(tritonSyncTexture(pD,r,0,TRUE,FALSE,&ticket))) tritonReadUnpin(r,&ticket);
 }
 
 void APIENTRY
 tritonShaderResourceViewReadAfterWriteHazard(D3D10DDI_HDEVICE hDev, D3D10DDI_HSHADERRESOURCEVIEW hSRV, D3D10DDI_HRESOURCE hRes)
 {
+    UINT64 ticket=0;
     PTRITON_RESOURCE r = (PTRITON_RESOURCE)(hRes.pDrvPrivate);
-    (void)hDev;
+    PTRITON_DEVICE pD=(PTRITON_DEVICE)hDev.pDrvPrivate;
     (void)hSRV;
-    tritonSyncTexture(r, 0, TRUE);
+    if(SUCCEEDED(tritonSyncTexture(pD,r,0,TRUE,FALSE,&ticket))) tritonReadUnpin(r,&ticket);
 }
 
 /* Per-stage constant-buffer setters. D3D11_0 takes only handles
@@ -1247,7 +1325,7 @@ tritonSetHardwareProtectionState(D3D10DDI_HDEVICE hDev, BOOL flag)
 void APIENTRY
 tritonAcquireResource(D3D10DDI_HDEVICE hDev, D3D10DDI_HRESOURCE hRes, HANDLE h)
 {
-    (void)hDev;
+    PTRITON_DEVICE pD=(PTRITON_DEVICE)hDev.pDrvPrivate;
     (void)hRes;
     (void)h;
 }

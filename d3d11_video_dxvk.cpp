@@ -27,6 +27,17 @@
 #include <dxgi.h>
 
 #include "d3d11_video_dxvk.h"
+extern "C" {
+#include "vp_identity_trace.h"
+}
+
+/* VP9TRACE (2026-10-25): the UMD log.  Declared here instead of pulling in the
+ * DDI headers (this file deliberately includes none): adapter.c defines it with
+ * C linkage and default visibility, and both objects are linked into the same
+ * dx11um DLL.  Used only by the two diagnostic probes below. */
+extern "C" void virtio_wddm_log(const char *file, int line, const char *label,
+                                const char *format, ...);
+#define VTRACE(...) virtio_wddm_log(__FILE__, __LINE__, "INFO", __VA_ARGS__)
 
 namespace {
 
@@ -187,6 +198,99 @@ extern "C" void virtio_wddm_dxvk_video_destroy_processor(void *processor) {
         as_processor(processor)->Release();
 }
 
+/* VP_IDENTITY_DIAG_BEGIN */
+extern "C" ULONG_PTR virtio_wddm_dxvk_video_view_resource_identity(void *view, BOOL output) {
+    if (!view) return 0;
+    ID3D11Resource *resource = nullptr;
+    if (output) as_output_view(view)->GetResource(&resource);
+    else as_input_view(view)->GetResource(&resource);
+    ULONG_PTR identity = reinterpret_cast<ULONG_PTR>(resource);
+    if (resource) resource->Release();
+    return identity;
+}
+/* VP_IDENTITY_DIAG_END */
+
+/* Identity refresh holds COM refs through GetDesc/Create/swap. No cached raw
+ * resource scalar is used, so an old resource cannot disappear and ABA-alias.
+ * These leases do not serialize the external DDI wrapper or its resource pointer. */
+namespace {
+static bool vp_refresh_log_admit() {
+    static volatile LONG count;
+    if (!virtio_vp_identity_enabled()) return false;
+    LONG n=InterlockedIncrement(&count);
+    if (n==11) virtio_vp_identity_emit(1,FALSE,"kind=vp_refresh truncated=1 refresh_pair_limit=10");
+    return n<=10;
+}
+template<typename T> struct VPRefreshLease {
+    T *ptr;
+    explicit VPRefreshLease(T *p = nullptr, bool retain = false) : ptr(p) {
+        if (ptr && retain) ptr->AddRef();
+    }
+    ~VPRefreshLease() { if (ptr) ptr->Release(); }
+    VPRefreshLease(const VPRefreshLease&) = delete;
+    VPRefreshLease& operator=(const VPRefreshLease&) = delete;
+};
+}
+extern "C" void virtio_wddm_dxvk_video_retain_refresh_context(void *device, void *enumeration) {
+    if (device) as_video_device(device)->AddRef();
+    if (enumeration) as_enum(enumeration)->AddRef();
+}
+extern "C" void virtio_wddm_dxvk_video_release_refresh_context(void *device, void *enumeration) {
+    if (enumeration) as_enum(enumeration)->Release();
+    if (device) as_video_device(device)->Release();
+}
+extern "C" HRESULT virtio_wddm_dxvk_video_refresh_view(
+        void *device, void *enumeration, void *current_resource, BOOL output, void **view) {
+    if (!device || !enumeration || !current_resource || !view || !*view) return E_INVALIDARG;
+    VPRefreshLease<ID3D11Resource> current(as_resource(current_resource), true);
+    VPRefreshLease<ID3D11VideoDevice> dev(as_video_device(device), true);
+    VPRefreshLease<ID3D11VideoProcessorEnumerator> enumerator(as_enum(enumeration), true);
+    HRESULT hr = E_FAIL;
+    bool log_refresh = false;
+    try {
+        if (output) {
+            VPRefreshLease<ID3D11VideoProcessorOutputView> old(as_output_view(*view), true);
+            VPRefreshLease<ID3D11Resource> actual;
+            old.ptr->GetResource(&actual.ptr);
+            if (actual.ptr == current.ptr) return S_OK;
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC desc = {};
+            old.ptr->GetDesc(&desc);
+            log_refresh=vp_refresh_log_admit();
+            if (log_refresh) virtio_vp_identity_emit(1,FALSE,"kind=vp_refresh phase=before output=1 device=%p old_view=%p actual=%p current=%p",device,old.ptr,actual.ptr,current.ptr);
+            VPRefreshLease<ID3D11VideoProcessorOutputView> replacement;
+            hr=dev.ptr->CreateVideoProcessorOutputView(current.ptr,enumerator.ptr,&desc,&replacement.ptr);
+            if (SUCCEEDED(hr) && !replacement.ptr) hr=E_FAIL;
+            if (SUCCEEDED(hr)) {
+                *view=replacement.ptr;
+                replacement.ptr=nullptr; // Transfer the create reference to the DDI wrapper.
+                old.ptr->Release(); // Drop the wrapper's old reference; local lease remains.
+            }
+        } else {
+            VPRefreshLease<ID3D11VideoProcessorInputView> old(as_input_view(*view), true);
+            VPRefreshLease<ID3D11Resource> actual;
+            old.ptr->GetResource(&actual.ptr);
+            if (actual.ptr == current.ptr) return S_OK;
+            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC desc = {};
+            old.ptr->GetDesc(&desc);
+            log_refresh=vp_refresh_log_admit();
+            if (log_refresh) virtio_vp_identity_emit(1,FALSE,"kind=vp_refresh phase=before output=0 device=%p old_view=%p actual=%p current=%p",device,old.ptr,actual.ptr,current.ptr);
+            VPRefreshLease<ID3D11VideoProcessorInputView> replacement;
+            hr=dev.ptr->CreateVideoProcessorInputView(current.ptr,enumerator.ptr,&desc,&replacement.ptr);
+            if (SUCCEEDED(hr) && !replacement.ptr) hr=E_FAIL;
+            if (SUCCEEDED(hr)) {
+                *view=replacement.ptr;
+                replacement.ptr=nullptr;
+                old.ptr->Release();
+            }
+        }
+    } catch (...) {
+        // Local leases release actual/current/old/partial replacement on unwind.
+        hr=E_OUTOFMEMORY;
+    }
+    if (log_refresh || FAILED(hr)) virtio_vp_identity_emit(1,FAILED(hr),"kind=vp_refresh phase=after output=%u device=%p view=%p current=%p hr=0x%08lx",(unsigned)output,device,*view,current.ptr,(unsigned long)hr);
+    return hr;
+}
+
 extern "C" HRESULT virtio_wddm_dxvk_video_create_input_view(
         void *video_device, void *resource, void *enumeration, UINT four_cc,
         UINT mip_slice, UINT first_array_slice, void **view) {
@@ -207,10 +311,14 @@ extern "C" HRESULT virtio_wddm_dxvk_video_create_input_view(
         hr = as_video_device(video_device)->CreateVideoProcessorInputView(
             as_resource(resource), as_enum(enumeration), &desc, &object);
     } catch (...) {
+        if (object) object->Release();
         return E_OUTOFMEMORY;
     }
-    if (SUCCEEDED(hr))
-        *view = object;
+    if (FAILED(hr) || !object) {
+        if (object) object->Release();
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+    *view = object;
     return hr;
 }
 
@@ -244,10 +352,14 @@ extern "C" HRESULT virtio_wddm_dxvk_video_create_output_view(
         hr = as_video_device(video_device)->CreateVideoProcessorOutputView(
             as_resource(resource), as_enum(enumeration), &desc, &object);
     } catch (...) {
+        if (object) object->Release();
         return E_OUTOFMEMORY;
     }
-    if (SUCCEEDED(hr))
-        *view = object;
+    if (FAILED(hr) || !object) {
+        if (object) object->Release();
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+    *view = object;
     return hr;
 }
 
@@ -606,6 +718,10 @@ extern "C" HRESULT virtio_wddm_dxvk_video_upload_frame(void *d3d11_context, void
     ID3D11Texture2D *texture = static_cast<ID3D11Texture2D *>(dst);
     D3D11_TEXTURE2D_DESC desc = {};
     texture->GetDesc(&desc);
+    VTRACE("dx11um upload: enter tex=%p sub=%u %ux%u stride=%u fourcc=%08x desc=%ux%u "
+           "fmt=%u mips=%u array=%u", resource, subresource, width, height, stride,
+           fourcc, desc.Width, desc.Height, (UINT)desc.Format, desc.MipLevels,
+           desc.ArraySize);
     if (desc.Format != (p010 ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12) || width > desc.Width ||
         height > desc.Height)
         return E_INVALIDARG;
@@ -616,8 +732,11 @@ extern "C" HRESULT virtio_wddm_dxvk_video_upload_frame(void *d3d11_context, void
         return E_INVALIDARG;
 
     const D3D11_BOX box = { 0, 0, 0, width, height, 1 };
+    VTRACE("dx11um upload: calling UpdateSubresource (box %ux%u sub=%u src=%p)",
+           width, height, subresource, data);
     static_cast<ID3D11DeviceContext *>(d3d11_context)->UpdateSubresource(
         dst, subresource, &box, data, stride, stride * height);
+    VTRACE("dx11um upload: UpdateSubresource returned");
     return S_OK;
 }
 
@@ -668,9 +787,12 @@ extern "C" HRESULT virtio_wddm_dxvk_video_tex_stats(void *d3d11_device,
     HRESULT hr = device->CreateTexture2D(&staging_desc, nullptr, &staging);
     if (FAILED(hr) || !staging)
         return FAILED(hr) ? hr : E_FAIL;
+    VTRACE("dx11um tex_stats: staging %ux%u fmt=%u created, copying sub=%u",
+           staging_desc.Width, staging_desc.Height, (UINT)staging_desc.Format, subresource);
 
     context->CopySubresourceRegion(staging, 0, 0, 0, 0, src, subresource, nullptr);
     context->Flush();
+    VTRACE("dx11um tex_stats: copy queued + flushed, mapping (waits for the GPU)");
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     hr = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
@@ -678,6 +800,7 @@ extern "C" HRESULT virtio_wddm_dxvk_video_tex_stats(void *d3d11_device,
         staging->Release();
         return FAILED(hr) ? hr : E_FAIL;
     }
+    VTRACE("dx11um tex_stats: map returned pitch=%u pData=%p", mapped.RowPitch, mapped.pData);
 
     const BYTE *base = static_cast<const BYTE *>(mapped.pData);
     const UINT row_pitch = mapped.RowPitch;
@@ -701,10 +824,17 @@ extern "C" HRESULT virtio_wddm_dxvk_video_tex_stats(void *d3d11_device,
         count = (unsigned long long)desc.Width * desc.Height;
         sum_a /= (double)count;
 
+        /* VP9FIX2 (2026-10-25): the UV plane has desc.Height / 2 rows, and each
+         * row holds the interleaved U/V pairs.  The old code walked it with the
+         * Y-plane row index (y, up to desc.Height - 2) and so read up to
+         * row_pitch * (desc.Height - 2) bytes past the start of the UV plane,
+         * i.e. ~1 MB past the end of a 1920x1088 NV12 slice.  Iterating pairs
+         * with the row index y / 2 reads exactly the plane: the whole read is
+         * now row_pitch * desc.Height * 3 / 2 = the image size. */
         const BYTE *uv = base + (size_t)row_pitch * desc.Height;
         unsigned long long uv_count = 0;
         for (UINT y = 0; y + 1 < desc.Height; y += 2) {
-            const BYTE *row = uv + (size_t)y * row_pitch;
+            const BYTE *row = uv + (size_t)(y / 2u) * row_pitch;
             for (UINT x = 0; x + 1 < desc.Width; x += 2) {
                 if (p010) {
                     const uint16_t *pair = reinterpret_cast<const uint16_t *>(row) + x;
@@ -738,6 +868,8 @@ extern "C" HRESULT virtio_wddm_dxvk_video_tex_stats(void *d3d11_device,
 
     context->Unmap(staging, 0);
     staging->Release();
+    VTRACE("dx11um tex_stats: done Y=%.2f U=%.2f V=%.2f (%llu px)", sum_a, sum_b,
+           sum_c, count);
 
     *mean_a = sum_a;
     *mean_b = sum_b;

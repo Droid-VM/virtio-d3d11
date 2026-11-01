@@ -15,6 +15,40 @@
 #include "resource.h"
 
 #include "dxvk.h"
+#include <context_protection.h>
+
+#include <triton_close_trace.h>
+
+BOOL virtio_close_trace_enabled(void)
+{
+    static volatile LONG cache;
+    LONG value = InterlockedCompareExchange(&cache, 0, 0);
+    if (!value) {
+        char setting[2] = {0};
+        DWORD n = GetEnvironmentVariableA("VIRTIO_WDDM_CLOSE_TRACE", setting, sizeof(setting));
+        LONG proposed = n == 1 && setting[0] == '1' ? 2 : 1;
+        LONG previous = InterlockedCompareExchange(&cache, proposed, 0);
+        value = previous ? previous : proposed;
+    }
+    return value == 2;
+}
+
+ULONGLONG virtio_close_trace_next(void)
+{
+    static DECLSPEC_ALIGN(8) volatile LONG64 sequence;
+    return (ULONGLONG)InterlockedIncrement64(&sequence);
+}
+
+void virtio_close_trace_emit(const char *path, const char *phase,
+    ULONGLONG operation, ULONGLONG seq, DWORD pid, DWORD tid,
+    TR_CLOSE_SNAPSHOT s, HRESULT hr, BOOL failed)
+{
+    virtio_wddm_log(__FILE__, __LINE__, failed ? "ERROR" : "INFO",
+        "CLOSE_TRACE domain=umd-common level=%s path=%s phase=%s operation_id=%llu event_seq=%llu pid=%lu tid=%lu device=%p hRTDevice=%p hRTResource=%p alloc=0x%08x KMResource_field=0x%08x NumAllocations=%u HandleList[0]=0x%08x resource=%p owner_hRTResource=%p hr=0x%08lx",
+        failed ? "ERROR" : "INFO", path, phase, operation, seq, pid, tid,
+        s.device, s.rtdev, s.rtres, s.allocation, s.kmres, s.count, s.handle0,
+        s.resource, s.owner_rtres, hr);
+}
 
 __thread VIRTIO_WDDM_RuntimeAllocRecord virtio_wddm_last_runtime_alloc;
 __thread VIRTIO_WDDM_RuntimeAllocScope virtio_wddm_runtime_alloc_scope;
@@ -34,6 +68,10 @@ int virtio_wddm_runtime_alloc(void *ctx, const VIRTIO_WDDM_RuntimeAllocRequest *
     VIRTIO_WDDM_Device *device = ctx;
 
     if (!device || !req || !out) {
+        const ULONGLONG operation = virtio_close_trace_next();
+        const TR_CLOSE_SNAPSHOT trace = { .device = device };
+        virtio_close_trace_emit("runtime_alloc", "rejected_no_callback", operation, operation,
+            GetCurrentProcessId(), GetCurrentThreadId(), trace, E_INVALIDARG, TRUE);
         return -EINVAL;
     }
 
@@ -93,9 +131,24 @@ int virtio_wddm_runtime_alloc(void *ctx, const VIRTIO_WDDM_RuntimeAllocRequest *
          (unsigned long long)req->blob_id, (unsigned long long)req->size,
          req->mem, req->flags);
 
+    const BOOL close_trace = virtio_close_trace_enabled();
+    const DWORD trace_pid = GetCurrentProcessId(), trace_tid = GetCurrentThreadId();
+    TR_CLOSE_SNAPSHOT trace = { device, device->base.hRTDevice.handle,
+        allocate.hResource, 0, 0, allocate.NumAllocations, 0 };
+    const ULONGLONG operation = virtio_close_trace_next();
+    if (close_trace)
+        virtio_close_trace_emit("runtime_alloc", "before_requested", operation, operation,
+            trace_pid, trace_tid, trace, S_OK, FALSE);
     SetLastError(ERROR_SUCCESS);
     HRESULT hr = device->base.KTCallbacks.pfnAllocateCb(device->base.hRTDevice.handle, &allocate);
     DWORD last_error = GetLastError();
+    const ULONGLONG completed = virtio_close_trace_next();
+    trace.allocation = alloc_info.hAllocation;
+    trace.kmres = allocate.hKMResource;
+    if (close_trace || FAILED(hr) || alloc_info.hAllocation == 0)
+        virtio_close_trace_emit("runtime_alloc", "after_returned_no_HandleList", operation,
+            completed, trace_pid, trace_tid, trace, hr,
+            FAILED(hr) || alloc_info.hAllocation == 0);
 
     VERBOSE("%s: pfnAllocateCb end hr=0x%08lx last_error=%lu kmres=0x%08x allocation=0x%08x",
          __FUNCTION__, hr, last_error, allocate.hKMResource, alloc_info.hAllocation);
@@ -130,9 +183,19 @@ int virtio_wddm_runtime_free(void *ctx, const VIRTIO_WDDM_RuntimeAllocResult *al
     VIRTIO_WDDM_Device *device = ctx;
 
     if (!device || !alloc) {
+        const ULONGLONG operation = virtio_close_trace_next();
+        const TR_CLOSE_SNAPSHOT trace = { .device = device };
+        virtio_close_trace_emit("runtime_free", "rejected_no_callback", operation, operation,
+            GetCurrentProcessId(), GetCurrentThreadId(), trace, E_INVALIDARG, TRUE);
         return -EINVAL;
     }
     if (alloc->hAllocation == 0) {
+        if (virtio_close_trace_enabled()) {
+            const ULONGLONG operation = virtio_close_trace_next();
+            const TR_CLOSE_SNAPSHOT trace = { .device = device };
+            virtio_close_trace_emit("runtime_free", "zero_handle_no_callback", operation, operation,
+                GetCurrentProcessId(), GetCurrentThreadId(), trace, S_OK, FALSE);
+        }
         return 0;
     }
 
@@ -143,11 +206,24 @@ int virtio_wddm_runtime_free(void *ctx, const VIRTIO_WDDM_RuntimeAllocResult *al
         .HandleList     = handles,
     };
 
+    const BOOL close_trace = virtio_close_trace_enabled();
+    const DWORD trace_pid = GetCurrentProcessId(), trace_tid = GetCurrentThreadId();
+    const TR_CLOSE_SNAPSHOT trace = { device, device->base.hRTDevice.handle,
+        deallocate.hResource, alloc->hAllocation, alloc->hKMResource,
+        deallocate.NumAllocations, handles[0] };
+    const ULONGLONG operation = virtio_close_trace_next();
+    if (close_trace)
+        virtio_close_trace_emit("runtime_free", "before", operation, operation,
+            trace_pid, trace_tid, trace, S_OK, FALSE);
     HRESULT hr = device->base.KTCallbacks.pfnDeallocateCb(device->base.hRTDevice.handle, &deallocate);
+    const ULONGLONG completed = virtio_close_trace_next();
+    if (close_trace || FAILED(hr))
+        virtio_close_trace_emit("runtime_free", "after", operation, completed,
+            trace_pid, trace_tid, trace, hr, FAILED(hr));
     VERBOSE("%s: pfnDeallocateCb allocation=0x%08x kmres=0x%08x hr=0x%08lx", __FUNCTION__,
-         alloc->hAllocation, alloc->hKMResource, hr);
+         trace.allocation, trace.kmres, hr);
 
-    if (virtio_wddm_last_runtime_alloc.hAllocation == alloc->hAllocation) {
+    if (virtio_wddm_last_runtime_alloc.hAllocation == trace.allocation) {
         memset(&virtio_wddm_last_runtime_alloc, 0, sizeof(virtio_wddm_last_runtime_alloc));
     }
 
@@ -306,6 +382,12 @@ static void APIENTRY virtio_wddm_destroy_device(D3D10DDI_HDEVICE hDevice)
         return;
     }
 
+    const DWORD trace_pid = GetCurrentProcessId(), trace_tid = GetCurrentThreadId();
+    const TR_CLOSE_SNAPSHOT trace = { .device = device,
+        .rtdev = device->base.hRTDevice.handle };
+    const ULONGLONG operation = virtio_close_trace_next();
+    virtio_close_trace_emit("destroy_device", "entry", operation, operation,
+        trace_pid, trace_tid, trace, S_OK, FALSE);
     INFO("%s: destroying device %p / %p", __FUNCTION__, device->callbacks.hRTDevice, device->base.hRTDevice.handle);
 
     // FIXME: ensure that DXVK never tries to submit any more commands
@@ -382,7 +464,11 @@ static void APIENTRY virtio_wddm_destroy_device(D3D10DDI_HDEVICE hDevice)
 
     virtio_wddm_vk_bootstrap_release(&device->vk_bootstrap);
 
+    virtio_close_trace_emit("destroy_device", "before_private_zero", operation,
+        virtio_close_trace_next(), trace_pid, trace_tid, trace, S_OK, FALSE);
     memset(device, 0, sizeof(*device));
+    virtio_close_trace_emit("destroy_device", "after_private_zero_return_pending", operation,
+        virtio_close_trace_next(), trace_pid, trace_tid, trace, S_OK, FALSE);
     INFO("%s: complete", __FUNCTION__);
 }
 
@@ -600,6 +686,18 @@ HRESULT APIENTRY virtio_wddm_create_device(D3D10DDI_HADAPTER hAdapter, D3D10DDIA
     }
     INFO("%s: internal D3D11CreateDevice returned dev=%p ctx=%p feature=0x%x",
          __FUNCTION__, d3d11_device, d3d11_context, device->base.FeatureLevel);
+
+    /* Always protect this private context before publishing any aliases or
+     * starting collectors. Non-tag users pay the per-API locking cost too.
+     * No Enter/Leave spans media WAIT, IOCTL or ledger operations. */
+    ContextProtectionState protection;
+    hr = protect_internal_context(d3d11_context, &protection);
+    INFO("internal context protection QI=0x%08lx before=%d previous=%d after=%d hr=0x%08lx",
+         protection.query_hr, protection.before, protection.previous, protection.after, hr);
+    if (FAILED(hr)) {
+        ERROR("Internal context multithread protection required; initialization failed: 0x%08lx", hr);
+        return hr; /* CLEANUP locals release context and device. */
+    }
 
     hr = ID3D11Device_QueryInterface(d3d11_device, &IID_ID3D11Device1, (void **) &device->base.pDev1);
     if (FAILED(hr)) {

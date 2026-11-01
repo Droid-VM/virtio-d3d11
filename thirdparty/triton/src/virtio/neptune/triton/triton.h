@@ -93,6 +93,7 @@ typedef struct TRITON_DEVICE {
 
     /* Runtime callback handle + table. The DDI is mostly VOID-returning;
      * to signal asynchronous failures we route through pfnSetErrorCb. */
+    volatile LONG read_failure_hr; /* first terminal decode-read error; device rebuild clears */
     D3D10DDI_HRTCORELAYER                            hRTCoreLayer;
     const D3D11DDI_CORELAYER_DEVICECALLBACKS        *pUMCallbacks;
 
@@ -237,6 +238,18 @@ typedef struct TRITON_DEVICE {
 
 void tritonSetError_impl(PTRITON_DEVICE pD, HRESULT hr, const char *function);
 #define tritonSetError(pD, hr) tritonSetError_impl(pD, hr, __FUNCTION__)
+enum TR_READ_ACTION { TR_READ_WAIT, TR_READ_NOWAIT, TR_READ_ADMIT, TR_READ_RELEASE, TR_READ_FORGET };
+static inline HRESULT tritonReadGate(PTRITON_DEVICE pD) {
+ return pD ? (HRESULT)InterlockedCompareExchange(&pD->read_failure_hr,0,0) : E_FAIL;
+}
+static inline HRESULT tritonReadFailure(PTRITON_DEVICE pD,HRESULT hr) {
+ if(pD && FAILED(hr) && hr!=DXGI_ERROR_WAS_STILL_DRAWING) {
+   LONG previous=InterlockedCompareExchange(&pD->read_failure_hr,(LONG)hr,0);
+   if(!previous) tritonSetError(pD,hr); /* state published, no media lock held */
+ }
+ return hr;
+}
+
 
 /* D3D11 no longer drains the runtime's deferred-destruction queue through
  * pfnRenderCb. Call this on the entering DDI thread at submission boundaries;
@@ -309,6 +322,9 @@ typedef struct TRITON_RESOURCE {
     D3DKMT_HANDLE          hImportResKmt;
 
     ID3D11Resource        *pResource;
+    UINT64 decodeReadMapTicket;
+    volatile LONG decodeReadMapPin;
+    UINT decodeReadMapSubresource;
 
     /* Head of the intrusive list of live views wrapping this resource. */
     TRITON_VIEWLINK       *pViewList;

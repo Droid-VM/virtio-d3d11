@@ -661,7 +661,7 @@ tritonDraw(D3D10DDI_HDEVICE hDevice, UINT VertexCount, UINT StartVertexLocation)
 {
     TR_TRACE();
     PTRITON_DEVICE pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
-    if (!pD) return;
+    if (!pD || FAILED(tritonReadGate(pD))) return;
     TR_SHADER_DIAG("Draw dev=%p count=%u start=%u", pD, VertexCount, StartVertexLocation);
     ID3D11DeviceContext1_Draw(pD->pCtx1, VertexCount, StartVertexLocation);
 }
@@ -672,7 +672,7 @@ tritonDrawIndexed(D3D10DDI_HDEVICE hDevice, UINT IndexCount,
 {
     TR_TRACE();
     PTRITON_DEVICE pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
-    if (!pD) return;
+    if (!pD || FAILED(tritonReadGate(pD))) return;
     TR_SHADER_DIAG("DrawIndexed dev=%p count=%u start=%u base=%d", pD,
         IndexCount, StartIndexLocation, BaseVertexLocation);
     ID3D11DeviceContext1_DrawIndexed(pD->pCtx1, IndexCount, StartIndexLocation, BaseVertexLocation);
@@ -685,7 +685,7 @@ tritonDrawInstanced(D3D10DDI_HDEVICE hDevice, UINT VertexCountPerInstance,
 {
     TR_TRACE();
     PTRITON_DEVICE pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
-    if (!pD) return;
+    if (!pD || FAILED(tritonReadGate(pD))) return;
     TR_SHADER_DIAG("DrawInstanced dev=%p count=%u instances=%u start=%u instanceStart=%u", pD,
         VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
     ID3D11DeviceContext1_DrawInstanced(pD->pCtx1, VertexCountPerInstance, InstanceCount,
@@ -699,7 +699,7 @@ tritonDrawIndexedInstanced(D3D10DDI_HDEVICE hDevice, UINT IndexCountPerInstance,
 {
     TR_TRACE();
     PTRITON_DEVICE pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
-    if (!pD) return;
+    if (!pD || FAILED(tritonReadGate(pD))) return;
     TR_SHADER_DIAG("DrawIndexedInstanced dev=%p count=%u instances=%u start=%u base=%d instanceStart=%u", pD,
         IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
     ID3D11DeviceContext1_DrawIndexedInstanced(pD->pCtx1, IndexCountPerInstance, InstanceCount,
@@ -712,7 +712,7 @@ tritonDrawAuto(D3D10DDI_HDEVICE hDevice)
 {
     TR_TRACE();
     PTRITON_DEVICE pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
-    if (!pD) return;
+    if (!pD || FAILED(tritonReadGate(pD))) return;
     ID3D11DeviceContext1_DrawAuto(pD->pCtx1);
 }
 
@@ -723,7 +723,7 @@ tritonDrawInstancedIndirect(D3D10DDI_HDEVICE hDevice,
     TR_TRACE();
     PTRITON_DEVICE   pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     PTRITON_RESOURCE r  = (PTRITON_RESOURCE)(hBuf.pDrvPrivate);
-    if (!pD || !r || !r->pResource) return;
+    if (!pD || !r || !r->pResource || FAILED(tritonReadGate(pD))) return;
     ID3D11DeviceContext1_DrawInstancedIndirect(
         pD->pCtx1, (ID3D11Buffer *)r->pResource, Offset);
 }
@@ -735,7 +735,7 @@ tritonDrawIndexedInstancedIndirect(D3D10DDI_HDEVICE hDevice,
     TR_TRACE();
     PTRITON_DEVICE   pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     PTRITON_RESOURCE r  = (PTRITON_RESOURCE)(hBuf.pDrvPrivate);
-    if (!pD || !r || !r->pResource) return;
+    if (!pD || !r || !r->pResource || FAILED(tritonReadGate(pD))) return;
     ID3D11DeviceContext1_DrawIndexedInstancedIndirect(
         pD->pCtx1, (ID3D11Buffer *)r->pResource, Offset);
 }
@@ -745,7 +745,7 @@ tritonDispatch(D3D10DDI_HDEVICE hDevice, UINT X, UINT Y, UINT Z)
 {
     TR_TRACE();
     PTRITON_DEVICE pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
-    if (!pD) return;
+    if (!pD || FAILED(tritonReadGate(pD))) return;
     ID3D11DeviceContext1_Dispatch(pD->pCtx1, X, Y, Z);
 }
 
@@ -756,7 +756,7 @@ tritonDispatchIndirect(D3D10DDI_HDEVICE hDevice,
     TR_TRACE();
     PTRITON_DEVICE   pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     PTRITON_RESOURCE r  = (PTRITON_RESOURCE)(hBuf.pDrvPrivate);
-    if (!pD || !r || !r->pResource) return;
+    if (!pD || !r || !r->pResource || FAILED(tritonReadGate(pD))) return;
     ID3D11DeviceContext1_DispatchIndirect(
         pD->pCtx1, (ID3D11Buffer *)r->pResource, Offset);
 }

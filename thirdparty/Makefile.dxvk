@@ -303,12 +303,12 @@ $(BUILD_DIR)/%.h: $(DXVK_PATH)/%.geom | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(GLSLANG) $(GLSL_ARGS) -V --vn "$(basename $(notdir $<))" --depfile "$(BUILD_DIR)/$(basename $(notdir $<)).d" $< -o $@
 
-.PHONY: dxvk-version-force
+.PHONY:
 dxvk-version-force:
 
 # The persistent IR cache must change even for edits inside a dirty submodule.
 # The generator preserves the header timestamp when all inputs are unchanged.
-$(BUILD_DIR)/version.h: $(DXVK_PATH)/version.h.in thirdparty/gen_dxvk_version.py dxvk-version-force | $(BUILD_DIR)
+$(BUILD_DIR)/version.h: $(DXVK_PATH)/version.h.in thirdparty/gen_dxvk_version.py | $(BUILD_DIR)
 	$(PYTHON) thirdparty/gen_dxvk_version.py --root $(DXVK_PATH) --output $@ --target "$(DXVK_TARGET)" --compiler "$(DXVK_COMPILER_VERSION)" --flags "$(CFLAGS) $(CXXFLAGS) $(GLSL_ARGS)"
 
 $(BUILD_DIR)/buildenv.h: $(DXVK_PATH)/buildenv.h.in | $(BUILD_DIR)

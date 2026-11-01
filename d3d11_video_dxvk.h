@@ -22,10 +22,27 @@
  * are plain DXVK COM pointers, so a 0/NULL pointer is always accepted. */
 
 #include <windows.h>
+/* VP_IDENTITY_DIAG_BEGIN */
+/* Scalar observation only. GetResource reference is released before return. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+ULONG_PTR virtio_wddm_dxvk_video_view_resource_identity(void *view, BOOL output);
+#ifdef __cplusplus
+}
+#endif
+/* VP_IDENTITY_DIAG_END */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* VP identity refresh: retained device/enumerator outlive their DDI wrappers.
+ * refresh leaves the old view untouched on failure; caller must refuse BLT. */
+void virtio_wddm_dxvk_video_retain_refresh_context(void *device, void *enumeration);
+void virtio_wddm_dxvk_video_release_refresh_context(void *device, void *enumeration);
+HRESULT virtio_wddm_dxvk_video_refresh_view(void *device, void *enumeration,
+    void *current_resource, BOOL output, void **view);
 
 /* D3D11_1DDI_VIDEO_PROCESSOR_CONTENT_DESC, field for field, so the C side does
  * not have to hand the bridge any DDI-specific type. Enum values (frame

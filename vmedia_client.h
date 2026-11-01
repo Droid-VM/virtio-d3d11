@@ -49,8 +49,11 @@ VM_CLIENT_API VM_SESSION * VM_CALL vm_open_codec(uint32_t kind, uint32_t codec,
 VM_CLIENT_API VM_SESSION * VM_CALL vm_open(uint32_t kind, VM_OPEN_OUT *out);
 
 /* Send one H.264 access unit.  `data`/`size` are copied into a single
- * METHOD_BUFFERED input: VM_SEND_IN followed by the bytes.  The driver accepts
- * exactly one access unit per session in P2-1. */
+ * METHOD_BUFFERED input: VM_SEND_IN_EX followed by the bytes, so the driver's
+ * SESSION-OWNERSHIP check can tell this session's access units from a replaced
+ * decoder's.  On a driver older than VMEDIA_SESSION_OWNERSHIP_MIN_VERSION the
+ * first call falls back to the legacy VM_IOCTL_SEND_BITSTREAM (one extra failed
+ * ioctl per session) and the session stays on the legacy path. */
 VM_CLIENT_API int VM_CALL vm_send(VM_SESSION *session,
                                   const void *data, uint32_t size,
                                   uint32_t width, uint32_t height,
@@ -87,6 +90,15 @@ VM_CLIENT_API void VM_CALL vm_close(VM_SESSION *session);
  * reference frame.  The next vm_send() must be an IDR that carries SPS/PPS.
  * Updates the session's driver session id.  Returns 1 on success. */
 VM_CLIENT_API int VM_CALL vm_flush(VM_SESSION *session, VM_FLUSH_OUT *out);
+
+/* Tag path requires driver .26 and a generation token; never falls back.
+ * The caller correlates returned tag with its own outstanding job table. */
+VM_CLIENT_API int VM_CALL vm_send_tag(VM_SESSION *session, const void *data, uint32_t size,
+    uint32_t width, uint32_t height, uint32_t flags, uint64_t tag, VM_SEND_OUT *out);
+VM_CLIENT_API int VM_CALL vm_get_frame_tag(VM_SESSION *session, void *pixels, uint32_t capacity,
+    VM_FRAME_TAG_OUT *out, uint32_t timeout_ms);
+VM_CLIENT_API int VM_CALL vm_map_frame_tag(VM_SESSION *session, VM_FRAME_MAP_TAG_OUT *out,
+    uint32_t timeout_ms);
 
 /* Last Win32 error (0 after a successful call). */
 VM_CLIENT_API uint32_t VM_CALL vm_last_error(void);
