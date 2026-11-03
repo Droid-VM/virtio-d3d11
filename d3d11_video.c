@@ -8338,7 +8338,12 @@ static BOOL decoder_life_flush(VIRTIO_WDDM_VideoDecoder *runtime, const char *re
     ULONGLONG deadline;
     VM_FLUSH_OUT out;
     UINT i;
-    (void)reason;
+    UINT old_session=0;
+    UINT64 old_token=0, old_generation=0, committed_generation=0, sequence=0;
+    BOOL snapshot=FALSE, io_attempted=FALSE, io_ok=FALSE, committed=FALSE;
+    DWORD io_error=ERROR_SUCCESS;
+    const char *phase="quiesce";
+    memset(&out,0,sizeof(out));
     if(!runtime) return FALSE;
     if(runtime->driver_version<VMEDIA_FLUSH_MIN_DRIVER_VERSION) {
         pipeline_fail_admission(runtime);
@@ -8380,6 +8385,19 @@ wait:
         WaitForSingleObject(p->ready,ml_remaining(GetTickCount64(),deadline)>10 ? 10 :
             ml_remaining(GetTickCount64(),deadline));
     }
+    /* Snapshot under pipe->lock; never log inside the publication SRW lock. */
+    old_session=p->object->session_id;
+    old_token=p->object->media_token;
+    old_generation=p->generation;
+    sequence=p->submit_seq;
+    snapshot=TRUE;
+    INFO("LIFE_FLUSH entry runtime=%p ctx=%p reason=%s seq=%llu session=%u "
+         "token=%llu gen=%llu mappings=%u worker=%u reader=%u terminal=%ld",
+         runtime,p,reason?reason:"?",(unsigned long long)sequence,old_session,
+         (unsigned long long)old_token,(unsigned long long)old_generation,
+         p->mappings_out,(UINT)p->worker_active,(UINT)p->reader_active,
+         (long)ma_terminal(&p->admission_terminal));
+    phase="release";
     /* All old IO and uploads have left. RELEASE may itself block in the driver;
      * this deadline is NOT a bound on synchronous WDF or the whole DDI. */
     for(i=0;i<p->job_count;++i) {
@@ -8391,7 +8409,11 @@ wait:
        p->generation==~(UINT64)0 || GetTickCount64()>=deadline) goto failed;
     memset(&out,0,sizeof(out));
     /* owned_session stays owned even on ambiguous IO/short response failure. */
-    if(!vm_flush(life_owner_session(p),&out)) goto failed;
+    phase="ioctl";
+    io_attempted=TRUE;
+    io_ok=vm_flush(life_owner_session(p),&out)?TRUE:FALSE;
+    if(!io_ok) { io_error=vm_last_error(); goto failed; }
+    phase="publish";
     if(!out.SessionToken || InterlockedCompareExchange(&p->detached,0,0) ||
        ma_terminal(&p->admission_terminal)) goto failed; /* session id zero is valid */
     /* Detach and commit serialize on the publication lock. Never restart a
@@ -8408,6 +8430,8 @@ wait:
     p->object->send_fail_streak=runtime->send_fail_streak=0;
     p->object->direct_fail_streak=runtime->direct_fail_streak=0;
     ++p->generation;
+    committed_generation=p->generation;
+    committed=TRUE;
     p->drain_seq=p->submit_seq; /* global tags / submit sequence never reused */
     p->jobs_in_flight=0;
     p->av1_outstanding=0; p->av1_inputs_sent=0; p->last_submit_qpc=0;
@@ -8417,6 +8441,14 @@ wait:
     runtime->frames_dropped+=out.DroppedFrames;
     ReleaseSRWLockExclusive(&g_runtime_ctx_lock);
     LeaveCriticalSection(&p->lock); locked=FALSE;
+    INFO("LIFE_FLUSH commit runtime=%p ctx=%p reason=%s seq=%llu "
+         "old_session=%u new_session=%u old_token=%llu new_token=%llu "
+         "old_gen=%llu new_gen=%llu dropped_au=%u dropped_frames=%u",
+         runtime,p,reason?reason:"?",(unsigned long long)sequence,old_session,out.SessionId,
+         (unsigned long long)old_token,(unsigned long long)out.SessionToken,
+         (unsigned long long)old_generation,(unsigned long long)committed_generation,
+         out.DroppedAu,out.DroppedFrames);
+    phase="read_forget";
     read_forget(p,FALSE);
     if(runtime->codec==VIRTIO_WDDM_CODEC_AV1) {
         av1_dpb_reset(&runtime->av1_dpb);
@@ -8433,8 +8465,20 @@ wait:
     InterlockedExchange(&p->flushing,0);
     ReleaseSRWLockExclusive(&g_runtime_ctx_lock);
     ok=TRUE;
+    INFO("LIFE_FLUSH resume runtime=%p ctx=%p reason=%s seq=%llu gen=%llu",
+         runtime,p,reason?reason:"?",(unsigned long long)sequence,
+         (unsigned long long)committed_generation);
     goto owner_done;
 failed:
+    ERROR("LIFE_FLUSH fail runtime=%p ctx=%p reason=%s phase=%s snapshot=%u "
+          "seq=%llu old_session=%u old_token=%llu old_gen=%llu ioctl_attempted=%u "
+          "ioctl_ok=%u error=%lu committed=%u new_session=%u new_token=%llu new_gen=%llu "
+          "dropped_au=%u dropped_frames=%u",
+          runtime,p,reason?reason:"?",phase,(UINT)snapshot,(unsigned long long)sequence,
+          old_session,(unsigned long long)old_token,(unsigned long long)old_generation,
+          (UINT)io_attempted,(UINT)io_ok,(unsigned long)io_error,(UINT)committed,
+          out.SessionId,(unsigned long long)out.SessionToken,
+          (unsigned long long)committed_generation,out.DroppedAu,out.DroppedFrames);
     /* May arrive without pipe lock. Atomic terminal closes all admission;
      * never race an unlocked ordinary broken write or revive via flush. */
     pipeline_fail_admission(runtime);
