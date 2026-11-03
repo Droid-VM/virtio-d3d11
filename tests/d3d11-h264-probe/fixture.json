@@ -1,0 +1,7 @@
+{
+  "geometry": 96,
+  "host_geometry_basis": "96 observed session initialization; exact advertised minimum not queried",
+  "red": "AAAAAWdCwArcY2wEQAAAAwBAAAADAIPEieAAAAABaM4PLIAAAAFliIQEvEYoAAqLxwABKNjgAC+tJycnJyddddddddddddddddddddddddddddddeA==",
+  "blue": "AAAAAWdCwArcY2wEQAAAAwBAAAADAIPEieAAAAABaM4PLIAAAAFliIQEvEYoAAzExwABfWjgACJDJycnJyddddddddddddddddddddddddddddddeA==",
+  "generator": "ffmpeg color=c=COLOR:size=96x96:rate=1 -frames:v 1 -c:v libx264 -profile:v baseline -level 1.0 -pix_fmt yuv420p -x264-params keyint=1:min-keyint=1:scenecut=0:bframes=0:ref=1:slices=1:repeat-headers=1:aud=0 -bsf:v filter_units=remove_types=6 -f h264 pipe:1"
+}
