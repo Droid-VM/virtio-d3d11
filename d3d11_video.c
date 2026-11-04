@@ -117,6 +117,7 @@
  * needs -- submit returning 0..N temporal units, the exact refresh mask derived
  * from the NEXT picture's reference map, and flush() -- lives there. */
 #include "av1_dpb.h"
+#include "av1_tile_identity.h"
 
 /* AV1 STATEFUL PORT (2026-10-27): build switch for the OLD composition path.
  *
@@ -699,6 +700,7 @@ typedef struct VIRTIO_WDDM_VideoDecoder {
     UINT64 av1_catchups;      /* hidden DPB catch-up frames re-sent */
     UINT64 av1_masks_derived; /* refresh masks recovered from a successor */
     UINT64 av1_bad_tile_records;
+    BOOL av1_identity_trace; /* opt-in exact tile identity; latched at creation */
 
     /* AV1 STATEFUL PORT (2026-10-27): the DPB + one-frame lookahead builder.
      * It OWNS the refresh-mask derivation, the DPB mirror, the deferred picture
@@ -1808,6 +1810,8 @@ static HRESULT APIENTRY virtio_wddm_video_create_video_decoder(
      * itself (and logs why) for VP9, for a driver that predates VM_IOCTL_FLUSH,
      * and when VIRTIO_WDDM_PIPELINE=0, in which case every frame takes the exact
      * serial path this UMD shipped before. */
+    object->av1_identity_trace = profile->codec == VIRTIO_WDDM_CODEC_AV1 &&
+        pipeline_env_flag("VIRTIO_WDDM_AV1_IDENTITY_TRACE", FALSE);
     object->life_requested = pipeline_env_flag("VIRTIO_WDDM_TAG_LIFE_EXPERIMENT", FALSE);
     BOOL pipeline_ok = pipeline_create(object);
     if ((object->life_requested || object->async_lifetime) &&
@@ -10315,6 +10319,32 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
                                 av1_tiles_n, width, height)) {
             decoder_fail_frame(object, E_FAIL);
             return;
+        }
+        /* Log input identity only after validating every tile range and frame
+         * parameter. This records DDI input, not SEND acceptance or display PTS. */
+        if (object->av1_identity_trace) {
+            VIRTIO_WDDM_DecodePipeline *identity_pipe=decoder_ctx_access(object);
+            UINT64 identity_gen=0;
+            if (identity_pipe) {
+                EnterCriticalSection(&identity_pipe->lock);
+                identity_gen=identity_pipe->generation;
+                LeaveCriticalSection(&identity_pipe->lock);
+            }
+            for (i=0;i<av1_tiles_n;++i) {
+                char tile_hash[65];
+                av1_tile_sha256(object->bitstream+av1_tiles[i].offset,av1_tiles[i].size,tile_hash);
+                INFO("AV1_INPUT_ID v=1 decoder=%p ctx=%p gen=%llu session=%u token=%llu "
+                     "pic=%llu qpc=%lld type=%u show=%u oh=%u oh_bits=%u "
+                     "tile=%u tiles=%u row=%u col=%u bytes=%u sha256=%s "
+                     "view=%p resource=%p mip=%u slice=%u",
+                     object,identity_pipe,(unsigned long long)identity_gen,
+                     object->session_id,(unsigned long long)object->media_token,
+                     (unsigned long long)object->av1_pic_buffers,(long long)decoder_qpc_now(),
+                     (UINT)object->av1_pic.format.frame_type,(UINT)object->av1_pic.format.show_frame,
+                     (UINT)object->av1_pic.order_hint,(UINT)object->av1_pic.order_hint_bits,
+                     i,av1_tiles_n,av1_tiles[i].row,av1_tiles[i].column,av1_tiles[i].size,tile_hash,
+                     view,resource,view->mip_slice,view->first_array_slice);
+            }
         }
         if (object->av1_pic.format.show_frame == 0) {
             VERBOSE("%s: picture was coded hidden (show_frame=0); it is emitted "
