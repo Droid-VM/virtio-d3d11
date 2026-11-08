@@ -26,18 +26,20 @@ __declspec(dllimport) BOOL __stdcall FlushFileBuffers(HANDLE);
 __declspec(dllimport) void *__stdcall VirtualAlloc(void *, size_t, DWORD, DWORD);
 __declspec(dllimport) BOOL __stdcall VirtualFree(void *, size_t, DWORD);
 __declspec(dllimport) void __stdcall OutputDebugStringA(const char *);
+__declspec(dllimport) DWORD __stdcall GetLastError(void);
 __declspec(dllimport) void __stdcall ExitProcess(uint32_t);
 #define MEM_COMMIT 0x00001000u
 #define MEM_RESERVE 0x00002000u
 #define MEM_RELEASE 0x00008000u
 #define PAGE_READWRITE 0x00000004u
 static const uint16_t ENCODER_LINK[] = {
-    '\\', '.', '\\', 'V','M','e','d','i','a','E','n','c','o','d','e','r', 0
+    '\\', '\\', '.', '\\', 'V','M','e','d','i','a','E','n','c','o','d','e','r', 0
 };
 
 #define WIDTH 64u
 #define HEIGHT 48u
-#define NV12_BYTES (WIDTH * HEIGHT * 3u / 2u)
+#define MAX_STRIDE (WIDTH * 2u)
+#define NV12_MAX_BYTES (MAX_STRIDE * HEIGHT * 3u / 2u)
 #define PACKET_CAPACITY (1024u * 1024u)
 #define PACKET_WAIT_MS 3000u
 #define INPUT_FRAMES 4u
@@ -56,38 +58,62 @@ typedef struct {
     uint64_t timestamp_100ns;
 } PACKET_META;
 
-static void make_nv12(uint8_t *p, unsigned frame)
+typedef struct {
+    uint32_t step;
+    uint32_t status;
+    uint32_t returned_bytes;
+    uint32_t frame_index;
+} PROBE_LOG_RECORD;
+
+static void zero_bytes(void *p, size_t n);
+
+static void make_nv12(uint8_t *p, uint32_t size, uint32_t y_stride,
+                      uint32_t uv_stride, uint32_t uv_offset, unsigned frame)
 {
     unsigned x, y;
-    uint8_t *uv = p + WIDTH * HEIGHT;
+    zero_bytes(p, size);
     for (y = 0; y < HEIGHT; ++y) {
         for (x = 0; x < WIDTH; ++x) {
-            p[y * WIDTH + x] = (uint8_t)((x * 3u + y * 5u + frame * 37u) & 255u);
+            p[y * y_stride + x] = (uint8_t)((x * 3u + y * 5u + frame * 37u) & 255u);
         }
     }
     for (y = 0; y < HEIGHT / 2; ++y) {
         for (x = 0; x < WIDTH; x += 2) {
-            uv[y * WIDTH + x] = (uint8_t)(96u + frame * 17u);
-            uv[y * WIDTH + x + 1] = (uint8_t)(160u - frame * 13u);
+            p[uv_offset + y * uv_stride + x] = (uint8_t)(96u + frame * 17u);
+            p[uv_offset + y * uv_stride + x + 1] = (uint8_t)(160u - frame * 13u);
         }
     }
 }
 
 static void zero_bytes(void *p, size_t n)
 {
-    uint8_t *b = (uint8_t *)p;
+    volatile uint8_t *b = (volatile uint8_t *)p;
     size_t i;
     for (i = 0; i < n; ++i) b[i] = 0;
+}
+
+static DWORD g_last_error;
+static HANDLE g_log = INVALID_HANDLE_VALUE;
+
+static void log_step(uint32_t step, uint32_t status, uint32_t returned, uint32_t frame)
+{
+    PROBE_LOG_RECORD r;
+    DWORD written = 0;
+    r.step = step; r.status = status; r.returned_bytes = returned; r.frame_index = frame;
+    if (g_log != INVALID_HANDLE_VALUE) WriteFile(g_log, &r, sizeof(r), &written, NULL);
 }
 
 static int ioctl_ok(HANDLE h, DWORD code, void *in, DWORD in_len,
                     void *out, DWORD out_len, DWORD *returned, const char *name)
 {
     if (!DeviceIoControl(h, code, in, in_len, out, out_len, returned, NULL)) {
+        g_last_error = GetLastError();
+        log_step(code, g_last_error, returned ? *returned : 0, 0);
         (void)name;
         OutputDebugStringA("encoder probe: DeviceIoControl failed\n");
         return 0;
     }
+    log_step(code, 0, returned ? *returned : 0, 0);
     return 1;
 }
 
@@ -95,6 +121,7 @@ static int probe_run(void)
 {
     static const uint16_t output_path[] = {'e','n','c','o','d','e','r','-','p','r','o','b','e','.','h','2','6','4',0};
     static const uint16_t metadata_path[] = {'e','n','c','o','d','e','r','-','p','r','o','b','e','.','m','e','t','a',0};
+    static const uint16_t log_path[] = {'e','n','c','o','d','e','r','-','p','r','o','b','e','.','l','o','g',0};
     HANDLE h = INVALID_HANDLE_VALUE;
     HANDLE output = INVALID_HANDLE_VALUE;
     HANDLE metadata = INVALID_HANDLE_VALUE;
@@ -105,17 +132,23 @@ static int probe_run(void)
     VM_OPEN_OUT open_out;
     VM_ENCODER_CONFIG config;
     DWORD bytes = 0;
+    uint32_t payload_size = 0;
     unsigned submitted = 0, packets = 0;
     int status = 1;
 
-    frame = (uint8_t *)VirtualAlloc(NULL, NV12_BYTES, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    input_request = (uint8_t *)VirtualAlloc(NULL, sizeof(VM_ENCODER_INPUT) + NV12_BYTES,
+    frame = (uint8_t *)VirtualAlloc(NULL, NV12_MAX_BYTES, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    input_request = (uint8_t *)VirtualAlloc(NULL, sizeof(VM_ENCODER_INPUT) + NV12_MAX_BYTES,
                                             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!frame || !input_request) { OutputDebugStringA("encoder probe: NV12 buffers allocation failed\n"); goto done; }
+    g_log = CreateFileW(log_path, GENERIC_WRITE, 0, NULL, 2u, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (g_log == INVALID_HANDLE_VALUE) { OutputDebugStringA("encoder probe: log file open failed\n"); goto done; }
+    log_step(0, 0, 0, 0);
     h = CreateFileW(ENCODER_LINK, GENERIC_READ | GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
                     FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) {
+        g_last_error = GetLastError();
+        log_step(0x80000000u, g_last_error, 0, 0);
         OutputDebugStringA("encoder probe: open encoder link failed\n");
         goto done;
     }
@@ -148,16 +181,21 @@ static int probe_run(void)
         goto close_session;
     }
     OutputDebugStringA("encoder probe: NV12 configured\n");
+    payload_size = config.UVOffset + config.UVStride * (HEIGHT / 2u);
+    if (config.YStride > MAX_STRIDE || config.UVStride > MAX_STRIDE || payload_size > NV12_MAX_BYTES) {
+        OutputDebugStringA("encoder probe: negotiated NV12 layout exceeds probe buffer\n");
+        goto close_session;
+    }
 
     for (submitted = 0; submitted < INPUT_FRAMES; ++submitted) {
         VM_ENCODER_INPUT input;
-        make_nv12(frame, submitted);
+        make_nv12(frame, payload_size, config.YStride, config.UVStride, config.UVOffset, submitted);
         zero_bytes(&input, sizeof(input));
         input.Version = VM_ENCODER_ABI_VERSION;
         input.Size = sizeof(input);
         input.SessionToken = open_out.SessionToken;
         input.BufferId = submitted;
-        input.DataSize = NV12_BYTES;
+        input.DataSize = payload_size;
         input.Timestamp = (uint64_t)submitted * 333333u;
         input.YOffset = 0;
         input.UVOffset = config.UVOffset;
@@ -166,9 +204,9 @@ static int probe_run(void)
         {
             size_t i;
             for (i = 0; i < sizeof(input); ++i) input_request[i] = ((const uint8_t *)&input)[i];
-            for (i = 0; i < NV12_BYTES; ++i) input_request[sizeof(input) + i] = frame[i];
+            for (i = 0; i < payload_size; ++i) input_request[sizeof(input) + i] = frame[i];
             if (!ioctl_ok(h, VM_IOCTL_ENC_QUEUE_INPUT, input_request,
-                          (DWORD)(sizeof(input) + NV12_BYTES), NULL, 0, &bytes,
+                          (DWORD)(sizeof(input) + payload_size), NULL, 0, &bytes,
                           "VM_IOCTL_ENC_QUEUE_INPUT")) goto close_session;
         }
         OutputDebugStringA("encoder probe: NV12 frame queued\n");
@@ -193,7 +231,13 @@ static int probe_run(void)
         request.Capacity = PACKET_CAPACITY;
         zero_bytes(&packet->info, sizeof(packet->info));
         if (!ioctl_ok(h, VM_IOCTL_ENC_GET_PACKET, &request, sizeof(request), packet,
-                      sizeof(*packet), &bytes, "VM_IOCTL_ENC_GET_PACKET")) goto close_session;
+                      sizeof(*packet), &bytes, "VM_IOCTL_ENC_GET_PACKET")) {
+            if (g_last_error == 121u) {
+                OutputDebugStringA("encoder probe: packet wait timed out\n");
+                break;
+            }
+            goto close_session;
+        }
         if (bytes < sizeof(VM_ENCODER_PACKET_INFO) ||
             packet->info.Version != VM_ENCODER_ABI_VERSION ||
             packet->info.SessionToken != open_out.SessionToken ||
@@ -234,6 +278,7 @@ static int probe_run(void)
                 goto close_session;
             }
         }
+        log_step(0x1000u, 0, packet->info.BytesUsed, packets);
         ++packets;
     }
     if (packets < MIN_PACKETS) {
@@ -259,6 +304,8 @@ close_session:
         }
     }
 done:
+    log_step(0xFFFFu, (uint32_t)status, packets, 0);
+    if (g_log != INVALID_HANDLE_VALUE) { FlushFileBuffers(g_log); CloseHandle(g_log); g_log = INVALID_HANDLE_VALUE; }
     if (frame) VirtualFree(frame, 0, MEM_RELEASE);
     if (input_request) VirtualFree(input_request, 0, MEM_RELEASE);
     if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
