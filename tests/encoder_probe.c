@@ -48,6 +48,14 @@ typedef struct {
     uint8_t bytes[PACKET_CAPACITY];
 } PACKET_BUFFER;
 
+typedef struct {
+    uint32_t index;
+    uint32_t bytes_used;
+    uint32_t flags;
+    uint32_t reserved;
+    uint64_t timestamp_100ns;
+} PACKET_META;
+
 static void make_nv12(uint8_t *p, unsigned frame)
 {
     unsigned x, y;
@@ -86,8 +94,10 @@ static int ioctl_ok(HANDLE h, DWORD code, void *in, DWORD in_len,
 static int probe_run(void)
 {
     static const uint16_t output_path[] = {'e','n','c','o','d','e','r','-','p','r','o','b','e','.','h','2','6','4',0};
+    static const uint16_t metadata_path[] = {'e','n','c','o','d','e','r','-','p','r','o','b','e','.','m','e','t','a',0};
     HANDLE h = INVALID_HANDLE_VALUE;
     HANDLE output = INVALID_HANDLE_VALUE;
+    HANDLE metadata = INVALID_HANDLE_VALUE;
     uint8_t *frame = NULL;
     uint8_t *input_request = NULL;
     PACKET_BUFFER *packet = NULL;
@@ -169,6 +179,9 @@ static int probe_run(void)
     output = CreateFileW(output_path, GENERIC_WRITE, 0, NULL, 2u,
                          FILE_ATTRIBUTE_NORMAL, NULL);
     if (output == INVALID_HANDLE_VALUE) { OutputDebugStringA("encoder probe: output file open failed\n"); goto close_session; }
+    metadata = CreateFileW(metadata_path, GENERIC_WRITE, 0, NULL, 2u,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (metadata == INVALID_HANDLE_VALUE) { OutputDebugStringA("encoder probe: metadata file open failed\n"); goto close_session; }
 
     while (packets < INPUT_FRAMES) {
         VM_ENCODER_GET_PACKET_IN request;
@@ -208,18 +221,32 @@ static int probe_run(void)
                 goto close_session;
             }
         }
+        {
+            PACKET_META meta;
+            DWORD written = 0;
+            meta.index = packets;
+            meta.bytes_used = packet->info.BytesUsed;
+            meta.flags = packet->info.Flags;
+            meta.reserved = 0;
+            meta.timestamp_100ns = packet->info.Timestamp;
+            if (!WriteFile(metadata, &meta, sizeof(meta), &written, NULL) || written != sizeof(meta)) {
+                OutputDebugStringA("encoder probe: metadata write failed\n");
+                goto close_session;
+            }
+        }
         ++packets;
     }
     if (packets < MIN_PACKETS) {
         OutputDebugStringA("encoder probe: fewer packets than minimum threshold\n");
         goto close_session;
     }
-    if (!FlushFileBuffers(output)) { OutputDebugStringA("encoder probe: output flush failed\n"); goto close_session; }
-    OutputDebugStringA("encoder probe: H264 output written\n");
+    if (!FlushFileBuffers(output) || !FlushFileBuffers(metadata)) { OutputDebugStringA("encoder probe: output flush failed\n"); goto close_session; }
+    OutputDebugStringA("encoder probe: H264 output and packet metadata written\n");
     status = 0;
 
 close_session:
     if (output != INVALID_HANDLE_VALUE) { CloseHandle(output); output = INVALID_HANDLE_VALUE; }
+    if (metadata != INVALID_HANDLE_VALUE) { CloseHandle(metadata); metadata = INVALID_HANDLE_VALUE; }
     if (packet) { VirtualFree(packet, 0, MEM_RELEASE); packet = NULL; }
     if (h != INVALID_HANDLE_VALUE) {
         VM_CLOSE_IN close_in;
