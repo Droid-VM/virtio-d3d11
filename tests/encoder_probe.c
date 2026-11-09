@@ -36,8 +36,14 @@ static const uint16_t ENCODER_LINK[] = {
     '\\', '\\', '.', '\\', 'V','M','e','d','i','a','E','n','c','o','d','e','r', 0
 };
 
-#define WIDTH 64u
-#define HEIGHT 48u
+#ifndef ENCODER_PROBE_WIDTH
+#define ENCODER_PROBE_WIDTH 64u
+#endif
+#ifndef ENCODER_PROBE_HEIGHT
+#define ENCODER_PROBE_HEIGHT 48u
+#endif
+#define WIDTH ENCODER_PROBE_WIDTH
+#define HEIGHT ENCODER_PROBE_HEIGHT
 #define MAX_STRIDE (WIDTH * 2u)
 #define NV12_MAX_BYTES (MAX_STRIDE * HEIGHT * 3u / 2u)
 #define PACKET_CAPACITY (1024u * 1024u)
@@ -181,6 +187,7 @@ static int probe_run(void)
         goto close_session;
     }
     OutputDebugStringA("encoder probe: NV12 configured\n");
+    log_step(0x2000u,config.Width,config.Height,config.YStride);
     payload_size = config.UVOffset + config.UVStride * (HEIGHT / 2u);
     if (config.YStride > MAX_STRIDE || config.UVStride > MAX_STRIDE || payload_size > NV12_MAX_BYTES) {
         OutputDebugStringA("encoder probe: negotiated NV12 layout exceeds probe buffer\n");
