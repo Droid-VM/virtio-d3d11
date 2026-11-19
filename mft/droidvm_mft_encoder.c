@@ -80,6 +80,9 @@ typedef struct DvmEncoder {
     int                               worker_stop;
     int                               worker_started;
     int                               drain_done;
+    int                               drain_requested;
+    int                               drain_complete_posted;
+    uint32_t                          active_outputs;
     uint32_t                          inflight;
     uint32_t                          next_buffer_id;
     uint32_t                          packet_count;
@@ -177,6 +180,17 @@ static HRESULT hr_from_vm_error(void)
     return HRESULT_FROM_WIN32(error ? error : ERROR_GEN_FAILURE);
 }
 
+/* Called under the state lock. Consuming the completion state prevents the
+ * worker and ProcessOutput from publishing the same drain twice. */
+static int take_drain_completion(DvmEncoder *m)
+{
+    if(m->drain_requested&&m->drain_done&&!m->packet_head&&m->active_outputs==0&&!m->drain_complete_posted){
+        m->drain_complete_posted=1;
+        return 1;
+    }
+    return 0;
+}
+
 static DWORD WINAPI encoder_worker(void *arg)
 {
     DvmEncoder *m = (DvmEncoder *)arg;
@@ -186,7 +200,8 @@ static DWORD WINAPI encoder_worker(void *arg)
         EnterCriticalSection(&m->lock);
         stop = m->worker_stop;
         session = m->session;
-        can_read = m->inflight != 0 && m->packet_count < DVM_MAX_INFLIGHT;
+        can_read = (m->inflight != 0 || (m->drain_requested&&!m->drain_done)) &&
+                   m->packet_count < DVM_MAX_INFLIGHT;
         LeaveCriticalSection(&m->lock);
         if (stop) break;
         if (!session || !can_read) {
@@ -218,11 +233,15 @@ static DWORD WINAPI encoder_worker(void *arg)
                 post_event(m, MEError, m->fatal);
                 break;
             }
-            if (info.Flags & VM_ENCODER_PACKET_FLAG_DRAIN_DONE) {
+            if ((info.Flags & VM_ENCODER_PACKET_FLAG_DRAIN_DONE) && info.BytesUsed==0) {
+                int complete;
+                EnterCriticalSection(&m->lock);
+                m->drain_done=1;m->inflight=0;
+                complete=take_drain_completion(m);
+                LeaveCriticalSection(&m->lock);
                 HeapFree(GetProcessHeap(),0,bytes);
-                EnterCriticalSection(&m->lock);m->fatal=HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);LeaveCriticalSection(&m->lock);
-                post_event(m,MEError,HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED));
-                break;
+                if(complete)post_event(m,METransformDrainComplete,S_OK);
+                continue;
             }
             if (info.BytesUsed != 0) {
                 DvmPacket *node = (DvmPacket *)HeapAlloc(GetProcessHeap(), 0,
@@ -247,6 +266,7 @@ static DWORD WINAPI encoder_worker(void *arg)
                 ++m->packet_count;
                 if (m->inflight) --m->inflight;
                 m->frames_out++;
+                if(info.Flags&VM_ENCODER_PACKET_FLAG_DRAIN_DONE){m->drain_done=1;m->inflight=0;}
                 stop = m->worker_stop;
                 LeaveCriticalSection(&m->lock);
                 HeapFree(GetProcessHeap(), 0, bytes);
@@ -318,7 +338,7 @@ static HRESULT encoder_start(DvmEncoder *m)
     if (!m->wake_event) m->wake_event=CreateEventW(NULL,FALSE,FALSE,NULL);
     if (!m->wake_event) { vm_close(session); return HRESULT_FROM_WIN32(GetLastError()); }
     EnterCriticalSection(&m->lock);
-    m->session=session; m->encoder_config=cfg; m->worker_stop=0; m->drain_done=0;
+    m->session=session; m->encoder_config=cfg; m->worker_stop=0; m->drain_done=0;m->drain_requested=0;m->drain_complete_posted=0;m->active_outputs=0;
     m->worker=CreateThread(NULL,0,encoder_worker,m,0,&tid);
     if (!m->worker) {
         m->session=NULL; LeaveCriticalSection(&m->lock); vm_close(session);
@@ -835,10 +855,25 @@ static HRESULT STDMETHODCALLTYPE enc_ProcessMessage_impl(IMFTransform *This,
         encoder_stop(m);
         return S_OK;
     case MFT_MESSAGE_COMMAND_FLUSH:
-    case MFT_MESSAGE_COMMAND_DRAIN:
-        /* Enable these only with an epoch-aware driver/MFT state machine.
-         * A rejected control must not clear queued output or publish completion. */
         return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    case MFT_MESSAGE_COMMAND_DRAIN:
+        if(!m->session)return MF_E_TRANSFORM_TYPE_NOT_SET;
+        EnterCriticalSection(&m->lock);
+        if(m->drain_requested){LeaveCriticalSection(&m->lock);return S_OK;}
+        LeaveCriticalSection(&m->lock);
+        /* The API lock excludes input/stop. Hold io_lock until the successful
+         * control has been published, so the worker cannot outrun this state. */
+        EnterCriticalSection(&m->io_lock);
+        if(!vm_encoder_control(m->session,VM_IOCTL_ENC_DRAIN)){
+            hr=hr_from_vm_error();LeaveCriticalSection(&m->io_lock);return hr;
+        }
+        EnterCriticalSection(&m->lock);
+        m->draining=1;m->drain_requested=1;m->drain_done=0;
+        m->drain_complete_posted=0;m->need_input_posted=0;
+        LeaveCriticalSection(&m->lock);
+        LeaveCriticalSection(&m->io_lock);
+        SetEvent(m->wake_event);
+        return S_OK;
     case MFT_MESSAGE_NOTIFY_END_OF_STREAM:
         EnterCriticalSection(&m->lock); m->draining=1; m->need_input_posted=0; LeaveCriticalSection(&m->lock);
         return S_OK;
@@ -926,13 +961,12 @@ static HRESULT STDMETHODCALLTYPE enc_ProcessOutput_impl(IMFTransform *This, DWOR
     if(!sample)return E_POINTER;
     EnterCriticalSection(&m->lock);
     node=m->packet_head;
-    if(node){m->packet_head=node->next;if(!m->packet_head)m->packet_tail=NULL;if(m->packet_count)--m->packet_count;}
+    if(node){m->packet_head=node->next;if(!m->packet_head)m->packet_tail=NULL;if(m->packet_count)--m->packet_count;++m->active_outputs;}
     hr=m->fatal;
     LeaveCriticalSection(&m->lock);
     if(!node)return FAILED(hr)?hr:MF_E_TRANSFORM_NEED_MORE_INPUT;
-    if(node->size==0){HeapFree(GetProcessHeap(),0,node);return MF_E_TRANSFORM_NEED_MORE_INPUT;}
     hr=IMFSample_ConvertToContiguousBuffer(sample,&buffer);
-    if(FAILED(hr)){EnterCriticalSection(&m->lock);node->next=m->packet_head;m->packet_head=node;if(!m->packet_tail)m->packet_tail=node;++m->packet_count;LeaveCriticalSection(&m->lock);return hr;}
+    if(FAILED(hr))goto requeue;
     hr=IMFMediaBuffer_Lock(buffer,&dst,&max_len,&current);
     if(FAILED(hr)){IMFMediaBuffer_Release(buffer);goto requeue;}
     if(max_len<node->size){IMFMediaBuffer_Unlock(buffer);IMFMediaBuffer_Release(buffer);hr=MF_E_BUFFERTOOSMALL;goto requeue;}
@@ -946,16 +980,20 @@ static HRESULT STDMETHODCALLTYPE enc_ProcessOutput_impl(IMFTransform *This, DWOR
         (node->flags&VM_ENCODER_PACKET_FLAG_KEYFRAME)?1u:0u);
     buffers[0].dwStatus=0;
     {
+        int complete;
         HeapFree(GetProcessHeap(),0,node);
         if(m->wake_event)SetEvent(m->wake_event);
         EnterCriticalSection(&m->lock);
+        --m->active_outputs;
+        complete=take_drain_completion(m);
         if(m->inflight+m->packet_count<DVM_MAX_INFLIGHT&&!m->need_input_posted&&!m->draining){m->need_input_posted=1;hr=S_OK;}else hr=S_FALSE;
         LeaveCriticalSection(&m->lock);
+        if(complete)post_event(m,METransformDrainComplete,S_OK);
         if(hr==S_OK)post_event(m,METransformNeedInput,S_OK);
     }
     return S_OK;
 requeue:
-    EnterCriticalSection(&m->lock);node->next=m->packet_head;m->packet_head=node;if(!m->packet_tail)m->packet_tail=node;++m->packet_count;LeaveCriticalSection(&m->lock);
+    EnterCriticalSection(&m->lock);node->next=m->packet_head;m->packet_head=node;if(!m->packet_tail)m->packet_tail=node;++m->packet_count;--m->active_outputs;LeaveCriticalSection(&m->lock);
     if(m->wake_event)SetEvent(m->wake_event);
     return hr;
 }
