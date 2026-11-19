@@ -448,6 +448,144 @@ int VM_CALL vm_flush(VM_SESSION *session, VM_FLUSH_OUT *out)
     return 1;
 }
 
+static int encoder_session_ok(VM_SESSION *session)
+{
+    if (session == NULL || session->kind != 1u || session->token == 0) {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    return 1;
+}
+
+int VM_CALL vm_encoder_configure(VM_SESSION *session, VM_ENCODER_CONFIG *config)
+{
+    VM_ENCODER_CONFIG request;
+    DWORD returned = 0;
+    if (!encoder_session_ok(session)) return 0;
+    if (config == NULL) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+    request = *config;
+    request.Version = VM_ENCODER_ABI_VERSION;
+    request.Size = sizeof(request);
+    request.SessionToken = session->token;
+    if (!DeviceIoControl(session->handle, VM_IOCTL_ENC_CONFIG,
+                         &request, sizeof(request), config, sizeof(*config),
+                         &returned, NULL)) {
+        set_error(GetLastError());
+        return 0;
+    }
+    if (returned != sizeof(*config) || config->Version != VM_ENCODER_ABI_VERSION ||
+        config->Size != sizeof(*config) || config->SessionToken != session->token) {
+        set_error(ERROR_INVALID_DATA);
+        return 0;
+    }
+    set_error(0);
+    return 1;
+}
+
+int VM_CALL vm_encoder_queue_input(VM_SESSION *session,
+                                   const VM_ENCODER_INPUT *input,
+                                   const void *nv12, uint32_t size)
+{
+    VM_ENCODER_INPUT request;
+    uint8_t *buffer;
+    size_t total;
+    DWORD returned = 0;
+    int ok;
+    if (!encoder_session_ok(session)) return 0;
+    if (input == NULL || nv12 == NULL || size == 0 || input->DataSize != size ||
+        size > UINT32_MAX - sizeof(request)) {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    request = *input;
+    request.Version = VM_ENCODER_ABI_VERSION;
+    request.Size = sizeof(request);
+    request.SessionToken = session->token;
+    total = sizeof(request) + (size_t)size;
+    buffer = (uint8_t *)HeapAlloc(GetProcessHeap(), 0, total);
+    if (buffer == NULL) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+    memcpy(buffer, &request, sizeof(request));
+    memcpy(buffer + sizeof(request), nv12, size);
+    ok = DeviceIoControl(session->handle, VM_IOCTL_ENC_QUEUE_INPUT,
+                         buffer, (DWORD)total, NULL, 0, &returned, NULL);
+    HeapFree(GetProcessHeap(), 0, buffer);
+    if (!ok) { set_error(GetLastError()); return 0; }
+    set_error(0);
+    return 1;
+}
+
+int VM_CALL vm_encoder_get_packet(VM_SESSION *session,
+                                  VM_ENCODER_PACKET_INFO *info, void *packet,
+                                  uint32_t capacity, uint32_t timeout_ms)
+{
+    VM_ENCODER_GET_PACKET_IN request;
+    uint8_t *buffer;
+    size_t total;
+    DWORD returned = 0;
+    int ok;
+    if (!encoder_session_ok(session)) return 0;
+    if (info == NULL || packet == NULL || capacity == 0 || timeout_ms > 30000u ||
+        capacity > UINT32_MAX - sizeof(*info)) {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    total = sizeof(*info) + (size_t)capacity;
+    buffer = (uint8_t *)HeapAlloc(GetProcessHeap(), 0, total);
+    if (buffer == NULL) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+    memset(&request, 0, sizeof(request));
+    request.Version = VM_ENCODER_ABI_VERSION;
+    request.Size = sizeof(request);
+    request.SessionToken = session->token;
+    request.TimeoutMs = timeout_ms;
+    request.Capacity = capacity;
+    ok = DeviceIoControl(session->handle, VM_IOCTL_ENC_GET_PACKET,
+                         &request, sizeof(request), buffer, (DWORD)total,
+                         &returned, NULL);
+    if (!ok) {
+        DWORD err = GetLastError();
+        HeapFree(GetProcessHeap(), 0, buffer);
+        set_error(err);
+        return 0;
+    }
+    {
+        VM_ENCODER_PACKET_INFO *header = (VM_ENCODER_PACKET_INFO *)buffer;
+        if (returned < sizeof(*header) || header->Version != VM_ENCODER_ABI_VERSION ||
+            header->Size != sizeof(*header) || header->SessionToken != session->token ||
+            header->BytesUsed > capacity || returned - sizeof(*header) < header->BytesUsed) {
+            HeapFree(GetProcessHeap(), 0, buffer);
+            set_error(ERROR_INVALID_DATA);
+            return 0;
+        }
+        *info = *header;
+        if (header->BytesUsed != 0) memcpy(packet, buffer + sizeof(*header), header->BytesUsed);
+    }
+    HeapFree(GetProcessHeap(), 0, buffer);
+    set_error(0);
+    return 1;
+}
+
+int VM_CALL vm_encoder_control(VM_SESSION *session, uint32_t ioctl_code)
+{
+    VM_ENCODER_CONTROL request;
+    DWORD returned = 0;
+    if (!encoder_session_ok(session)) return 0;
+    if (ioctl_code != VM_IOCTL_ENC_DRAIN && ioctl_code != VM_IOCTL_ENC_FLUSH) {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    memset(&request, 0, sizeof(request));
+    request.Version = VM_ENCODER_ABI_VERSION;
+    request.Size = sizeof(request);
+    request.SessionToken = session->token;
+    if (!DeviceIoControl(session->handle, ioctl_code, &request, sizeof(request),
+                         NULL, 0, &returned, NULL)) {
+        set_error(GetLastError());
+        return 0;
+    }
+    set_error(0);
+    return 1;
+}
+
 void VM_CALL vm_close(VM_SESSION *session)
 {
     VM_CLOSE_IN in;
