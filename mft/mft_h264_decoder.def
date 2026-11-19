@@ -1,0 +1,10 @@
+; mft_h264_decoder.def - the four standard in-proc COM server entry points.
+; Every other symbol stays private (the virtio-media client is compiled in with
+; VMEDIA_CLIENT_STATIC, so vm_open/vm_send/... are not exported either).
+LIBRARY mft_h264_decoder
+
+EXPORTS
+    DllGetClassObject
+    DllCanUnloadNow
+    DllRegisterServer
+    DllUnregisterServer

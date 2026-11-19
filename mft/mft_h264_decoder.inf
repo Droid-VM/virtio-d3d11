@@ -1,0 +1,50 @@
+; mft_h264_decoder.inf - install the DroidVM virtio-media H.264 decoder MFT.
+;
+; This is a user-mode COM/MFT package, not a PnP driver: there is no device and
+; no service.  [DefaultInstall] copies the DLL into %SystemRoot%\System32 and
+; writes the COM in-proc server keys.  The Media Foundation transform
+; registration itself (HKLM\SOFTWARE\Classes\MediaFoundation\Transforms\{CLSID}
+; with the binary InputTypes/OutputTypes/Attributes blobs) is written by
+; DllRegisterServer -> MFTRegister(), because those blobs are not practical to
+; express as INF AddReg data.  Install order is therefore:
+;
+;   1. copy mft_h264_decoder.dll (this INF, or Explorer)
+;   2. regsvr32 /s mft_h264_decoder.dll   (as Administrator)
+;
+; `install.cmd` next to this file does both, and P-BATCH-MFT.md section 2 has
+; the manual registry checks.
+
+[Version]
+Signature       = "$WINDOWS NT$"
+Class           = Media
+ClassGuid       = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider        = %Provider%
+CatalogFile     = mft_h264_decoder.cat
+DriverVer       = 10/25/2026,1.0.1.0
+PnpLockdown     = 0
+
+[DestinationDirs]
+DroidVmMft.Files = 11
+
+[DefaultInstall]
+CopyFiles = DroidVmMft.Files
+AddReg    = DroidVmMft.Reg
+
+[DefaultInstall.NT]
+CopyFiles = DroidVmMft.Files
+AddReg    = DroidVmMft.Reg
+
+[DefaultInstall.NT.Services]
+; no service: an MFT is loaded into the calling process
+
+[DroidVmMft.Files]
+mft_h264_decoder.dll,,,0x00000020
+
+[DroidVmMft.Reg]
+HKCR,CLSID\{9F3C2A11-7D64-4E3B-9A21-6C0D5B48E7A2},,0x00000000,"DroidVM virtio-media H.264 Decoder MFT"
+HKCR,CLSID\{9F3C2A11-7D64-4E3B-9A21-6C0D5B48E7A2},DisplayName,,0x00000000,"DroidVM virtio-media H.264 Decoder MFT"
+HKCR,CLSID\{9F3C2A11-7D64-4E3B-9A21-6C0D5B48E7A2}\InprocServer32,,0x00020000,"%SystemRoot%\System32\mft_h264_decoder.dll"
+HKCR,CLSID\{9F3C2A11-7D64-4E3B-9A21-6C0D5B48E7A2}\InprocServer32,ThreadingModel,0x00000000,"Both"
+
+[Strings]
+Provider = "DroidVM"

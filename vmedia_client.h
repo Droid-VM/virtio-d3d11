@@ -100,6 +100,20 @@ VM_CLIENT_API int VM_CALL vm_get_frame_tag(VM_SESSION *session, void *pixels, ui
 VM_CLIENT_API int VM_CALL vm_map_frame_tag(VM_SESSION *session, VM_FRAME_MAP_TAG_OUT *out,
     uint32_t timeout_ms);
 
+/* Encoder-only ABI v1. `config` is updated with the driver's negotiated layout.
+ * `vm_encoder_queue_input` copies one NV12 payload behind its header. The caller
+ * keeps ownership of the source sample; no user VA is retained after return.
+ * `vm_encoder_get_packet` copies one coded packet and its metadata to caller
+ * storage; `capacity` is packet payload capacity, excluding the metadata header.
+ * Control sends either VM_IOCTL_ENC_DRAIN or VM_IOCTL_ENC_FLUSH. These IOCTLs may
+ * return ERROR_NOT_SUPPORTED until the driver/host state machine implements them. */
+VM_CLIENT_API int VM_CALL vm_encoder_configure(VM_SESSION *session, VM_ENCODER_CONFIG *config);
+VM_CLIENT_API int VM_CALL vm_encoder_queue_input(VM_SESSION *session,
+    const VM_ENCODER_INPUT *input, const void *nv12, uint32_t size);
+VM_CLIENT_API int VM_CALL vm_encoder_get_packet(VM_SESSION *session,
+    VM_ENCODER_PACKET_INFO *info, void *packet, uint32_t capacity, uint32_t timeout_ms);
+VM_CLIENT_API int VM_CALL vm_encoder_control(VM_SESSION *session, uint32_t ioctl_code);
+
 /* Last Win32 error (0 after a successful call). */
 VM_CLIENT_API uint32_t VM_CALL vm_last_error(void);
 
