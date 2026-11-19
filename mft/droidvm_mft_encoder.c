@@ -363,8 +363,8 @@ static HRESULT encoder_start(DvmEncoder *m)
     memset(&opened, 0, sizeof(opened));
     session=vm_open(1, &opened);
     if (!session) {HRESULT hr=hr_from_vm_error();dvm_logf("encoder OPEN failed: %08lX",(unsigned long)hr);return hr;}
-    if(opened.DriverVersion<0x00010022u){
-        dvm_logf("encoder controls require driver 1.0.0.34; got %08X",opened.DriverVersion);
+    if(opened.DriverVersion<0x00010023u){
+        dvm_logf("encoder bitrate modes require driver 1.0.0.35; got %08X",opened.DriverVersion);
         vm_close(session);return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     }
     memset(&cfg,0,sizeof(cfg));
@@ -372,6 +372,7 @@ static HRESULT encoder_start(DvmEncoder *m)
     cfg.Width=width; cfg.Height=height; cfg.YStride=width; cfg.UVStride=width;
     cfg.UVOffset=width*height; cfg.FrameRateNum=frame_rate ? DVM_HI32(frame_rate) : 30;
     cfg.FrameRateDen=frame_rate ? DVM_LO32(frame_rate) : 1; cfg.Bitrate=bitrate; cfg.GopFrames=gop;
+    cfg.Flags=m->rate_control_mode==0u?VM_ENCODER_CONFIG_CBR:0u;
     if (!vm_encoder_configure(session,&cfg)) { HRESULT hr=hr_from_vm_error();dvm_logf("encoder CONFIG failed: %ux%u hr=%08lX",width,height,(unsigned long)hr); vm_close(session); return hr; }
     if (!m->wake_event) m->wake_event=CreateEventW(NULL,FALSE,FALSE,NULL);
     if (!m->wake_event) { vm_close(session); return HRESULT_FROM_WIN32(GetLastError()); }
@@ -1000,13 +1001,19 @@ static HRESULT STDMETHODCALLTYPE enc_ProcessInput_impl(IMFTransform *This, DWORD
     { uint32_t y; for(y=0;y<h;++y){memcpy(nv12+(size_t)y*y_stride,src+(size_t)y*src_stride,w);if(y_stride>w)memset(nv12+(size_t)y*y_stride+w,16,y_stride-w);} }
     { uint32_t y; const uint8_t *src_uv=src+(size_t)src_stride*h; for(y=0;y<h/2u;++y){memcpy(nv12+uv_offset+(size_t)y*uv_stride,src_uv+(size_t)y*src_stride,w);if(uv_stride>w)memset(nv12+uv_offset+(size_t)y*uv_stride+w,128,uv_stride-w);} }
     IMFMediaBuffer_Unlock(buffer);IMFMediaBuffer_Release(buffer);
-    /* Reserve a unique microsecond-aligned opaque tag before the QBUF. The
-     * original signed PTS/duration never cross the lossy V4L2 timeval ABI. */
+    /* Host tags are also MediaCodec presentation times: advance by duration,
+     * not 1us per frame. Keep 100ns accumulated duration to avoid NTSC drift;
+     * each transmitted tag is unique and microsecond aligned. Original signed
+     * PTS/duration remain in the bounded table (including duplicate user PTS). */
     EnterCriticalSection(&m->lock);
     for(unsigned i=0;i<DVM_MAX_INFLIGHT;++i)if(!m->input_times[i].used){timing_slot=i;break;}
-    if(timing_slot<DVM_MAX_INFLIGHT && m->next_time_tag<(uint64_t)INT64_MAX/10u){
-        tag=(++m->next_time_tag)*10u;
+    {uint64_t step=(uint64_t)sample_duration<10u?10u:(uint64_t)sample_duration;
+     if(m->next_time_tag==0)m->next_time_tag=10u;
+     if(timing_slot<DVM_MAX_INFLIGHT && step<=(uint64_t)INT64_MAX-m->next_time_tag){
+        tag=(m->next_time_tag/10u)*10u;
+        m->next_time_tag+=step;
         m->input_times[timing_slot]=(DvmInputTime){tag,sample_time,sample_duration,1};
+     }
     }
     LeaveCriticalSection(&m->lock);
     if(!tag){HeapFree(GetProcessHeap(),0,nv12);hr=E_UNEXPECTED;goto fail_slot;}
@@ -1167,6 +1174,7 @@ static HRESULT STDMETHODCALLTYPE evt_QueueEvent(IMFMediaEventGenerator *This,
 static int codec_api_supported(REFGUID api)
 {
     return IsEqualGUID(api, &k_codec_mean_bitrate) ||
+           IsEqualGUID(api, &k_codec_rate_control_mode) ||
            IsEqualGUID(api, &k_codec_gop_size) ||
            IsEqualGUID(api, &k_codec_force_keyframe);
 }
@@ -1210,10 +1218,13 @@ static HRESULT STDMETHODCALLTYPE codec_IsSupported(ICodecAPI *This, const GUID *
 
 static HRESULT STDMETHODCALLTYPE codec_IsModifiable(ICodecAPI *This, const GUID *Api)
 {
-    (void)This;
-    if (Api == NULL)
-        return E_POINTER;
-    return codec_api_supported(Api) ? S_OK : S_FALSE;
+    DvmEncoder *m=DVM_ENC_FROM_CODEC(This);
+    int modifiable;
+    if (Api == NULL)return E_POINTER;
+    EnterCriticalSection(&m->api_lock);
+    modifiable=codec_api_supported(Api)&&(!m->session||IsEqualGUID(Api,&k_codec_force_keyframe)||IsEqualGUID(Api,&k_codec_mean_bitrate));
+    LeaveCriticalSection(&m->api_lock);
+    return modifiable?S_OK:S_FALSE;
 }
 
 static HRESULT STDMETHODCALLTYPE codec_GetParameterRange(ICodecAPI *This,
@@ -1259,7 +1270,7 @@ static HRESULT STDMETHODCALLTYPE codec_GetDefaultValue(ICodecAPI *This,
     if (IsEqualGUID(Api, &k_codec_mean_bitrate))
         V_UI4(Value) = 8000000u;
     else if (IsEqualGUID(Api, &k_codec_rate_control_mode))
-        V_UI4(Value) = 0u;        /* eAVEncCommonRateControlMode_CBR */
+        V_UI4(Value) = 2u;        /* eAVEncCommonRateControlMode_UnconstrainedVBR */
     else if (IsEqualGUID(Api, &k_codec_gop_size))
         V_UI4(Value) = 30u;
     else
@@ -1308,10 +1319,20 @@ static HRESULT STDMETHODCALLTYPE codec_SetValue(ICodecAPI *This, const GUID *Api
         v = (V_BOOL(Value) != VARIANT_FALSE) ? 1u : 0u;
     else
         return E_INVALIDARG;
-    if(IsEqualGUID(Api,&k_codec_rate_control_mode))return E_NOTIMPL;
+    /* CodecAPI: CBR=0, UnconstrainedVBR=2. No silent mode substitution. */
+    if(IsEqualGUID(Api,&k_codec_rate_control_mode)&&v!=0u&&v!=2u)return E_NOTIMPL;
     if((IsEqualGUID(Api,&k_codec_mean_bitrate)||IsEqualGUID(Api,&k_codec_gop_size))&&(!v||v>INT32_MAX))return E_INVALIDARG;
     EnterCriticalSection(&m->api_lock);
-    if(m->session&&!IsEqualGUID(Api,&k_codec_force_keyframe)){
+    if(m->session&&IsEqualGUID(Api,&k_codec_mean_bitrate)){
+        HRESULT hr;
+        EnterCriticalSection(&m->lock);
+        if(m->draining){LeaveCriticalSection(&m->lock);LeaveCriticalSection(&m->api_lock);return MF_E_NOTACCEPTING;}
+        LeaveCriticalSection(&m->lock);
+        EnterCriticalSection(&m->io_lock);
+        {int ok=vm_encoder_set_bitrate(m->session,v);hr=ok?S_OK:hr_from_vm_error();}
+        LeaveCriticalSection(&m->io_lock);
+        if(FAILED(hr)){LeaveCriticalSection(&m->api_lock);return hr;}
+    }else if(m->session&&!IsEqualGUID(Api,&k_codec_force_keyframe)){
         LeaveCriticalSection(&m->api_lock);return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     }
     EnterCriticalSection(&m->lock);
@@ -1359,7 +1380,7 @@ static HRESULT STDMETHODCALLTYPE codec_SetAllDefaults(ICodecAPI *This)
     if(m->session){LeaveCriticalSection(&m->api_lock);return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);}
     EnterCriticalSection(&m->lock);
     m->mean_bitrate = 8000000u;
-    m->rate_control_mode = 0u;
+    m->rate_control_mode = 2u;
     m->gop_size = 30u;
     m->force_keyframe = 0u;
     LeaveCriticalSection(&m->lock);
@@ -1590,7 +1611,7 @@ HRESULT dvm_mft_create_instance(REFIID riid, void **ppv)
     m->ref = 1;
     m->fatal = S_OK;
     m->mean_bitrate = 8000000u;
-    m->rate_control_mode = 0u;
+    m->rate_control_mode = 2u;
     m->gop_size = 30u;
     InitializeCriticalSection(&m->api_lock);
     InitializeCriticalSection(&m->io_lock);

@@ -113,6 +113,8 @@ VM_CLIENT_API int VM_CALL vm_encoder_queue_input(VM_SESSION *session,
 VM_CLIENT_API int VM_CALL vm_encoder_get_packet(VM_SESSION *session,
     VM_ENCODER_PACKET_INFO *info, void *packet, uint32_t capacity, uint32_t timeout_ms);
 VM_CLIENT_API int VM_CALL vm_encoder_control(VM_SESSION *session, uint32_t ioctl_code);
+/* Driver .36+: synchronous backend bitrate SET; no cached success on failure. */
+VM_CLIENT_API int VM_CALL vm_encoder_set_bitrate(VM_SESSION *session, uint32_t bitrate);
 
 /* Last Win32 error (0 after a successful call). */
 VM_CLIENT_API uint32_t VM_CALL vm_last_error(void);
