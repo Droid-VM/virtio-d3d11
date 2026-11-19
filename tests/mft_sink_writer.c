@@ -13,6 +13,10 @@
  *   mft_sink_writer.exe --probe-only
  *   mft_sink_writer.exe result.mp4
  *   mft_sink_writer.exe --prefer-local result.mp4
+ *   mft_sink_writer.exe --fps ntsc ntsc.mp4
+ *   mft_sink_writer.exe --prefer-local --fps variable variable.mp4
+ * --fps defaults to 30; ntsc is 30000/1001; variable uses exact contiguous
+ * 166667/333337/500003/250009 tick durations (100ns), repeated 30 times.
  * Output must not already exist. Failed runs may leave an incomplete MP4.
  * Exit: 0 = requested gate passed, 1 = API/encoding failure, 2 = usage,
  *       3 = actual encoder identity unproven/wrong (never a software PASS).
@@ -60,8 +64,14 @@
 #define WIDTH 640u
 #define HEIGHT 480u
 #define FRAME_COUNT 120u
-#define FPS_NUM 30u
-#define FPS_DEN 1u
+typedef enum { FPS_30, FPS_NTSC, FPS_VARIABLE } FpsMode;
+
+static UINT32 fps_num(FpsMode mode) { return mode == FPS_NTSC ? 30000u : 30u; }
+static UINT32 fps_den(FpsMode mode) { return mode == FPS_NTSC ? 1001u : 1u; }
+static const char *fps_name(FpsMode mode)
+{
+    return mode == FPS_NTSC ? "ntsc" : mode == FPS_VARIABLE ? "variable" : "30";
+}
 #define NV12_BYTES (WIDTH * HEIGHT * 3u / 2u)
 #define PACK(a,b) (((UINT64)(a) << 32) | (UINT64)(b))
 #define CHECK(call) do { hr = (call); if (FAILED(hr)) { \
@@ -195,7 +205,7 @@ static int prove_writer_encoder(IMFSinkWriter *writer, DWORD stream)
     return proven;
 }
 
-static HRESULT make_type(IMFMediaType **type, const GUID *subtype)
+static HRESULT make_type(IMFMediaType **type, const GUID *subtype, FpsMode mode)
 {
     HRESULT hr = MFCreateMediaType(type);
     if (SUCCEEDED(hr)) hr = IMFMediaType_SetGUID(*type, &MF_MT_MAJOR_TYPE,
@@ -204,7 +214,7 @@ static HRESULT make_type(IMFMediaType **type, const GUID *subtype)
     if (SUCCEEDED(hr)) hr = IMFMediaType_SetUINT64(*type, &MF_MT_FRAME_SIZE,
                                                   PACK(WIDTH, HEIGHT));
     if (SUCCEEDED(hr)) hr = IMFMediaType_SetUINT64(*type, &MF_MT_FRAME_RATE,
-                                                  PACK(FPS_NUM, FPS_DEN));
+                                                  PACK(fps_num(mode), fps_den(mode)));
     if (SUCCEEDED(hr)) hr = IMFMediaType_SetUINT64(*type, &MF_MT_PIXEL_ASPECT_RATIO,
                                                   PACK(1, 1));
     if (SUCCEEDED(hr)) hr = IMFMediaType_SetUINT32(*type, &MF_MT_INTERLACE_MODE,
@@ -212,14 +222,20 @@ static HRESULT make_type(IMFMediaType **type, const GUID *subtype)
     return hr;
 }
 
-/* Compute every boundary independently: durations alternate 333333/333334,
- * with no accumulated truncation. Frame 120 ends at exactly 40000000 ticks. */
-static LONGLONG frame_time(UINT32 index)
+/* Compute every boundary independently in native MF 100ns ticks. Fixed-rate
+ * modes never accumulate truncation: 120 frames end at 40000000 (30) or
+ * 40040000 (NTSC). Variable mode uses a four-duration cycle whose exact sum
+ * is 1250016 ticks; the advertised 30/1 is only the nominal media type rate. */
+static LONGLONG frame_time(UINT32 index, FpsMode mode)
 {
-    return (LONGLONG)(((UINT64)index * 10000000u * FPS_DEN) / FPS_NUM);
+    static const LONGLONG boundary[] = {0, 166667, 500004, 1000007};
+    if (mode == FPS_VARIABLE)
+        return (LONGLONG)(index / 4u) * 1250016 + boundary[index % 4u];
+    return (LONGLONG)(((UINT64)index * 10000000u * fps_den(mode)) / fps_num(mode));
 }
 
-static HRESULT write_frame(IMFSinkWriter *writer, DWORD stream, UINT32 index)
+static HRESULT write_frame(IMFSinkWriter *writer, DWORD stream, UINT32 index,
+                           FpsMode mode)
 {
     IMFSample *sample = NULL;
     IMFMediaBuffer *buffer = NULL;
@@ -244,9 +260,9 @@ static HRESULT write_frame(IMFSinkWriter *writer, DWORD stream, UINT32 index)
     }
     if (SUCCEEDED(hr)) hr = IMFMediaBuffer_SetCurrentLength(buffer, NV12_BYTES);
     if (SUCCEEDED(hr)) hr = IMFSample_AddBuffer(sample, buffer);
-    if (SUCCEEDED(hr)) hr = IMFSample_SetSampleTime(sample, frame_time(index));
+    if (SUCCEEDED(hr)) hr = IMFSample_SetSampleTime(sample, frame_time(index, mode));
     if (SUCCEEDED(hr)) hr = IMFSample_SetSampleDuration(sample,
-                                           frame_time(index+1u)-frame_time(index));
+                                           frame_time(index+1u, mode)-frame_time(index, mode));
     if (SUCCEEDED(hr)) hr = IMFSinkWriter_WriteSample(writer, stream, sample);
     if (buffer) IMFMediaBuffer_Release(buffer);
     if (sample) IMFSample_Release(sample);
@@ -311,17 +327,22 @@ int wmain(int argc, WCHAR **argv)
     DWORD stream = 0;
     UINT32 i;
     int rc = 1, co_started = 0, mf_started = 0, local = 0;
-    int prefer_local = 0, probe = 0;
-    if (argc == 2 && wcscmp(argv[1], L"--probe-only") == 0) probe = 1;
-    else if (argc == 2 && argv[1][0] != L'-') path = argv[1];
-    else if (argc == 3 && wcscmp(argv[1], L"--prefer-local") == 0) {
-        prefer_local = 1;
-        path = argv[2];
-    } else {
-        fprintf(stderr, "usage: mft_sink_writer.exe [--prefer-local] new-output.mp4\n"
-                        "       mft_sink_writer.exe --probe-only\n");
-        return 2;
+    int prefer_local = 0, probe = 0, fps_set = 0, arg;
+    FpsMode mode = FPS_30;
+    for (arg = 1; arg < argc; ++arg) {
+        if (wcscmp(argv[arg], L"--probe-only") == 0 && !probe) probe = 1;
+        else if (wcscmp(argv[arg], L"--prefer-local") == 0 && !prefer_local) prefer_local = 1;
+        else if (wcscmp(argv[arg], L"--fps") == 0 && !fps_set && arg+1 < argc) {
+            ++arg;
+            if (wcscmp(argv[arg], L"30") == 0) mode = FPS_30;
+            else if (wcscmp(argv[arg], L"ntsc") == 0) mode = FPS_NTSC;
+            else if (wcscmp(argv[arg], L"variable") == 0) mode = FPS_VARIABLE;
+            else goto usage;
+            fps_set = 1;
+        } else if (argv[arg][0] != L'-' && !path) path = argv[arg];
+        else goto usage;
     }
+    if (probe ? (path || prefer_local || fps_set) : !path) goto usage;
     if (path) {
         size_t n = wcslen(path);
         DWORD error;
@@ -357,11 +378,11 @@ int wmain(int argc, WCHAR **argv)
     CHECK(MFCreateAttributes(&attrs, 2));
     CHECK(IMFAttributes_SetUINT32(attrs, &MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1));
     CHECK(MFCreateSinkWriterFromURL(path, NULL, attrs, &writer));
-    CHECK(make_type(&output, &MFVideoFormat_H264));
+    CHECK(make_type(&output, &MFVideoFormat_H264, mode));
     CHECK(IMFMediaType_SetUINT32(output, &MF_MT_AVG_BITRATE, 2000000));
     CHECK(IMFMediaType_SetUINT32(output, &MF_MT_MPEG2_PROFILE, 100));
     CHECK(IMFSinkWriter_AddStream(writer, output, &stream));
-    CHECK(make_type(&input, &MFVideoFormat_NV12));
+    CHECK(make_type(&input, &MFVideoFormat_NV12, mode));
     CHECK(IMFMediaType_SetUINT32(input, &MF_MT_DEFAULT_STRIDE, WIDTH));
     CHECK(IMFMediaType_SetUINT32(input, &MF_MT_SAMPLE_SIZE, NV12_BYTES));
     CHECK(IMFMediaType_SetUINT32(input, &MF_MT_FIXED_SIZE_SAMPLES, 1));
@@ -373,12 +394,14 @@ int wmain(int argc, WCHAR **argv)
         rc = 3;
         goto done;
     }
-    printf("START NV12 %ux%u -> H264 MP4 frames=%u fps=%u/%u\n",
-           WIDTH, HEIGHT, FRAME_COUNT, FPS_NUM, FPS_DEN);
+    printf("START NV12 %ux%u -> H264 MP4 frames=%u mode=%s nominal_fps=%u/%u\n",
+           WIDTH, HEIGHT, FRAME_COUNT, fps_name(mode), fps_num(mode), fps_den(mode));
     for (i = 0; i < FRAME_COUNT; ++i) {
-        CHECK(write_frame(writer, stream, i));
-        printf("INPUT index=%u pts100ns=%lld duration100ns=%lld\n", (unsigned)i,
-               (long long)frame_time(i), (long long)(frame_time(i+1u)-frame_time(i)));
+        CHECK(write_frame(writer, stream, i, mode));
+        printf("INPUT index=%u pts100ns=%lld duration100ns=%lld end100ns=%lld\n", (unsigned)i,
+               (long long)frame_time(i, mode),
+               (long long)(frame_time(i+1u, mode)-frame_time(i, mode)),
+               (long long)frame_time(i+1u, mode));
         fflush(stdout);
     }
     /* Check the actual pipeline again after all samples, before Finalize can
@@ -400,9 +423,14 @@ int wmain(int argc, WCHAR **argv)
         goto done;
     }
     if (rc == 0)
-        printf("PASS SINK_WRITER_DROIDVM frames=%u end100ns=%lld Finalize=OK output=%ls\n",
-               FRAME_COUNT, (long long)frame_time(FRAME_COUNT), path);
+        printf("PASS SINK_WRITER_DROIDVM frames=%u mode=%s end100ns=%lld Finalize=OK output=%ls\n",
+               FRAME_COUNT, fps_name(mode), (long long)frame_time(FRAME_COUNT, mode), path);
     else fprintf(stderr, "UNPROVEN_OR_WRONG_ENCODER after WriteSample; MP4 is not a PASS\n");
+    goto done;
+usage:
+    fprintf(stderr, "usage: mft_sink_writer.exe [--prefer-local] [--fps 30|ntsc|variable] new-output.mp4\n"
+                    "       mft_sink_writer.exe --probe-only\n");
+    return 2;
 done:
     if (writer) IMFSinkWriter_Release(writer);
     if (input) IMFMediaType_Release(input);

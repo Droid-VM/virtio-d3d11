@@ -55,9 +55,17 @@ typedef struct DvmPacket {
     struct DvmPacket *next;
     uint32_t size;
     uint32_t flags;
-    uint64_t time;
+    LONGLONG time;
+    LONGLONG duration;
     uint8_t data[1];
 } DvmPacket;
+
+typedef struct DvmInputTime {
+    uint64_t tag;
+    LONGLONG pts;
+    LONGLONG duration;
+    int used;
+} DvmInputTime;
 
 typedef struct DvmEncoder {
     /* COM: three interface vtable pointers; IMFTransform first so the object
@@ -88,6 +96,8 @@ typedef struct DvmEncoder {
     uint32_t                          active_outputs;
     uint32_t                          inflight;
     uint32_t                          next_buffer_id;
+    uint64_t                          next_time_tag;
+    DvmInputTime                      input_times[DVM_MAX_INFLIGHT];
     uint32_t                          packet_count;
     DvmPacket                        *packet_head;
     DvmPacket                        *packet_tail;
@@ -187,7 +197,7 @@ static HRESULT hr_from_vm_error(void)
  * worker and ProcessOutput from publishing the same drain twice. */
 static int take_drain_completion(DvmEncoder *m)
 {
-    if(m->drain_requested&&m->drain_done&&!m->packet_head&&m->active_outputs==0&&!m->drain_complete_posted){
+    if(m->fatal==S_OK&&m->drain_requested&&m->drain_done&&!m->packet_head&&m->active_outputs==0&&!m->drain_complete_posted){
         m->drain_complete_posted=1;
         return 1;
     }
@@ -242,7 +252,11 @@ static DWORD WINAPI encoder_worker(void *arg)
             if ((info.Flags & VM_ENCODER_PACKET_FLAG_DRAIN_DONE) && info.BytesUsed==0) {
                 int complete;
                 EnterCriticalSection(&m->lock);
-                m->drain_done=1;m->inflight=0;
+                if(m->inflight!=0){
+                    m->fatal=MF_E_INVALID_STREAM_DATA;LeaveCriticalSection(&m->lock);
+                    HeapFree(GetProcessHeap(),0,bytes);post_event(m,MEError,MF_E_INVALID_STREAM_DATA);break;
+                }
+                m->drain_done=1;
                 complete=take_drain_completion(m);
                 LeaveCriticalSection(&m->lock);
                 HeapFree(GetProcessHeap(),0,bytes);
@@ -263,20 +277,33 @@ static DWORD WINAPI encoder_worker(void *arg)
                 node->next = NULL;
                 node->size = info.BytesUsed;
                 node->flags = info.Flags;
-                node->time = info.Timestamp;
                 memcpy(node->data, bytes, info.BytesUsed);
                 EnterCriticalSection(&m->lock);
+                {unsigned i;for(i=0;i<DVM_MAX_INFLIGHT;++i)if(m->input_times[i].used&&m->input_times[i].tag==info.Timestamp)break;
+                 if(i==DVM_MAX_INFLIGHT){
+                    m->fatal=MF_E_INVALID_STREAM_DATA;LeaveCriticalSection(&m->lock);
+                    HeapFree(GetProcessHeap(),0,node);HeapFree(GetProcessHeap(),0,bytes);
+                    post_event(m,MEError,MF_E_INVALID_STREAM_DATA);break;
+                 }
+                 node->time=m->input_times[i].pts;node->duration=m->input_times[i].duration;
+                 m->input_times[i].used=0;
+                }
                 if (m->packet_tail) m->packet_tail->next = node;
                 else m->packet_head = node;
                 m->packet_tail = node;
                 ++m->packet_count;
                 if (m->inflight) --m->inflight;
                 m->frames_out++;
-                if(info.Flags&VM_ENCODER_PACKET_FLAG_DRAIN_DONE){m->drain_done=1;m->inflight=0;}
+                if(info.Flags&VM_ENCODER_PACKET_FLAG_DRAIN_DONE){
+                    if(m->inflight!=0)m->fatal=MF_E_INVALID_STREAM_DATA;
+                    else m->drain_done=1;
+                }
                 stop = m->worker_stop;
+                error=m->fatal;
                 LeaveCriticalSection(&m->lock);
                 HeapFree(GetProcessHeap(), 0, bytes);
                 post_event(m, METransformHaveOutput, S_OK);
+                if(FAILED((HRESULT)error)){post_event(m,MEError,(HRESULT)error);break;}
                 if (!stop) {
                     EnterCriticalSection(&m->lock);
                     post = m->streaming && !m->draining && !m->need_input_posted &&
@@ -313,6 +340,7 @@ static void encoder_stop(DvmEncoder *m)
     m->session = NULL;
     m->worker_started = 0;
     m->inflight = 0;
+    memset(m->input_times,0,sizeof(m->input_times));
     m->worker_stop = 0;
     free_packets(m);
     LeaveCriticalSection(&m->lock);
@@ -924,8 +952,9 @@ static HRESULT STDMETHODCALLTYPE enc_ProcessInput_impl(IMFTransform *This, DWORD
     DWORD max_length=0,current=0;
     uint8_t *nv12=NULL;
     uint32_t w,h,src_stride,y_stride,uv_stride,uv_offset,total,buffer_id;
-    uint64_t pts=0;
-    UINT64 sample_time=0;
+    uint64_t tag=0;
+    LONGLONG sample_time=0,sample_duration=0;
+    unsigned timing_slot=DVM_MAX_INFLIGHT;
     VM_ENCODER_INPUT in;
     HRESULT hr;
     int post=0;
@@ -933,6 +962,15 @@ static HRESULT STDMETHODCALLTYPE enc_ProcessInput_impl(IMFTransform *This, DWORD
     if(id!=0)return MF_E_INVALIDSTREAMNUMBER;
     if(!sample)return E_POINTER;
     if(!async_unlocked(m))return MF_E_TRANSFORM_ASYNC_LOCKED;
+    hr=IMFSample_GetSampleTime(sample,&sample_time);
+    if(FAILED(hr))return hr;
+    hr=IMFSample_GetSampleDuration(sample,&sample_duration);
+    if(hr==MF_E_NO_SAMPLE_DURATION){
+        UINT32 num=DVM_HI32(m->frame_rate),den=DVM_LO32(m->frame_rate);
+        if(!num||!den){num=30;den=1;}
+        sample_duration=(LONGLONG)((10000000ull*den)/num);
+    }else if(FAILED(hr))return hr;
+    if(sample_duration<=0)return E_INVALIDARG;
     EnterCriticalSection(&m->lock);
     if(m->fatal!=S_OK){hr=m->fatal;LeaveCriticalSection(&m->lock);return hr;}
     if(!types_ready(m)||!m->session){LeaveCriticalSection(&m->lock);return MF_E_TRANSFORM_TYPE_NOT_SET;}
@@ -956,9 +994,18 @@ static HRESULT STDMETHODCALLTYPE enc_ProcessInput_impl(IMFTransform *This, DWORD
     { uint32_t y; for(y=0;y<h;++y){memcpy(nv12+(size_t)y*y_stride,src+(size_t)y*src_stride,w);if(y_stride>w)memset(nv12+(size_t)y*y_stride+w,16,y_stride-w);} }
     { uint32_t y; const uint8_t *src_uv=src+(size_t)src_stride*h; for(y=0;y<h/2u;++y){memcpy(nv12+uv_offset+(size_t)y*uv_stride,src_uv+(size_t)y*src_stride,w);if(uv_stride>w)memset(nv12+uv_offset+(size_t)y*uv_stride+w,128,uv_stride-w);} }
     IMFMediaBuffer_Unlock(buffer);IMFMediaBuffer_Release(buffer);
-    if(SUCCEEDED(IMFSample_GetSampleTime(sample,(LONGLONG *)&sample_time)))pts=sample_time;
+    /* Reserve a unique microsecond-aligned opaque tag before the QBUF. The
+     * original signed PTS/duration never cross the lossy V4L2 timeval ABI. */
+    EnterCriticalSection(&m->lock);
+    for(unsigned i=0;i<DVM_MAX_INFLIGHT;++i)if(!m->input_times[i].used){timing_slot=i;break;}
+    if(timing_slot<DVM_MAX_INFLIGHT && m->next_time_tag<(uint64_t)INT64_MAX/10u){
+        tag=(++m->next_time_tag)*10u;
+        m->input_times[timing_slot]=(DvmInputTime){tag,sample_time,sample_duration,1};
+    }
+    LeaveCriticalSection(&m->lock);
+    if(!tag){HeapFree(GetProcessHeap(),0,nv12);hr=E_UNEXPECTED;goto fail_slot;}
     memset(&in,0,sizeof(in));in.Version=VM_ENCODER_ABI_VERSION;in.Size=sizeof(in);in.SessionToken=m->encoder_config.SessionToken;
-    in.BufferId=buffer_id;in.DataSize=total;in.Timestamp=pts;in.YOffset=0;in.UVOffset=uv_offset;in.YStride=y_stride;in.UVStride=uv_stride;
+    in.BufferId=buffer_id;in.DataSize=total;in.Timestamp=tag;in.YOffset=0;in.UVOffset=uv_offset;in.YStride=y_stride;in.UVStride=uv_stride;
     EnterCriticalSection(&m->io_lock);
     {int ok=vm_encoder_queue_input(m->session,&in,nv12,total);hr=ok?S_OK:hr_from_vm_error();}
     LeaveCriticalSection(&m->io_lock);
@@ -968,7 +1015,10 @@ static HRESULT STDMETHODCALLTYPE enc_ProcessInput_impl(IMFTransform *This, DWORD
     if(m->wake_event)SetEvent(m->wake_event);if(post)post_event(m,METransformNeedInput,S_OK);
     return S_OK;
 fail_slot:
-    EnterCriticalSection(&m->lock);if(m->inflight)--m->inflight;if(m->fatal==S_OK)m->fatal=hr;LeaveCriticalSection(&m->lock);
+    EnterCriticalSection(&m->lock);
+    if(timing_slot<DVM_MAX_INFLIGHT&&m->input_times[timing_slot].tag==tag)m->input_times[timing_slot].used=0;
+    if(m->inflight)--m->inflight;if(m->fatal==S_OK)m->fatal=hr;
+    LeaveCriticalSection(&m->lock);
     return hr;
 }
 
@@ -1006,11 +1056,11 @@ static HRESULT STDMETHODCALLTYPE enc_ProcessOutput_impl(IMFTransform *This, DWOR
     hr=IMFMediaBuffer_SetCurrentLength(buffer,node->size);
     IMFMediaBuffer_Release(buffer);
     if(FAILED(hr))goto requeue;
-    (void)IMFSample_SetSampleTime(sample,(LONGLONG)node->time);
-    {UINT32 num=DVM_HI32(m->frame_rate),den=DVM_LO32(m->frame_rate);
-     if(!num||!den){num=30;den=1;}
-     (void)IMFSample_SetSampleDuration(sample,(LONGLONG)((10000000ull*den)/num));}
-    dvm_logf("encoded output bytes=%u pts=%llu",node->size,(unsigned long long)node->time);
+    hr=IMFSample_SetSampleTime(sample,node->time);
+    if(FAILED(hr))goto requeue;
+    hr=IMFSample_SetSampleDuration(sample,node->duration);
+    if(FAILED(hr))goto requeue;
+    dvm_logf("encoded output bytes=%u pts=%lld duration=%lld",node->size,(long long)node->time,(long long)node->duration);
     (void)IMFAttributes_SetUINT32((IMFAttributes *)sample,&MFSampleExtension_CleanPoint,
         (node->flags&VM_ENCODER_PACKET_FLAG_KEYFRAME)?1u:0u);
     buffers[0].dwStatus=0;
