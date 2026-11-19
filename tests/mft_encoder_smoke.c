@@ -10,26 +10,46 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
+#include <wchar.h>
 
 static const CLSID encoder_clsid = {0x9f3c2a12,0x7d64,0x4e3b,{0x9a,0x21,0x6c,0x0d,0x5b,0x48,0xe7,0xa3}};
 typedef HRESULT (WINAPI *GetClassObjectFn)(REFCLSID,REFIID,void **);
 #define W 640u
 #define H 480u
 #define FRAMES 4u
+#ifndef SMOKE_LONG_FRAMES
+#define SMOKE_LONG_FRAMES 120u
+#endif
+#if SMOKE_LONG_FRAMES < 120
+#error SMOKE_LONG_FRAMES must be at least 120
+#endif
+#define MAX_PENDING 4u
 #define CAP (4u*1024u*1024u)
 #define PACK(a,b) (((UINT64)(a)<<32)|(b))
 #define CHECK(call) do { hr=(call); if(FAILED(hr)){fprintf(stderr,"%s: 0x%08lX\n",#call,(unsigned long)hr);goto done;} } while(0)
 
-static HRESULT media_type(IMFMediaType **type,const GUID *subtype)
+static HRESULT media_type(IMFMediaType **type,const GUID *subtype,unsigned width,unsigned height)
 {
     HRESULT hr=MFCreateMediaType(type);
     if(FAILED(hr))return hr;
     hr=IMFMediaType_SetGUID(*type,&MF_MT_MAJOR_TYPE,&MFMediaType_Video);
     if(SUCCEEDED(hr))hr=IMFMediaType_SetGUID(*type,&MF_MT_SUBTYPE,subtype);
-    if(SUCCEEDED(hr))hr=IMFMediaType_SetUINT64(*type,&MF_MT_FRAME_SIZE,PACK(W,H));
+    if(SUCCEEDED(hr))hr=IMFMediaType_SetUINT64(*type,&MF_MT_FRAME_SIZE,PACK(width,height));
     if(SUCCEEDED(hr))hr=IMFMediaType_SetUINT64(*type,&MF_MT_FRAME_RATE,PACK(30,1));
     if(SUCCEEDED(hr))hr=IMFMediaType_SetUINT32(*type,&MF_MT_INTERLACE_MODE,MFVideoInterlace_Progressive);
     return hr;
+}
+
+static int parse_dimension(const wchar_t *text,unsigned *value)
+{
+    wchar_t *end=NULL;
+    unsigned long parsed;
+    if(*text<L'0'||*text>L'9')return 0;
+    parsed=wcstoul(text,&end,10);
+    /* Bound allocation arithmetic and require an even NV12 size. */
+    if(*end||parsed<128||parsed>8192||(parsed&1))return 0;
+    *value=(unsigned)parsed;return 1;
 }
 
 int wmain(int argc,wchar_t **argv)
@@ -45,12 +65,23 @@ int wmain(int argc,wchar_t **argv)
     IMFSample *sample=NULL;
     IMFMediaBuffer *buffer=NULL;
     FILE *stream=NULL,*meta=NULL;
-    unsigned frames=0,need_input=0,have_output=0,drain_events=0;
-    unsigned target=FRAMES;
+    unsigned frames=0,submitted=0,max_pending=0,need_input=0,have_output=0,drain_events=0;
+    unsigned target=FRAMES,width=W,height=H;
+    int flush_test=0,flushed=0,long_test=0,drain_sent=0;
+    int retry_test=0,retried=0;
     int rc=1,com_started=0,mf_started=0,streaming=0;
     ULONGLONG deadline;
-    if(argc<2||argc>3){fprintf(stderr,"usage: mft_encoder_smoke.exe encoder.dll [empty]\n");return 2;}
-    if(argc==3)target=0;
+    if(argc<2||argc>5)goto usage;
+    if(argc>=3){
+        if(wcscmp(argv[2],L"flush")==0)flush_test=1;
+        else if(wcscmp(argv[2],L"empty")==0)target=0;
+        else if(wcscmp(argv[2],L"retry")==0)retry_test=1;
+        else if(wcscmp(argv[2],L"long")==0){long_test=1;target=SMOKE_LONG_FRAMES;}
+        else goto usage;
+    }
+    if(argc>3){
+        if(!long_test||argc!=5||!parse_dimension(argv[3],&width)||!parse_dimension(argv[4],&height))goto usage;
+    }
     CHECK(CoInitializeEx(NULL,COINIT_MULTITHREADED));com_started=1;
     CHECK(MFStartup(MF_VERSION,MFSTARTUP_FULL));mf_started=1;
     dll=LoadLibraryW(argv[1]);
@@ -62,9 +93,9 @@ int wmain(int argc,wchar_t **argv)
     CHECK(IMFTransform_QueryInterface(mft,&IID_IMFMediaEventGenerator,(void **)&events));
     CHECK(IMFTransform_GetAttributes(mft,&attrs));
     CHECK(IMFAttributes_SetUINT32(attrs,&MF_TRANSFORM_ASYNC_UNLOCK,1));
-    CHECK(media_type(&input,&MFVideoFormat_NV12));
-    CHECK(IMFMediaType_SetUINT32(input,&MF_MT_DEFAULT_STRIDE,W));
-    CHECK(media_type(&output,&MFVideoFormat_H264));
+    CHECK(media_type(&input,&MFVideoFormat_NV12,width,height));
+    CHECK(IMFMediaType_SetUINT32(input,&MF_MT_DEFAULT_STRIDE,width));
+    CHECK(media_type(&output,&MFVideoFormat_H264,width,height));
     CHECK(IMFMediaType_SetUINT32(output,&MF_MT_AVG_BITRATE,2000000));
     CHECK(IMFTransform_SetInputType(mft,0,input,0));
     CHECK(IMFTransform_SetOutputType(mft,0,output,0));
@@ -72,45 +103,70 @@ int wmain(int argc,wchar_t **argv)
     stream=fopen("mft-smoke.h264","wb");meta=fopen("mft-smoke.csv","w");
     if(!stream||!meta){perror("output files");goto done;}
     fprintf(meta,"index,bytes,pts100ns,keyframe\n");
-    for(unsigned i=0;i<target;++i){
-        BYTE *pixels=NULL;DWORD max_len=0,len=0;
-        CHECK(MFCreateSample(&sample));
-        CHECK(MFCreateMemoryBuffer(W*H*3u/2u,&buffer));
-        CHECK(IMFMediaBuffer_Lock(buffer,&pixels,&max_len,&len));
-        for(unsigned y=0;y<H;++y)for(unsigned x=0;x<W;++x)pixels[y*W+x]=(BYTE)(16u+(x*3u+y*5u+i*37u)%220u);
-        for(unsigned j=W*H;j<W*H*3u/2u;j+=2){pixels[j]=(BYTE)(96u+i*17u);pixels[j+1]=(BYTE)(160u-i*13u);}
-        CHECK(IMFMediaBuffer_Unlock(buffer));
-        CHECK(IMFMediaBuffer_SetCurrentLength(buffer,W*H*3u/2u));
-        CHECK(IMFSample_AddBuffer(sample,buffer));
-        IMFMediaBuffer_Release(buffer);buffer=NULL;
-        CHECK(IMFSample_SetSampleTime(sample,(LONGLONG)i*333333));
-        CHECK(IMFSample_SetSampleDuration(sample,333333));
-        CHECK(IMFTransform_ProcessInput(mft,0,sample,0));
-        IMFSample_Release(sample);sample=NULL;
-        printf("INPUT %u OK\n",i);fflush(stdout);
-    }
-    CHECK(IMFTransform_ProcessMessage(mft,MFT_MESSAGE_COMMAND_DRAIN,0));
-    CHECK(IMFTransform_ProcessMessage(mft,MFT_MESSAGE_COMMAND_DRAIN,0));
-    deadline=GetTickCount64()+20000;
+    printf("START frames=%u size=%ux%u pending_limit=%u\n",target,width,height,MAX_PENDING);
+    deadline=GetTickCount64()+(long_test?120000:20000);
     while((frames<target||drain_events==0)&&GetTickCount64()<deadline){
+        /* Keep at most four accepted samples without consumed output, even if
+         * the transform's internal queue grows or NeedInput events coalesce. */
+        while(submitted<target&&submitted-frames<MAX_PENDING){
+            unsigned i=submitted;
+            BYTE *pixels=NULL;DWORD max_len=0,len=0;
+            CHECK(MFCreateSample(&sample));
+            CHECK(MFCreateMemoryBuffer(width*height*3u/2u,&buffer));
+            CHECK(IMFMediaBuffer_Lock(buffer,&pixels,&max_len,&len));
+            for(unsigned y=0;y<height;++y)for(unsigned x=0;x<width;++x)pixels[y*width+x]=(BYTE)(16u+(x*3u+y*5u+i*37u)%220u);
+            for(unsigned j=width*height;j<width*height*3u/2u;j+=2){pixels[j]=(BYTE)(96u+i*17u);pixels[j+1]=(BYTE)(160u-i*13u);}
+            CHECK(IMFMediaBuffer_Unlock(buffer));
+            CHECK(IMFMediaBuffer_SetCurrentLength(buffer,width*height*3u/2u));
+            CHECK(IMFSample_AddBuffer(sample,buffer));
+            IMFMediaBuffer_Release(buffer);buffer=NULL;
+            CHECK(IMFSample_SetSampleTime(sample,(LONGLONG)i*333333+(flushed?10000000:0)));
+            CHECK(IMFSample_SetSampleDuration(sample,333333));
+            hr=IMFTransform_ProcessInput(mft,0,sample,0);
+            IMFSample_Release(sample);sample=NULL;
+            if(hr==MF_E_NOTACCEPTING)break;
+            if(FAILED(hr)){fprintf(stderr,"ProcessInput %08lX at %u\n",(unsigned long)hr,i);goto done;}
+            ++submitted;
+            if(submitted-frames>max_pending)max_pending=submitted-frames;
+            printf("INPUT %u OK\n",i);fflush(stdout);
+        }
+        if(flush_test&&!flushed&&submitted==target){
+            CHECK(IMFTransform_ProcessMessage(mft,MFT_MESSAGE_COMMAND_FLUSH,0));
+            flushed=1;submitted=0;
+            printf("FLUSH OK; old output must be discarded\n");continue;
+        }
+        if(submitted==target&&!drain_sent){
+            CHECK(IMFTransform_ProcessMessage(mft,MFT_MESSAGE_COMMAND_DRAIN,0));
+            drain_sent=1;
+        }
         IMFMediaEvent *event=NULL;
         while(SUCCEEDED(IMFMediaEventGenerator_GetEvent(events,MF_EVENT_FLAG_NO_WAIT,&event))){
             MediaEventType type;HRESULT event_hr;
-            IMFMediaEvent_GetType(event,&type);IMFMediaEvent_GetStatus(event,&event_hr);
+            CHECK(IMFMediaEvent_GetType(event,&type));CHECK(IMFMediaEvent_GetStatus(event,&event_hr));
+            IMFMediaEvent_Release(event);event=NULL;
             if(type==METransformNeedInput)++need_input;
             if(type==METransformHaveOutput)++have_output;
-            if(type==METransformDrainComplete){++drain_events;if(frames!=target){fprintf(stderr,"early drain completion at %u/%u\n",frames,target);IMFMediaEvent_Release(event);goto done;}}
-            IMFMediaEvent_Release(event);event=NULL;
+            if(type==METransformDrainComplete){
+                ++drain_events;
+                if(!drain_sent||frames!=target||drain_events!=1){fprintf(stderr,"early/duplicate drain completion at %u/%u (count=%u)\n",frames,target,drain_events);goto done;}
+            }
             if(FAILED(event_hr)){hr=event_hr;fprintf(stderr,"MF event failure %08lX\n",(unsigned long)hr);goto done;}
         }
-        CHECK(MFCreateSample(&sample));CHECK(MFCreateMemoryBuffer(CAP,&buffer));
+        CHECK(MFCreateSample(&sample));
+        CHECK(MFCreateMemoryBuffer(retry_test&&!retried?1u:CAP,&buffer));
         CHECK(IMFSample_AddBuffer(sample,buffer));IMFMediaBuffer_Release(buffer);buffer=NULL;
         MFT_OUTPUT_DATA_BUFFER out={0};DWORD status=0;out.pSample=sample;
         hr=IMFTransform_ProcessOutput(mft,0,1,&out,&status);
         if(out.pEvents)IMFCollection_Release(out.pEvents);
         if(hr==MF_E_TRANSFORM_NEED_MORE_INPUT){IMFSample_Release(sample);sample=NULL;Sleep(10);continue;}
+        if(retry_test&&!retried){
+            if(hr!=MF_E_BUFFERTOOSMALL){fprintf(stderr,"expected MF_E_BUFFERTOOSMALL, got %08lX\n",(unsigned long)hr);goto done;}
+            retried=1;IMFSample_Release(sample);sample=NULL;
+            printf("BUFFER_TOO_SMALL OK; retrying same output with full capacity\n");continue;
+        }
         if(FAILED(hr)){fprintf(stderr,"ProcessOutput %08lX\n",(unsigned long)hr);goto done;}
         LONGLONG pts=0;UINT32 key=0;BYTE *bytes=NULL;DWORD max_len=0,len=0;
+        LONGLONG expected=(LONGLONG)(((UINT64)frames*333333u/10u)*10u)+(flushed?10000000:0);
         CHECK(IMFSample_GetSampleTime(sample,&pts));
         CHECK(IMFAttributes_GetUINT32((IMFAttributes *)sample,&MFSampleExtension_CleanPoint,&key));
         CHECK(IMFSample_ConvertToContiguousBuffer(sample,&buffer));
@@ -119,14 +175,34 @@ int wmain(int argc,wchar_t **argv)
         CHECK(IMFMediaBuffer_Unlock(buffer));IMFMediaBuffer_Release(buffer);buffer=NULL;
         fprintf(meta,"%u,%lu,%lld,%u\n",frames,(unsigned long)len,(long long)pts,key);
         printf("OUTPUT %u bytes=%lu pts=%lld key=%u\n",frames,(unsigned long)len,(long long)pts,key);fflush(stdout);
-        if(pts!=(LONGLONG)frames*333330 || (frames==0&&!key)){fprintf(stderr,"PTS/keyframe mismatch\n");goto done;}
+        if(frames>=submitted||pts!=expected||(frames==0&&!key)){
+            fprintf(stderr,"output count/PTS/keyframe mismatch index=%u submitted=%u expected=%lld actual=%lld\n",frames,submitted,(long long)expected,(long long)pts);goto done;
+        }
         ++frames;IMFSample_Release(sample);sample=NULL;
     }
-    if(frames!=target||drain_events!=1||(target&&!have_output)){fprintf(stderr,"timeout/count mismatch frames=%u HaveOutput=%u DrainComplete=%u\n",frames,have_output,drain_events);goto done;}
-    /* Repeated drain is idempotent and must not emit another completion. */
+    if(submitted!=target||frames!=target||drain_events!=1||(target&&!have_output)||(retry_test&&!retried)){
+        fprintf(stderr,"timeout/count mismatch submitted=%u frames=%u HaveOutput=%u DrainComplete=%u\n",submitted,frames,have_output,drain_events);goto done;
+    }
+    /* Repeated drain is idempotent and must not emit another completion.
+     * Observe briefly so an asynchronously posted duplicate cannot pass. */
     CHECK(IMFTransform_ProcessMessage(mft,MFT_MESSAGE_COMMAND_DRAIN,0));
-    {IMFMediaEvent *event=NULL;while(SUCCEEDED(IMFMediaEventGenerator_GetEvent(events,MF_EVENT_FLAG_NO_WAIT,&event))){MediaEventType type;IMFMediaEvent_GetType(event,&type);IMFMediaEvent_Release(event);if(type==METransformDrainComplete){fprintf(stderr,"duplicate DrainComplete\n");goto done;}}}
-    printf("PASS frames=%u NeedInput=%u HaveOutput=%u DrainComplete=%u\n",frames,need_input,have_output,drain_events);rc=0;
+    deadline=GetTickCount64()+250;
+    do{
+        IMFMediaEvent *event=NULL;
+        while(SUCCEEDED(IMFMediaEventGenerator_GetEvent(events,MF_EVENT_FLAG_NO_WAIT,&event))){
+            MediaEventType type;HRESULT event_hr;
+            CHECK(IMFMediaEvent_GetType(event,&type));CHECK(IMFMediaEvent_GetStatus(event,&event_hr));
+            IMFMediaEvent_Release(event);
+            if(FAILED(event_hr)){hr=event_hr;fprintf(stderr,"MF event failure after drain %08lX\n",(unsigned long)hr);goto done;}
+            if(type==METransformDrainComplete){fprintf(stderr,"duplicate DrainComplete after drain\n");goto done;}
+        }
+        Sleep(10);
+    }while(GetTickCount64()<deadline);
+    printf("PASS frames=%u NeedInput=%u HaveOutput=%u DrainComplete=%u MaxPending=%u\n",frames,need_input,have_output,drain_events,max_pending);rc=0;
+    goto done;
+usage:
+    fprintf(stderr,"usage: mft_encoder_smoke.exe encoder.dll [empty|flush|retry|long [width height]]\n");
+    return 2;
 done:
     if(buffer)IMFMediaBuffer_Release(buffer);
     if(sample)IMFSample_Release(sample);
