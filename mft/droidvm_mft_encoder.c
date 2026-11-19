@@ -149,7 +149,7 @@ static HRESULT copy_media_type(IMFMediaType **dst, IMFMediaType *src)
     hr = MFCreateMediaType(&copy);
     if (FAILED(hr))
         return hr;
-    hr = IMFAttributes_CopyAllItems((IMFAttributes *)copy, (IMFAttributes *)src);
+    hr = IMFAttributes_CopyAllItems((IMFAttributes *)src, (IMFAttributes *)copy);
     if (FAILED(hr)) {
         IMFMediaType_Release(copy);
         return hr;
@@ -452,7 +452,7 @@ static HRESULT STDMETHODCALLTYPE enc_GetOutputStreamInfo(IMFTransform *This, DWO
      * samples, which is the normal shape for an encoder MFT. */
     info->dwFlags = MFT_OUTPUT_STREAM_WHOLE_SAMPLES |
                     MFT_OUTPUT_STREAM_SINGLE_SAMPLE_PER_BUFFER;
-    info->cbSize = 0;
+    info->cbSize = DVM_PACKET_CAP;
     return S_OK;
 }
 
@@ -1007,6 +1007,10 @@ static HRESULT STDMETHODCALLTYPE enc_ProcessOutput_impl(IMFTransform *This, DWOR
     IMFMediaBuffer_Release(buffer);
     if(FAILED(hr))goto requeue;
     (void)IMFSample_SetSampleTime(sample,(LONGLONG)node->time);
+    {UINT32 num=DVM_HI32(m->frame_rate),den=DVM_LO32(m->frame_rate);
+     if(!num||!den){num=30;den=1;}
+     (void)IMFSample_SetSampleDuration(sample,(LONGLONG)((10000000ull*den)/num));}
+    dvm_logf("encoded output bytes=%u pts=%llu",node->size,(unsigned long long)node->time);
     (void)IMFAttributes_SetUINT32((IMFAttributes *)sample,&MFSampleExtension_CleanPoint,
         (node->flags&VM_ENCODER_PACKET_FLAG_KEYFRAME)?1u:0u);
     buffers[0].dwStatus=0;
@@ -1370,11 +1374,11 @@ static HRESULT STDMETHODCALLTYPE enc_SetInputType(IMFTransform *t,DWORD id,IMFMe
 static HRESULT STDMETHODCALLTYPE enc_SetOutputType(IMFTransform *t,DWORD id,IMFMediaType *type,DWORD flags)
 {DvmEncoder *m=(DvmEncoder *)t;HRESULT hr;EnterCriticalSection(&m->api_lock);hr=enc_SetOutputType_impl(t,id,type,flags);LeaveCriticalSection(&m->api_lock);return hr;}
 static HRESULT STDMETHODCALLTYPE enc_ProcessMessage(IMFTransform *t,MFT_MESSAGE_TYPE msg,ULONG_PTR param)
-{DvmEncoder *m=(DvmEncoder *)t;HRESULT hr;EnterCriticalSection(&m->api_lock);hr=enc_ProcessMessage_impl(t,msg,param);LeaveCriticalSection(&m->api_lock);return hr;}
+{DvmEncoder *m=(DvmEncoder *)t;HRESULT hr;EnterCriticalSection(&m->api_lock);dvm_logf("ProcessMessage msg=%u",(unsigned)msg);hr=enc_ProcessMessage_impl(t,msg,param);if(FAILED(hr))dvm_logf("ProcessMessage failed hr=%08lX",(unsigned long)hr);LeaveCriticalSection(&m->api_lock);return hr;}
 static HRESULT STDMETHODCALLTYPE enc_ProcessInput(IMFTransform *t,DWORD id,IMFSample *sample,DWORD flags)
-{DvmEncoder *m=(DvmEncoder *)t;HRESULT hr;EnterCriticalSection(&m->api_lock);hr=enc_ProcessInput_impl(t,id,sample,flags);LeaveCriticalSection(&m->api_lock);return hr;}
+{DvmEncoder *m=(DvmEncoder *)t;HRESULT hr;EnterCriticalSection(&m->api_lock);hr=enc_ProcessInput_impl(t,id,sample,flags);if(FAILED(hr))dvm_logf("ProcessInput failed hr=%08lX frames_in=%llu",(unsigned long)hr,(unsigned long long)m->frames_in);LeaveCriticalSection(&m->api_lock);return hr;}
 static HRESULT STDMETHODCALLTYPE enc_ProcessOutput(IMFTransform *t,DWORD flags,DWORD count,MFT_OUTPUT_DATA_BUFFER *buffers,DWORD *status)
-{DvmEncoder *m=(DvmEncoder *)t;HRESULT hr;EnterCriticalSection(&m->api_lock);hr=enc_ProcessOutput_impl(t,flags,count,buffers,status);LeaveCriticalSection(&m->api_lock);return hr;}
+{DvmEncoder *m=(DvmEncoder *)t;HRESULT hr;EnterCriticalSection(&m->api_lock);hr=enc_ProcessOutput_impl(t,flags,count,buffers,status);if(FAILED(hr)&&hr!=MF_E_TRANSFORM_NEED_MORE_INPUT)dvm_logf("ProcessOutput failed hr=%08lX frames_out=%llu",(unsigned long)hr,(unsigned long long)m->frames_out);LeaveCriticalSection(&m->api_lock);return hr;}
 
 static const IMFTransformVtbl g_transform_vtbl = {
     enc_QueryInterface,

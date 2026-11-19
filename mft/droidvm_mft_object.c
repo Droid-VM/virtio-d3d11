@@ -209,7 +209,7 @@ static HRESULT copy_attribute_type(IMFMediaType **dst, IMFMediaType *src)
     hr = MFCreateMediaType(&copy);
     if (FAILED(hr))
         return hr;
-    hr = IMFAttributes_CopyAllItems((IMFAttributes *)copy, (IMFAttributes *)src);
+    hr = IMFAttributes_CopyAllItems((IMFAttributes *)src, (IMFAttributes *)copy);
     if (FAILED(hr)) {
         IMFMediaType_Release(copy);
         return hr;
