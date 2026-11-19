@@ -7,6 +7,8 @@
 #include <mfobjects.h>
 #include <mftransform.h>
 #include <mferror.h>
+#include <icodecapi.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -14,6 +16,11 @@
 #include <wchar.h>
 
 static const CLSID encoder_clsid = {0x9f3c2a12,0x7d64,0x4e3b,{0x9a,0x21,0x6c,0x0d,0x5b,0x48,0xe7,0xa3}};
+/* Explicit GUIDs avoid adding a codec GUID-library dependency to the test. */
+static const GUID codec_iid = {0x901db4c7,0x31ce,0x41a2,{0x85,0xdc,0x8f,0xa0,0xbf,0x41,0xb8,0xda}};
+static const GUID codec_bitrate = {0xf7222374,0x2144,0x4815,{0xb5,0x50,0xa3,0x7f,0x8e,0x12,0xee,0x52}};
+static const GUID codec_gop = {0x95f31b26,0x95a4,0x41aa,{0x93,0x03,0x24,0x6a,0x7f,0xc6,0xee,0xf1}};
+static const GUID codec_force_keyframe = {0x398c1b98,0x8353,0x475a,{0x9e,0xf2,0x8f,0x26,0x5d,0x26,0x03,0x45}};
 typedef HRESULT (WINAPI *GetClassObjectFn)(REFCLSID,REFIID,void **);
 #define W 640u
 #define H 480u
@@ -73,6 +80,34 @@ static int parse_dimension(const wchar_t *text,unsigned *value)
     *value=(unsigned)parsed;return 1;
 }
 
+static int parse_control(const wchar_t *text,UINT32 *value)
+{
+    wchar_t *end=NULL;
+    unsigned long parsed;
+    if(*text<L'0'||*text>L'9')return 0;
+    errno=0;parsed=wcstoul(text,&end,10);
+    if(errno==ERANGE||*end||parsed==0||parsed>UINT32_MAX)return 0;
+    *value=(UINT32)parsed;return 1;
+}
+
+static int parse_force_index(const wchar_t *text,long *value)
+{
+    wchar_t *end=NULL;
+    long parsed;
+    if(!*text||(*text!=L'-'&&(*text<L'0'||*text>L'9')))return 0;
+    errno=0;parsed=wcstol(text,&end,10);
+    if(errno==ERANGE||end==text||*end)return 0;
+    *value=parsed;return 1;
+}
+
+static HRESULT set_control(ICodecAPI *codec,const GUID *property,UINT32 value)
+{
+    VARIANT setting;
+    memset(&setting,0,sizeof(setting));
+    V_VT(&setting)=VT_UI4;V_UI4(&setting)=value;
+    return codec->lpVtbl->SetValue(codec,property,&setting);
+}
+
 int wmain(int argc,wchar_t **argv)
 {
     HRESULT hr=S_OK;
@@ -80,6 +115,7 @@ int wmain(int argc,wchar_t **argv)
     GetClassObjectFn get_class;
     IClassFactory *factory=NULL;
     IMFTransform *mft=NULL;
+    ICodecAPI *codec=NULL;
     IMFMediaEventGenerator *events=NULL;
     IMFAttributes *attrs=NULL;
     IMFMediaType *input=NULL,*output=NULL;
@@ -87,12 +123,15 @@ int wmain(int argc,wchar_t **argv)
     IMFMediaBuffer *buffer=NULL;
     FILE *stream=NULL,*meta=NULL;
     unsigned frames=0,submitted=0,max_pending=0,need_input=0,have_output=0,drain_events=0;
-    unsigned target=FRAMES,width=W,height=H;
+    unsigned target=FRAMES,width=W,height=H,pending_limit=MAX_PENDING;
+    UINT32 bitrate=2000000,gop=0;
+    int controls_test=0,force_requested=0;
+    long force_index=-1;
     int flush_test=0,flushed=0,long_test=0,drain_sent=0;
     int retry_test=0,retried=0,hold_test=0,exit_test=0,timing_mode=0;
     int rc=1,com_started=0,mf_started=0,streaming=0;
     ULONGLONG deadline;
-    if(argc<2||argc>5)goto usage;
+    if(argc<2||argc>6)goto usage;
     if(argc>=3){
         if(wcscmp(argv[2],L"flush")==0)flush_test=1;
         else if(wcscmp(argv[2],L"empty")==0)target=0;
@@ -100,11 +139,16 @@ int wmain(int argc,wchar_t **argv)
         else if(wcscmp(argv[2],L"long")==0){long_test=1;target=SMOKE_LONG_FRAMES;}
         else if(wcscmp(argv[2],L"timing")==0){timing_mode=1;target=120u;}
         else if(wcscmp(argv[2],L"variable")==0){timing_mode=2;target=120u;}
+        else if(wcscmp(argv[2],L"controls")==0){controls_test=1;target=SMOKE_LONG_FRAMES;pending_limit=1u;}
         else if(wcscmp(argv[2],L"hold")==0)hold_test=1;
         else if(wcscmp(argv[2],L"exit")==0)exit_test=1;
         else goto usage;
     }
-    if(argc>3){
+    if(controls_test){
+        if(argc<5||!parse_control(argv[3],&bitrate)||!parse_control(argv[4],&gop))goto usage;
+        if(argc==6&&!parse_force_index(argv[5],&force_index))goto usage;
+        if(force_index>=0&&(unsigned long)force_index>=target)goto usage;
+    }else if(argc>3){
         if(!long_test||argc!=5||!parse_dimension(argv[3],&width)||!parse_dimension(argv[4],&height))goto usage;
     }
     CHECK(CoInitializeEx(NULL,COINIT_MULTITHREADED));com_started=1;
@@ -118,36 +162,56 @@ int wmain(int argc,wchar_t **argv)
     CHECK(IMFTransform_QueryInterface(mft,&IID_IMFMediaEventGenerator,(void **)&events));
     CHECK(IMFTransform_GetAttributes(mft,&attrs));
     CHECK(IMFAttributes_SetUINT32(attrs,&MF_TRANSFORM_ASYNC_UNLOCK,1));
+    if(controls_test){
+        CHECK(IMFTransform_QueryInterface(mft,&codec_iid,(void **)&codec));
+        CHECK(set_control(codec,&codec_bitrate,bitrate));
+        CHECK(set_control(codec,&codec_gop,gop));
+        printf("CONTROLS bitrate=%lu gop=%lu force_index=%ld (set before media types)\n",
+               (unsigned long)bitrate,(unsigned long)gop,force_index);
+    }
     CHECK(media_type(&input,&MFVideoFormat_NV12,width,height,timing_mode));
     CHECK(IMFMediaType_SetUINT32(input,&MF_MT_DEFAULT_STRIDE,width));
     CHECK(media_type(&output,&MFVideoFormat_H264,width,height,timing_mode));
-    CHECK(IMFMediaType_SetUINT32(output,&MF_MT_AVG_BITRATE,2000000));
+    CHECK(IMFMediaType_SetUINT32(output,&MF_MT_AVG_BITRATE,bitrate));
     CHECK(IMFTransform_SetInputType(mft,0,input,0));
     CHECK(IMFTransform_SetOutputType(mft,0,output,0));
     CHECK(IMFTransform_ProcessMessage(mft,MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,0));streaming=1;
     stream=fopen("mft-smoke.h264","wb");meta=fopen("mft-smoke.csv","w");
     if(!stream||!meta){perror("output files");goto done;}
     fprintf(meta,"index,bytes,pts100ns,duration100ns,keyframe\n");
-    printf("START frames=%u size=%ux%u pending_limit=%u timing=%s\n",target,width,height,MAX_PENDING,
+    printf("START frames=%u size=%ux%u pending_limit=%u timing=%s\n",target,width,height,pending_limit,
            timing_mode==2?"variable":timing_mode==1?"30000/1001":"legacy");
-    deadline=GetTickCount64()+((long_test||timing_mode)?120000:20000);
+    deadline=GetTickCount64()+((long_test||timing_mode||controls_test)?120000:20000);
     while((frames<target||drain_events==0)&&GetTickCount64()<deadline){
-        /* Keep at most four accepted samples without consumed output, even if
-         * the transform's internal queue grows or NeedInput events coalesce. */
-        while(submitted<target&&submitted-frames<MAX_PENDING){
+        /* Controls permits only one accepted sample without consumed output,
+         * so a force request follows all preceding consumed frames. */
+        while(submitted<target&&submitted-frames<pending_limit){
             unsigned i=submitted;
             BYTE *pixels=NULL;DWORD max_len=0,len=0;
             CHECK(MFCreateSample(&sample));
             CHECK(MFCreateMemoryBuffer(width*height*3u/2u,&buffer));
             CHECK(IMFMediaBuffer_Lock(buffer,&pixels,&max_len,&len));
-            for(unsigned y=0;y<height;++y)for(unsigned x=0;x<width;++x)pixels[y*width+x]=(BYTE)(16u+(x*3u+y*5u+i*37u)%220u);
-            for(unsigned j=width*height;j<width*height*3u/2u;j+=2){pixels[j]=(BYTE)(96u+i*17u);pixels[j+1]=(BYTE)(160u-i*13u);}
+            if(controls_test){
+                uint32_t noise=0x6d2b79f5u^(i*0x9e3779b9u);
+                for(unsigned j=0;j<width*height*3u/2u;++j){noise^=noise<<13;noise^=noise>>17;noise^=noise<<5;pixels[j]=(BYTE)(16u+noise%220u);}
+            }else{
+                for(unsigned y=0;y<height;++y)for(unsigned x=0;x<width;++x)pixels[y*width+x]=(BYTE)(16u+(x*3u+y*5u+i*37u)%220u);
+                for(unsigned j=width*height;j<width*height*3u/2u;j+=2){pixels[j]=(BYTE)(96u+i*17u);pixels[j+1]=(BYTE)(160u-i*13u);}
+            }
             CHECK(IMFMediaBuffer_Unlock(buffer));
             CHECK(IMFMediaBuffer_SetCurrentLength(buffer,width*height*3u/2u));
             CHECK(IMFSample_AddBuffer(sample,buffer));
             IMFMediaBuffer_Release(buffer);buffer=NULL;
             CHECK(IMFSample_SetSampleTime(sample,frame_time(i,timing_mode)+(flushed?10000000:0)));
             CHECK(IMFSample_SetSampleDuration(sample,frame_duration(i,timing_mode)));
+            if(controls_test&&!force_requested&&force_index>=0&&i==(unsigned long)force_index){
+                CHECK(set_control(codec,&codec_force_keyframe,1));
+                force_requested=1;
+                /* The host may service the request asynchronously. Record the
+                 * request order and CSV clean points without asserting index. */
+                printf("FORCE_KEYFRAME before_input=%u submitted=%u consumed=%u\n",i,submitted,frames);
+                fflush(stdout);
+            }
             hr=IMFTransform_ProcessInput(mft,0,sample,0);
             IMFSample_Release(sample);sample=NULL;
             if(hr==MF_E_NOTACCEPTING)break;
@@ -243,7 +307,7 @@ int wmain(int argc,wchar_t **argv)
     printf("PASS frames=%u NeedInput=%u HaveOutput=%u DrainComplete=%u MaxPending=%u\n",frames,need_input,have_output,drain_events,max_pending);rc=0;
     goto done;
 usage:
-    fprintf(stderr,"usage: mft_encoder_smoke.exe encoder.dll [empty|flush|retry|hold|exit|timing|variable|long [width height]]\n");
+    fprintf(stderr,"usage: mft_encoder_smoke.exe encoder.dll [empty|flush|retry|hold|exit|timing|variable|long [width height]|controls bitrate gop [force_index]]\n");
     return 2;
 done:
     if(buffer)IMFMediaBuffer_Release(buffer);
@@ -253,6 +317,7 @@ done:
     if(meta&&fclose(meta)!=0)rc=1;
     if(input)IMFMediaType_Release(input);if(output)IMFMediaType_Release(output);
     if(attrs)IMFAttributes_Release(attrs);if(events)IMFMediaEventGenerator_Release(events);
+    if(codec)codec->lpVtbl->Release(codec);
     if(mft)IMFTransform_Release(mft);if(factory)IClassFactory_Release(factory);
     if(dll)FreeLibrary(dll);if(mf_started)MFShutdown();if(com_started)CoUninitialize();
     return rc;
