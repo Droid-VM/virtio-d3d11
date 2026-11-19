@@ -9,7 +9,7 @@ This probe was recovered from the verified R3 historical experiment into the cur
 - Two NV12 output textures/views.
 - Legal red/blue baseline IDR inputs with exact PicParams and slice metadata derived from the fixture.
 - `--baseline`: both inputs without an intentional delay, expected UMD generation 0 control.
-- `--flush`: second input after the existing 250ms delay, intended to reach the real non-tag H.264 LIFE flush entry.
+- Current canonical source supports `--baseline` only. The historical R4 `--flush` variant is a separate artifact; do not infer flush coverage from this baseline binary.
 - GPU readback and exact blue NV12 pixel verification.
 
 This is not a fake IOCTL probe and does not call `DeviceIoControl` directly. It is not a complete §5.4 old-completion race or direct token observation test; the public D3D11 API cannot expose the UMD token.
