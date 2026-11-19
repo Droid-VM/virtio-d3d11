@@ -489,7 +489,7 @@ int VM_CALL vm_encoder_queue_input(VM_SESSION *session,
     VM_ENCODER_INPUT request;
     uint8_t *buffer;
     size_t total;
-    DWORD returned = 0;
+    DWORD returned = 0, error;
     int ok;
     if (!encoder_session_ok(session)) return 0;
     if (input == NULL || nv12 == NULL || size == 0 || input->DataSize != size ||
@@ -508,8 +508,9 @@ int VM_CALL vm_encoder_queue_input(VM_SESSION *session,
     memcpy(buffer + sizeof(request), nv12, size);
     ok = DeviceIoControl(session->handle, VM_IOCTL_ENC_QUEUE_INPUT,
                          buffer, (DWORD)total, NULL, 0, &returned, NULL);
+    error = ok ? 0 : GetLastError();
     HeapFree(GetProcessHeap(), 0, buffer);
-    if (!ok) { set_error(GetLastError()); return 0; }
+    if (!ok) { set_error(error); return 0; }
     set_error(0);
     return 1;
 }
