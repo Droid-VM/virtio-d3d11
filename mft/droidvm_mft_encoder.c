@@ -47,7 +47,9 @@ static const GUID k_iid_icodecapi = {
 #define DVM_MIN_ENC_DIM   128u
 #define DVM_MAX_INFLIGHT  4u
 #define DVM_PACKET_CAP    (4u * 1024u * 1024u)
-#define DVM_PACKET_TIMEOUT_MS 250u
+/* Poll under io_lock, then wait outside it: a blocking GET_PACKET can starve
+ * ProcessInput on Windows critical sections, which do not guarantee fairness. */
+#define DVM_PACKET_TIMEOUT_MS 0u
 
 typedef struct DvmPacket {
     struct DvmPacket *next;
@@ -227,7 +229,10 @@ static DWORD WINAPI encoder_worker(void *arg)
             LeaveCriticalSection(&m->io_lock);
             if (!ok) {
                 HeapFree(GetProcessHeap(), 0, bytes);
-                if (error == ERROR_SEM_TIMEOUT || error == ERROR_TIMEOUT) continue;
+                if (error == ERROR_SEM_TIMEOUT || error == ERROR_TIMEOUT) {
+                    WaitForSingleObject(m->wake_event,2);
+                    continue;
+                }
                 EnterCriticalSection(&m->lock);
                 m->fatal = HRESULT_FROM_WIN32(error ? error : ERROR_GEN_FAILURE);
                 LeaveCriticalSection(&m->lock);
@@ -329,13 +334,13 @@ static HRESULT encoder_start(DvmEncoder *m)
     LeaveCriticalSection(&m->lock);
     memset(&opened, 0, sizeof(opened));
     session=vm_open(1, &opened);
-    if (!session) return hr_from_vm_error();
+    if (!session) {HRESULT hr=hr_from_vm_error();dvm_logf("encoder OPEN failed: %08lX",(unsigned long)hr);return hr;}
     memset(&cfg,0,sizeof(cfg));
     cfg.Version=VM_ENCODER_ABI_VERSION; cfg.Size=sizeof(cfg); cfg.SessionToken=opened.SessionToken;
     cfg.Width=width; cfg.Height=height; cfg.YStride=width; cfg.UVStride=width;
     cfg.UVOffset=width*height; cfg.FrameRateNum=frame_rate ? DVM_HI32(frame_rate) : 30;
     cfg.FrameRateDen=frame_rate ? DVM_LO32(frame_rate) : 1; cfg.Bitrate=bitrate; cfg.GopFrames=gop;
-    if (!vm_encoder_configure(session,&cfg)) { HRESULT hr=hr_from_vm_error(); vm_close(session); return hr; }
+    if (!vm_encoder_configure(session,&cfg)) { HRESULT hr=hr_from_vm_error();dvm_logf("encoder CONFIG failed: %ux%u hr=%08lX",width,height,(unsigned long)hr); vm_close(session); return hr; }
     if (!m->wake_event) m->wake_event=CreateEventW(NULL,FALSE,FALSE,NULL);
     if (!m->wake_event) { vm_close(session); return HRESULT_FROM_WIN32(GetLastError()); }
     EnterCriticalSection(&m->lock);
