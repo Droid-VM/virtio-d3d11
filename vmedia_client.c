@@ -587,6 +587,21 @@ int VM_CALL vm_encoder_control(VM_SESSION *session, uint32_t ioctl_code)
     return 1;
 }
 
+int VM_CALL vm_encoder_set_bitrate(VM_SESSION *session,uint32_t bitrate)
+{
+    VM_ENCODER_RATE_CONTROL request;
+    DWORD returned=0;
+    if(!encoder_session_ok(session))return 0;
+    if(session->driver_version<0x00010024u){set_error(ERROR_NOT_SUPPORTED);return 0;}
+    if(!bitrate||bitrate>INT32_MAX){set_error(ERROR_INVALID_PARAMETER);return 0;}
+    memset(&request,0,sizeof(request));request.Version=VM_ENCODER_ABI_VERSION;
+    request.Size=sizeof(request);request.SessionToken=session->token;request.Bitrate=bitrate;
+    if(!DeviceIoControl(session->handle,VM_IOCTL_ENC_SET_BITRATE,&request,sizeof(request),NULL,0,&returned,NULL)){
+        set_error(GetLastError());return 0;
+    }
+    set_error(0);return 1;
+}
+
 void VM_CALL vm_close(VM_SESSION *session)
 {
     VM_CLOSE_IN in;

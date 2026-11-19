@@ -19,6 +19,8 @@ static const CLSID encoder_clsid = {0x9f3c2a12,0x7d64,0x4e3b,{0x9a,0x21,0x6c,0x0
 /* Explicit GUIDs avoid adding a codec GUID-library dependency to the test. */
 static const GUID codec_iid = {0x901db4c7,0x31ce,0x41a2,{0x85,0xdc,0x8f,0xa0,0xbf,0x41,0xb8,0xda}};
 static const GUID codec_bitrate = {0xf7222374,0x2144,0x4815,{0xb5,0x50,0xa3,0x7f,0x8e,0x12,0xee,0x52}};
+/* AVEncCommonRateControlMode: CBR=0, unconstrained VBR=2. */
+static const GUID codec_rate_control_mode = {0x1c0608e9,0x370c,0x4710,{0x8a,0x58,0xcb,0x61,0x81,0xc4,0x24,0x23}};
 static const GUID codec_gop = {0x95f31b26,0x95a4,0x41aa,{0x93,0x03,0x24,0x6a,0x7f,0xc6,0xee,0xf1}};
 static const GUID codec_force_keyframe = {0x398c1b98,0x8353,0x475a,{0x9e,0xf2,0x8f,0x26,0x5d,0x26,0x03,0x45}};
 typedef HRESULT (WINAPI *GetClassObjectFn)(REFCLSID,REFIID,void **);
@@ -26,7 +28,7 @@ typedef HRESULT (WINAPI *GetClassObjectFn)(REFCLSID,REFIID,void **);
 #define H 480u
 #define FRAMES 4u
 #ifndef SMOKE_LONG_FRAMES
-#define SMOKE_LONG_FRAMES 120u
+#define SMOKE_LONG_FRAMES 600u
 #endif
 #if SMOKE_LONG_FRAMES < 120
 #error SMOKE_LONG_FRAMES must be at least 120
@@ -90,6 +92,16 @@ static int parse_control(const wchar_t *text,UINT32 *value)
     *value=(UINT32)parsed;return 1;
 }
 
+static int parse_frame_index(const wchar_t *text,UINT32 *value)
+{
+    wchar_t *end=NULL;
+    unsigned long parsed;
+    if(!*text||*text<L'0'||*text>L'9')return 0;
+    errno=0;parsed=wcstoul(text,&end,10);
+    if(errno==ERANGE||*end||parsed>UINT32_MAX)return 0;
+    *value=(UINT32)parsed;return 1;
+}
+
 static int parse_force_index(const wchar_t *text,long *value)
 {
     wchar_t *end=NULL;
@@ -108,6 +120,21 @@ static HRESULT set_control(ICodecAPI *codec,const GUID *property,UINT32 value)
     return codec->lpVtbl->SetValue(codec,property,&setting);
 }
 
+static HRESULT get_control(ICodecAPI *codec,const GUID *property,UINT32 *value)
+{
+    VARIANT result;
+    HRESULT hr;
+    VariantInit(&result);
+    hr=codec->lpVtbl->GetValue(codec,property,&result);
+    if(SUCCEEDED(hr)){
+        if(V_VT(&result)==VT_UI4)*value=V_UI4(&result);
+        else if(V_VT(&result)==VT_UI8&&V_UI8(&result)<=UINT32_MAX)*value=(UINT32)V_UI8(&result);
+        else hr=E_INVALIDARG;
+    }
+    VariantClear(&result);
+    return hr;
+}
+
 int wmain(int argc,wchar_t **argv)
 {
     HRESULT hr=S_OK;
@@ -124,14 +151,16 @@ int wmain(int argc,wchar_t **argv)
     FILE *stream=NULL,*meta=NULL;
     unsigned frames=0,submitted=0,max_pending=0,need_input=0,have_output=0,drain_events=0;
     unsigned target=FRAMES,width=W,height=H,pending_limit=MAX_PENDING;
-    UINT32 bitrate=2000000,gop=0;
-    int controls_test=0,force_requested=0;
+    UINT32 bitrate=2000000,gop=0,rate_control_mode=2u;
+    UINT32 dynamic_start_rate=0,dynamic_end_rate=0,dynamic_switch_index=0;
+    int controls_test=0,dynamic_test=0,force_requested=0,rate_control_explicit=0;
     long force_index=-1;
     int flush_test=0,flushed=0,long_test=0,drain_sent=0;
     int retry_test=0,retried=0,hold_test=0,exit_test=0,timing_mode=0;
+    int dynamic_switched=0;
     int rc=1,com_started=0,mf_started=0,streaming=0;
     ULONGLONG deadline;
-    if(argc<2||argc>6)goto usage;
+    if(argc<2||argc>7)goto usage;
     if(argc>=3){
         if(wcscmp(argv[2],L"flush")==0)flush_test=1;
         else if(wcscmp(argv[2],L"empty")==0)target=0;
@@ -140,13 +169,32 @@ int wmain(int argc,wchar_t **argv)
         else if(wcscmp(argv[2],L"timing")==0){timing_mode=1;target=120u;}
         else if(wcscmp(argv[2],L"variable")==0){timing_mode=2;target=120u;}
         else if(wcscmp(argv[2],L"controls")==0){controls_test=1;target=SMOKE_LONG_FRAMES;pending_limit=1u;}
+        else if(wcscmp(argv[2],L"dynamic")==0){dynamic_test=1;target=SMOKE_LONG_FRAMES;pending_limit=1u;}
         else if(wcscmp(argv[2],L"hold")==0)hold_test=1;
         else if(wcscmp(argv[2],L"exit")==0)exit_test=1;
         else goto usage;
     }
-    if(controls_test){
+    if(dynamic_test){
+        int dynamic_argc=argc;
+        if(argc<6||!parse_control(argv[3],&dynamic_start_rate)||!parse_control(argv[4],&dynamic_end_rate)||
+           !parse_frame_index(argv[5],&dynamic_switch_index))goto usage;
+        if(dynamic_switch_index>=SMOKE_LONG_FRAMES)goto usage;
+        if(argc>=7){
+            if(wcscmp(argv[6],L"cbr")==0){rate_control_mode=0u;rate_control_explicit=1;--dynamic_argc;}
+            else if(wcscmp(argv[6],L"vbr")==0){rate_control_explicit=1;--dynamic_argc;}
+            else goto usage;
+        }
+        if(dynamic_argc!=6)goto usage;
+        bitrate=dynamic_start_rate;
+    }else if(controls_test){
+        int control_argc=argc;
         if(argc<5||!parse_control(argv[3],&bitrate)||!parse_control(argv[4],&gop))goto usage;
-        if(argc==6&&!parse_force_index(argv[5],&force_index))goto usage;
+        if(argc>=6){
+            if(wcscmp(argv[argc-1],L"cbr")==0){rate_control_mode=0u;rate_control_explicit=1;--control_argc;}
+            else if(wcscmp(argv[argc-1],L"vbr")==0){rate_control_explicit=1;--control_argc;}
+        }
+        if(control_argc>6)goto usage;
+        if(control_argc==6&&!parse_force_index(argv[5],&force_index))goto usage;
         if(force_index>=0&&(unsigned long)force_index>=target)goto usage;
     }else if(argc>3){
         if(!long_test||argc!=5||!parse_dimension(argv[3],&width)||!parse_dimension(argv[4],&height))goto usage;
@@ -162,12 +210,22 @@ int wmain(int argc,wchar_t **argv)
     CHECK(IMFTransform_QueryInterface(mft,&IID_IMFMediaEventGenerator,(void **)&events));
     CHECK(IMFTransform_GetAttributes(mft,&attrs));
     CHECK(IMFAttributes_SetUINT32(attrs,&MF_TRANSFORM_ASYNC_UNLOCK,1));
-    if(controls_test){
+    if(controls_test||dynamic_test){
         CHECK(IMFTransform_QueryInterface(mft,&codec_iid,(void **)&codec));
+        CHECK(set_control(codec,&codec_rate_control_mode,rate_control_mode));
         CHECK(set_control(codec,&codec_bitrate,bitrate));
-        CHECK(set_control(codec,&codec_gop,gop));
-        printf("CONTROLS bitrate=%lu gop=%lu force_index=%ld (set before media types)\n",
-               (unsigned long)bitrate,(unsigned long)gop,force_index);
+        if(controls_test){
+            CHECK(set_control(codec,&codec_gop,gop));
+            printf("CONTROLS bitrate=%lu gop=%lu force_index=%ld mode=%s rate_control=%lu (%s; set before media types/start)\n",
+                   (unsigned long)bitrate,(unsigned long)gop,force_index,
+                   rate_control_mode==0u?"cbr":"vbr",(unsigned long)rate_control_mode,
+                   rate_control_explicit?"explicit mode":"default mode");
+        }else{
+            printf("DYNAMIC start_rate=%lu end_rate=%lu switch_index=%lu mode=%s rate_control=%lu (%s; start set before media types/start)\n",
+                   (unsigned long)dynamic_start_rate,(unsigned long)dynamic_end_rate,
+                   (unsigned long)dynamic_switch_index,rate_control_mode==0u?"cbr":"vbr",
+                   (unsigned long)rate_control_mode,rate_control_explicit?"explicit mode":"default mode");
+        }
     }
     CHECK(media_type(&input,&MFVideoFormat_NV12,width,height,timing_mode));
     CHECK(IMFMediaType_SetUINT32(input,&MF_MT_DEFAULT_STRIDE,width));
@@ -181,7 +239,7 @@ int wmain(int argc,wchar_t **argv)
     fprintf(meta,"index,bytes,pts100ns,duration100ns,keyframe\n");
     printf("START frames=%u size=%ux%u pending_limit=%u timing=%s\n",target,width,height,pending_limit,
            timing_mode==2?"variable":timing_mode==1?"30000/1001":"legacy");
-    deadline=GetTickCount64()+((long_test||timing_mode||controls_test)?120000:20000);
+    deadline=GetTickCount64()+((long_test||timing_mode||controls_test||dynamic_test)?120000:20000);
     while((frames<target||drain_events==0)&&GetTickCount64()<deadline){
         /* Controls permits only one accepted sample without consumed output,
          * so a force request follows all preceding consumed frames. */
@@ -191,7 +249,11 @@ int wmain(int argc,wchar_t **argv)
             CHECK(MFCreateSample(&sample));
             CHECK(MFCreateMemoryBuffer(width*height*3u/2u,&buffer));
             CHECK(IMFMediaBuffer_Lock(buffer,&pixels,&max_len,&len));
-            if(controls_test){
+            if((controls_test||dynamic_test)
+#ifdef SMOKE_SIMPLE_SOURCE
+               &&0
+#endif
+              ){
                 uint32_t noise=0x6d2b79f5u^(i*0x9e3779b9u);
                 for(unsigned j=0;j<width*height*3u/2u;++j){noise^=noise<<13;noise^=noise>>17;noise^=noise<<5;pixels[j]=(BYTE)(16u+noise%220u);}
             }else{
@@ -204,6 +266,19 @@ int wmain(int argc,wchar_t **argv)
             IMFMediaBuffer_Release(buffer);buffer=NULL;
             CHECK(IMFSample_SetSampleTime(sample,frame_time(i,timing_mode)+(flushed?10000000:0)));
             CHECK(IMFSample_SetSampleDuration(sample,frame_duration(i,timing_mode)));
+            if(dynamic_test&&!dynamic_switched&&i==dynamic_switch_index){
+                UINT32 confirmed=0;
+                CHECK(set_control(codec,&codec_bitrate,dynamic_end_rate));
+                CHECK(get_control(codec,&codec_bitrate,&confirmed));
+                if(confirmed!=dynamic_end_rate){
+                    fprintf(stderr,"dynamic bitrate confirmation mismatch expected=%lu actual=%lu\n",
+                            (unsigned long)dynamic_end_rate,(unsigned long)confirmed);goto done;
+                }
+                dynamic_switched=1;
+                printf("RATE_CHANGE index=%u bitrate=%lu confirmed=%lu\n",i,
+                       (unsigned long)dynamic_end_rate,(unsigned long)confirmed);
+                fflush(stdout);
+            }
             if(controls_test&&!force_requested&&force_index>=0&&i==(unsigned long)force_index){
                 CHECK(set_control(codec,&codec_force_keyframe,1));
                 force_requested=1;
@@ -286,7 +361,7 @@ int wmain(int argc,wchar_t **argv)
         }
         ++frames;IMFSample_Release(sample);sample=NULL;
     }
-    if(submitted!=target||frames!=target||drain_events!=1||(target&&!have_output)||(retry_test&&!retried)){
+    if(submitted!=target||frames!=target||drain_events!=1||(target&&!have_output)||(retry_test&&!retried)||(dynamic_test&&!dynamic_switched)){
         fprintf(stderr,"timeout/count mismatch submitted=%u frames=%u HaveOutput=%u DrainComplete=%u\n",submitted,frames,have_output,drain_events);goto done;
     }
     /* Repeated drain is idempotent and must not emit another completion.
@@ -307,7 +382,8 @@ int wmain(int argc,wchar_t **argv)
     printf("PASS frames=%u NeedInput=%u HaveOutput=%u DrainComplete=%u MaxPending=%u\n",frames,need_input,have_output,drain_events,max_pending);rc=0;
     goto done;
 usage:
-    fprintf(stderr,"usage: mft_encoder_smoke.exe encoder.dll [empty|flush|retry|hold|exit|timing|variable|long [width height]|controls bitrate gop [force_index]]\n");
+    fprintf(stderr,"usage: mft_encoder_smoke.exe encoder.dll [empty|flush|retry|hold|exit|timing|variable|long [width height]|controls bitrate gop [force_index] [cbr|vbr]|dynamic start_rate end_rate switch_index [cbr|vbr]]\n"
+                   "controls: default mode=vbr; force_index=-1 disables force; dynamic defaults to SMOKE_LONG_FRAMES (600) noise frames and pending_limit=1.\n");
     return 2;
 done:
     if(buffer)IMFMediaBuffer_Release(buffer);
