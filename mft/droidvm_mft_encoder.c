@@ -3,8 +3,9 @@
  * The transform owns one VM encoder session. ProcessInput copies an NV12 sample
  * into bounded encoder queue slots; a worker obtains coded packets and raises
  * METransformHaveOutput. ProcessOutput copies H.264 bytes and the echoed 100-ns
- * timestamp to the caller's sample. Host ForceKeyframe and driver DRAIN/FLUSH
- * are reported unsupported rather than emulated or silently acknowledged.
+ * timestamp to the caller's sample. Drain waits for STOP/LAST and delivered
+ * output; Flush rebuilds the token-owned session after joining its worker.
+ * ForceKeyframe is not enabled until the production backend is verified.
  */
 #include "droidvm_mft.h"
 #include <vmedia_client.h>
@@ -855,7 +856,32 @@ static HRESULT STDMETHODCALLTYPE enc_ProcessMessage_impl(IMFTransform *This,
         encoder_stop(m);
         return S_OK;
     case MFT_MESSAGE_COMMAND_FLUSH:
-        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        {
+            int resume;
+            uint32_t old_token;
+            IMFMediaEvent *event=NULL;
+            EnterCriticalSection(&m->lock);
+            resume=m->streaming;old_token=m->encoder_config.SessionToken;
+            m->streaming=0;m->need_input_posted=0;
+            LeaveCriticalSection(&m->lock);
+            /* api_lock excludes every public input/output/lifecycle operation.
+             * Joining the worker before discarding output is the epoch barrier. */
+            encoder_stop(m);
+            while(SUCCEEDED(IMFMediaEventQueue_GetEvent(m->events,MF_EVENT_FLAG_NO_WAIT,&event))){
+                IMFMediaEvent_Release(event);event=NULL;
+            }
+            EnterCriticalSection(&m->lock);
+            m->draining=0;m->drain_requested=0;m->drain_done=0;
+            m->drain_complete_posted=0;m->active_outputs=0;m->fatal=S_OK;
+            LeaveCriticalSection(&m->lock);
+            if(!resume)return S_OK;
+            hr=encoder_start(m);
+            if(FAILED(hr)){EnterCriticalSection(&m->lock);m->fatal=hr;LeaveCriticalSection(&m->lock);return hr;}
+            if(m->encoder_config.SessionToken==old_token){encoder_stop(m);return E_UNEXPECTED;}
+            EnterCriticalSection(&m->lock);m->streaming=1;m->need_input_posted=1;LeaveCriticalSection(&m->lock);
+            post_event(m,METransformNeedInput,S_OK);
+            return S_OK;
+        }
     case MFT_MESSAGE_COMMAND_DRAIN:
         if(!m->session)return MF_E_TRANSFORM_TYPE_NOT_SET;
         EnterCriticalSection(&m->lock);
