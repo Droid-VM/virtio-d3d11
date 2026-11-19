@@ -68,7 +68,7 @@ int wmain(int argc,wchar_t **argv)
     unsigned frames=0,submitted=0,max_pending=0,need_input=0,have_output=0,drain_events=0;
     unsigned target=FRAMES,width=W,height=H;
     int flush_test=0,flushed=0,long_test=0,drain_sent=0;
-    int retry_test=0,retried=0;
+    int retry_test=0,retried=0,hold_test=0,exit_test=0;
     int rc=1,com_started=0,mf_started=0,streaming=0;
     ULONGLONG deadline;
     if(argc<2||argc>5)goto usage;
@@ -77,6 +77,8 @@ int wmain(int argc,wchar_t **argv)
         else if(wcscmp(argv[2],L"empty")==0)target=0;
         else if(wcscmp(argv[2],L"retry")==0)retry_test=1;
         else if(wcscmp(argv[2],L"long")==0){long_test=1;target=SMOKE_LONG_FRAMES;}
+        else if(wcscmp(argv[2],L"hold")==0)hold_test=1;
+        else if(wcscmp(argv[2],L"exit")==0)exit_test=1;
         else goto usage;
     }
     if(argc>3){
@@ -129,6 +131,18 @@ int wmain(int argc,wchar_t **argv)
             ++submitted;
             if(submitted-frames>max_pending)max_pending=submitted-frames;
             printf("INPUT %u OK\n",i);fflush(stdout);
+            if(submitted==FRAMES&&(hold_test||exit_test)){
+                /* Leave the transform open for forced/process-exit cleanup tests. */
+                if(hold_test){
+                    printf("HOLD_READY pid=%lu submitted=%u\n",(unsigned long)GetCurrentProcessId(),submitted);
+                    fflush(stdout);
+                    Sleep(120000);
+                }else{
+                    printf("EXIT_WITHOUT_CLOSE\n");fflush(stdout);
+                }
+                /* Also skip done if the hold expires without an external kill. */
+                ExitProcess(0);
+            }
         }
         if(flush_test&&!flushed&&submitted==target){
             CHECK(IMFTransform_ProcessMessage(mft,MFT_MESSAGE_COMMAND_FLUSH,0));
@@ -201,7 +215,7 @@ int wmain(int argc,wchar_t **argv)
     printf("PASS frames=%u NeedInput=%u HaveOutput=%u DrainComplete=%u MaxPending=%u\n",frames,need_input,have_output,drain_events,max_pending);rc=0;
     goto done;
 usage:
-    fprintf(stderr,"usage: mft_encoder_smoke.exe encoder.dll [empty|flush|retry|long [width height]]\n");
+    fprintf(stderr,"usage: mft_encoder_smoke.exe encoder.dll [empty|flush|retry|hold|exit|long [width height]]\n");
     return 2;
 done:
     if(buffer)IMFMediaBuffer_Release(buffer);
