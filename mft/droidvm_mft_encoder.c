@@ -1,8 +1,8 @@
-/* droidvm_mft_encoder.c - asynchronous H.264 encoder MFT over canonical vmedia ABI.
+/* Asynchronous H.264 and HEVC encoder MFTs over the vmedia ABI.
  *
  * The transform owns one VM encoder session. ProcessInput copies an NV12 sample
  * into bounded encoder queue slots; a worker obtains coded packets and raises
- * METransformHaveOutput. ProcessOutput copies H.264 bytes and the echoed 100-ns
+ * METransformHaveOutput. ProcessOutput copies coded bytes and the echoed 100-ns
  * timestamp to the caller's sample. Drain waits for STOP/LAST and delivered
  * output; Flush rebuilds the token-owned session after joining its worker.
  * ForceKeyframe is not enabled until the production backend is verified.
@@ -361,10 +361,11 @@ static HRESULT encoder_start(DvmEncoder *m)
     bitrate=m->mean_bitrate; gop=m->gop_size;
     LeaveCriticalSection(&m->lock);
     memset(&opened, 0, sizeof(opened));
-    session=vm_open(1, &opened);
+    session=vm_open_codec(1, DVM_MFT_CODEC, &opened);
     if (!session) {HRESULT hr=hr_from_vm_error();dvm_logf("encoder OPEN failed: %08lX",(unsigned long)hr);return hr;}
-    if(opened.DriverVersion<0x00010023u){
-        dvm_logf("encoder bitrate modes require driver 1.0.0.35; got %08X",opened.DriverVersion);
+    if(opened.DriverVersion < DVM_MFT_MIN_DRIVER){
+        dvm_logf("%s requires driver %08X; got %08X", DVM_MFT_MODENAME,
+                 DVM_MFT_MIN_DRIVER, opened.DriverVersion);
         vm_close(session);return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     }
     memset(&cfg,0,sizeof(cfg));
@@ -616,7 +617,7 @@ static HRESULT STDMETHODCALLTYPE enc_GetOutputAvailableType(IMFTransform *This,
         return hr;
     hr = IMFMediaType_SetGUID(mt, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
     if (SUCCEEDED(hr))
-        hr = IMFMediaType_SetGUID(mt, &MF_MT_SUBTYPE, &MFVideoFormat_H264);
+        hr = IMFMediaType_SetGUID(mt, &MF_MT_SUBTYPE, &DVM_MFT_CODED_SUBTYPE);
     if (SUCCEEDED(hr))
         hr = IMFMediaType_SetUINT64(mt, &MF_MT_FRAME_SIZE, DVM_PACK2(w, h));
     if (SUCCEEDED(hr))
@@ -742,7 +743,7 @@ static HRESULT STDMETHODCALLTYPE enc_SetOutputType_impl(IMFTransform *This, DWOR
     if (FAILED(hr) || !IsEqualGUID(&major, &MFMediaType_Video))
         return MF_E_INVALIDMEDIATYPE;
     hr = IMFMediaType_GetGUID(type, &MF_MT_SUBTYPE, &subtype);
-    if (FAILED(hr) || !IsEqualGUID(&subtype, &MFVideoFormat_H264))
+    if (FAILED(hr) || !IsEqualGUID(&subtype, &DVM_MFT_CODED_SUBTYPE))
         return MF_E_INVALIDMEDIATYPE;
 
     if (SUCCEEDED(IMFMediaType_GetUINT64(type, &MF_MT_FRAME_SIZE, &frame_size)) &&
@@ -787,7 +788,7 @@ static HRESULT STDMETHODCALLTYPE enc_SetOutputType_impl(IMFTransform *This, DWOR
 
     if (post)
         post_event(m, METransformNeedInput, S_OK);
-    dvm_logf("encoder SetOutputType: H264 %ux%u", w, h);
+    dvm_logf("%s SetOutputType: %ux%u", DVM_MFT_MODENAME, w, h);
     return S_OK;
 }
 

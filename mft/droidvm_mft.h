@@ -54,6 +54,7 @@ extern "C" {
 
 #define MFT_BUILD_MODE_decoder 0
 #define MFT_BUILD_MODE_encoder 1
+#define MFT_BUILD_MODE_hevc_encoder 2
 #define MFT_BUILD_MODE_0       0
 #define MFT_BUILD_MODE_1       1
 
@@ -65,8 +66,8 @@ extern "C" {
 #define DVM_MFT_CAT(a, b)  DVM_MFT_CAT_(a, b)
 #define DVM_MFT_MODE       DVM_MFT_CAT(MFT_BUILD_MODE_, MFT_BUILD_MODE)
 
-#if (DVM_MFT_MODE != 0) && (DVM_MFT_MODE != 1)
-#error "MFT_BUILD_MODE must be decoder, encoder, 0 or 1"
+#if (DVM_MFT_MODE != 0) && (DVM_MFT_MODE != 1) && (DVM_MFT_MODE != 2)
+#error "MFT_BUILD_MODE must be decoder, encoder, or hevc_encoder"
 #endif
 
 #if DVM_MFT_MODE == 0
@@ -81,19 +82,33 @@ extern const CLSID CLSID_DroidVmH264DecoderMft;
 #define DVM_MFT_MERIT 0x80000000u
 #define DVM_MFT_MODENAME "decoder"
 #else
+#if DVM_MFT_MODE == 2
+extern const CLSID CLSID_DroidVmHevcEncoderMft;
+#define DVM_MFT_ACTIVE_CLSID CLSID_DroidVmHevcEncoderMft
+#define DVM_MFT_FRIENDLY_NAME L"DroidVM virtio-media HEVC Encoder MFT"
+#define DVM_MFT_HW_URL        L"DroidVM virtio-media HEVC Encoder HW-MFT"
+#define DVM_MFT_MODENAME      "hevc_encoder"
+#define DVM_MFT_CODED_SUBTYPE MFVideoFormat_HEVC
+#define DVM_MFT_CODEC         VM_OPEN_CODEC_HEVC
+#define DVM_MFT_MIN_DRIVER    0x00010027u
+#else
 /* {9F3C2A12-7D64-4E3B-9A21-6C0D5B48E7A3} - same prefix as the decoder CLSID,
  * one digit different, so the pair is easy to recognise in the registry. */
 extern const CLSID CLSID_DroidVmH264EncoderMft;
 #define DVM_MFT_ACTIVE_CLSID CLSID_DroidVmH264EncoderMft
-#define DVM_MFT_CATEGORY      MFT_CATEGORY_VIDEO_ENCODER
 #define DVM_MFT_FRIENDLY_NAME L"DroidVM virtio-media H.264 Encoder MFT"
 #define DVM_MFT_HW_URL        L"DroidVM virtio-media H264 Encoder HW-MFT"
+#define DVM_MFT_MODENAME      "encoder"
+#define DVM_MFT_CODED_SUBTYPE MFVideoFormat_H264
+#define DVM_MFT_CODEC         VM_OPEN_CODEC_H264
+#define DVM_MFT_MIN_DRIVER    0x00010023u
+#endif
+#define DVM_MFT_CATEGORY      MFT_CATEGORY_VIDEO_ENCODER
 /* Qualcomm's hardware encoder MFTs register MFT_CODEC_MERIT_Attribute = 7
  * (see 05-参考文档/作者原始文档/evidence/gpudriverx2-video-20261001/
  * mft-attributes.json).  Encoder selection is normally explicit, so this
  * value is documentation rather than a ranking decision. */
 #define DVM_MFT_MERIT 7u
-#define DVM_MFT_MODENAME "encoder"
 #endif
 
 /* Vendor id used by the author's plan (QEMU/virtio PCI vendor 0x1AF4).  The

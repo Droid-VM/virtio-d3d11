@@ -1,5 +1,5 @@
 #!/bin/bash
-# build-mft.sh - build the DroidVM virtio-media MFT, both directions.
+# build-mft.sh - build the DroidVM virtio-media transforms.
 #
 # Runs on the Linux build server (<build-server>), llvm-mingw in /opt/llvm-mingw.
 # No WSL, no Windows machine involved.
@@ -9,7 +9,8 @@
 #
 # MFT_BUILD_MODE is the compile-time switch:
 #   decoder -> mft_h264_decoder_<arch>.dll   H.264 -> NV12   (working decode path)
-#   encoder -> mft_h264_encoder_<arch>.dll   NV12 -> H.264   (IMFTransform/ICodecAPI skeleton)
+#   encoder -> mft_h264_encoder_<arch>.dll   NV12 -> H.264
+#   hevc_encoder -> mft_hevc_encoder_<arch>.dll   NV12 -> HEVC
 #
 # Output: $OUT/mft_h264_{decoder,encoder}_<arch>.dll, build-<mode>-<arch>.log,
 #         the two ARM64 enum probes, the native h264_bits unit test, and
@@ -27,7 +28,7 @@ SRC=${SRC:-/srv/mft-fix}
 # both MFT modes; the historical mft/ copies are not compiled.
 CLIENT_ROOT=${CLIENT_ROOT:-$SRC}
 OUT=${OUT:-$SRC/out}
-MODES=${MODES:-"decoder encoder"}
+MODES=${MODES:-"decoder encoder hevc_encoder"}
 ARCHES=${ARCH:-"arm64 x86"}
 FAIL=0
 mkdir -p "$OUT"
@@ -50,7 +51,7 @@ sources_for() {
     decoder)
       echo "mft/h264_bits.c mft/droidvm_mft_log.c mft/droidvm_mft_object.c \
             mft/droidvm_mft_class.c mft/droidvm_mft_reg.c $CLIENT_ROOT/vmedia_client.c" ;;
-    encoder)
+    encoder|hevc_encoder)
       echo "mft/droidvm_mft_log.c mft/droidvm_mft_encoder.c \
             mft/droidvm_mft_class.c mft/droidvm_mft_reg.c $CLIENT_ROOT/vmedia_client.c" ;;
   esac
@@ -58,7 +59,7 @@ sources_for() {
 
 extra_for() {
   case "$1" in
-    decoder|encoder) echo "-DVMEDIA_CLIENT_STATIC" ;;
+    decoder|encoder|hevc_encoder) echo "-DVMEDIA_CLIENT_STATIC" ;;
     *)       echo "" ;;
   esac
 }
@@ -68,6 +69,9 @@ build_one() {
   arch=$2
   prefix=$(prefix_for "$arch") || { echo "unknown arch $arch"; return 1; }
   dll="$OUT/mft_h264_${mode}_${arch}.dll"
+  if [ "$mode" = hevc_encoder ]; then
+    dll="$OUT/mft_hevc_encoder_${arch}.dll"
+  fi
   log="$OUT/build-${mode}-${arch}.log"
   srcs=$(sources_for "$mode")
   extra=$(extra_for "$mode")

@@ -60,6 +60,13 @@ const CLSID CLSID_DroidVmH264DecoderMft = {
     { 0x9A, 0x21, 0x6C, 0x0D, 0x5B, 0x48, 0xE7, 0xA2 }
 };
 #define DVM_MFT_X86_SIBLING L"mft_h264_decoder_x86.dll"
+#elif DVM_MFT_MODE == 2
+/* {9F3C2A13-7D64-4E3B-9A21-6C0D5B48E7A4} */
+const CLSID CLSID_DroidVmHevcEncoderMft = {
+    0x9F3C2A13, 0x7D64, 0x4E3B,
+    { 0x9A, 0x21, 0x6C, 0x0D, 0x5B, 0x48, 0xE7, 0xA4 }
+};
+#define DVM_MFT_X86_SIBLING L"mft_hevc_encoder_x86.dll"
 #else
 /* {9F3C2A12-7D64-4E3B-9A21-6C0D5B48E7A3} */
 const CLSID CLSID_DroidVmH264EncoderMft = {
@@ -597,7 +604,7 @@ HRESULT dvm_mft_register(HINSTANCE inst)
     in_types[0].guidSubtype = MFVideoFormat_NV12;
     in_count = 1;
     out_types[0].guidMajorType = MFMediaType_Video;
-    out_types[0].guidSubtype = MFVideoFormat_H264;
+    out_types[0].guidSubtype = DVM_MFT_CODED_SUBTYPE;
     out_count = 1;
 #endif
 
