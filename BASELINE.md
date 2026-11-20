@@ -3,7 +3,7 @@
 - 当前组件：ARM64 DX11 UMD，包含 AV1 tag/lifetime/flush 修复及 VP input/output view 身份刷新修复。
 - 本地仓库：`01-源码/virtio-d3d11`；分支以 `git branch --show-current` 为准；HEAD 以 `git rev-parse HEAD` 为准。
 - 对应基线 tag：`server-vp-view-fix-20261101`。
-- 服务器源码：`root@192.168.2.244:/srv/virtio-d3d11-edge-vp-view-fix-work/source`。
+- 服务器源码：`root@<build-server>:/srv/virtio-d3d11-edge-vp-view-fix-work/source`。
 - 服务器构建目录：上述源码下 `build-edge-vp-view-fix`。
 - 本次导入来自与服务器冻结构建对应的本地 source 副本；逐文件 SHA256 与改动清单见 `04-测试记录/仓库整理-20261101/umd-latest-import-manifest.json`。
 - 未签名 DLL SHA256：`ACF4E5C684F87E7F0BB6B1E2BA5AE393D2A7E9B27B431B1FC5CEA811E18F9EC2`。

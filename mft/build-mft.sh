@@ -1,7 +1,7 @@
 #!/bin/bash
 # build-mft.sh - build the DroidVM virtio-media MFT, both directions.
 #
-# Runs on the Linux build server (192.168.2.244), llvm-mingw in /opt/llvm-mingw.
+# Runs on the Linux build server (<build-server>), llvm-mingw in /opt/llvm-mingw.
 # No WSL, no Windows machine involved.
 #
 #   SRC=/srv/mft-fix bash tools/build-mft.sh                 # arm64 + x86, decoder + encoder
