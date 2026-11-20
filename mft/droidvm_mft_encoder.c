@@ -346,19 +346,61 @@ static void encoder_stop(DvmEncoder *m)
     LeaveCriticalSection(&m->lock);
 }
 
+static uint32_t encoder_colorimetry(IMFMediaType *input)
+{
+    UINT32 matrix = 0, primaries = 0, nominal_range = 0, function = 0;
+    uint32_t colorspace, quantization = 0, transfer = 0;
+
+    IMFMediaType_GetUINT32(input, &MF_MT_YUV_MATRIX, &matrix);
+    IMFMediaType_GetUINT32(input, &MF_MT_VIDEO_PRIMARIES, &primaries);
+    IMFMediaType_GetUINT32(input, &MF_MT_VIDEO_NOMINAL_RANGE, &nominal_range);
+    IMFMediaType_GetUINT32(input, &MF_MT_TRANSFER_FUNCTION, &function);
+
+    /* MediaCodec signals standard as a single primaries/matrix pair.
+     * Prefer the input matrix, with BT.601 as the untagged NV12 default. */
+    if (matrix == MFVideoTransferMatrix_BT709 ||
+        (matrix == 0 && primaries == MFVideoPrimaries_BT709)) {
+        colorspace = 3; /* V4L2_COLORSPACE_REC709 */
+    } else if (matrix == MFVideoTransferMatrix_BT2020_10 ||
+               matrix == MFVideoTransferMatrix_BT2020_12 ||
+               (matrix == 0 && primaries == MFVideoPrimaries_BT2020)) {
+        colorspace = 10; /* V4L2_COLORSPACE_BT2020 */
+    } else if (primaries == MFVideoPrimaries_BT470_2_SysBG) {
+        colorspace = 6; /* V4L2_COLORSPACE_470_SYSTEM_BG */
+    } else if (primaries == MFVideoPrimaries_BT470_2_SysM) {
+        colorspace = 5; /* V4L2_COLORSPACE_470_SYSTEM_M */
+    } else {
+        colorspace = 1; /* V4L2_COLORSPACE_SMPTE170M */
+    }
+    if (nominal_range == MFNominalRange_0_255)
+        quantization = 1; /* V4L2_QUANTIZATION_FULL_RANGE */
+    else if (nominal_range == MFNominalRange_16_235)
+        quantization = 2; /* V4L2_QUANTIZATION_LIM_RANGE */
+
+    if (function == MFVideoTransFunc_709)
+        transfer = 1; /* V4L2_XFER_FUNC_709 */
+    else if (function == MFVideoTransFunc_10)
+        transfer = 5; /* V4L2_XFER_FUNC_NONE (linear) */
+    else if (function == MFVideoTransFunc_2084)
+        transfer = 7; /* V4L2_XFER_FUNC_SMPTE2084 */
+
+    return colorspace | (quantization << 8) | (transfer << 16);
+}
+
 static HRESULT encoder_start(DvmEncoder *m)
 {
     VM_OPEN_OUT opened;
     VM_ENCODER_CONFIG cfg;
     VM_SESSION *session;
     UINT64 frame_rate;
-    uint32_t width, height, bitrate, gop;
+    uint32_t width, height, bitrate, gop, colorimetry;
     DWORD tid = 0;
     EnterCriticalSection(&m->lock);
     if (m->session != NULL) { LeaveCriticalSection(&m->lock); return S_OK; }
     if (!types_ready(m)) { LeaveCriticalSection(&m->lock); return MF_E_TRANSFORM_TYPE_NOT_SET; }
     width=m->width; height=m->height; frame_rate=m->frame_rate;
     bitrate=m->mean_bitrate; gop=m->gop_size;
+    colorimetry = encoder_colorimetry(m->in_type);
     LeaveCriticalSection(&m->lock);
     memset(&opened, 0, sizeof(opened));
     session=vm_open_codec(1, DVM_MFT_CODEC, &opened);
@@ -374,6 +416,8 @@ static HRESULT encoder_start(DvmEncoder *m)
     cfg.UVOffset=width*height; cfg.FrameRateNum=frame_rate ? DVM_HI32(frame_rate) : 30;
     cfg.FrameRateDen=frame_rate ? DVM_LO32(frame_rate) : 1; cfg.Bitrate=bitrate; cfg.GopFrames=gop;
     cfg.Flags=m->rate_control_mode==0u?VM_ENCODER_CONFIG_CBR:0u;
+    if (opened.DriverVersion >= 0x00010028u)
+        cfg.Colorimetry = colorimetry;
     if (!vm_encoder_configure(session,&cfg)) { HRESULT hr=hr_from_vm_error();dvm_logf("encoder CONFIG failed: %ux%u hr=%08lX",width,height,(unsigned long)hr); vm_close(session); return hr; }
     if (!m->wake_event) m->wake_event=CreateEventW(NULL,FALSE,FALSE,NULL);
     if (!m->wake_event) { vm_close(session); return HRESULT_FROM_WIN32(GetLastError()); }
