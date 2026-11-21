@@ -3514,32 +3514,25 @@ static HRESULT APIENTRY virtio_wddm_video_video_decoder_begin_frame(
  * sending from here would push a partial access unit whenever the runtime
  * splits one frame over more than one Submit call, and the host decoder takes
  * one complete access unit per send. */
-static HRESULT APIENTRY virtio_wddm_video_video_decoder_submit_buffers(
-    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecode, UINT count,
-    CONST D3D11_1DDI_VIDEO_DECODER_BUFFER_DESC *pBuffers) {
-    VIRTIO_WDDM_Device *device = hDevice.pDrvPrivate;
-    VIRTIO_WDDM_VideoDecoder *object = hDecode.pDrvPrivate;
+static HRESULT decoder_read_submit_buffer(
+    VIRTIO_WDDM_Device *device, VIRTIO_WDDM_Resource *resource,
+    UINT offset, UINT size, void *dst, const VIRTIO_WDDM_VideoReadRange *mapped) {
+    if (mapped && mapped->offset == offset && mapped->size == size) {
+        memcpy(dst, mapped->data, size);
+        return S_OK;
+    }
+    return virtio_wddm_dxvk_video_read_buffer(
+        device->base.pDev1, device->base.pCtx1, resource->base.pResource,
+        offset, size, dst);
+}
+
+static HRESULT decoder_submit_buffer_data(
+    VIRTIO_WDDM_Device *device, VIRTIO_WDDM_VideoDecoder *object, UINT count,
+    CONST D3D11_1DDI_VIDEO_DECODER_BUFFER_DESC *pBuffers,
+    const VIRTIO_WDDM_VideoReadRange *mapped) {
     UINT i;
     UINT appended = 0;
     UINT segments = 0;
-
-    VIRTIO_WDDM_DDI_ENTRY("hDecode=%p count=%u pBuffers=%p priv=%p frame_open=%d",
-                          (void *)hDecode.pDrvPrivate, count, (const void *)pBuffers,
-                          (void *)object, object ? (int)object->frame_open : -1);
-
-    if (!object || object->magic != VIRTIO_WDDM_VIDEO_MAGIC_DECODE || !device) {
-        ERROR("%s: invalid decoder %p -> E_INVALIDARG", __FUNCTION__, (void *)object);
-        return E_INVALIDARG;
-    }
-    if (!object->frame_open) {
-        ERROR("%s: SubmitDecoderBuffers outside BeginFrame/EndFrame -> E_FAIL",
-              __FUNCTION__);
-        return E_FAIL;
-    }
-    if (!pBuffers || count == 0) {
-        ERROR("%s: no buffers (count=%u) -> E_INVALIDARG", __FUNCTION__, count);
-        return E_INVALIDARG;
-    }
 
     for (i = 0; i < count; i++) {
         CONST D3D11_1DDI_VIDEO_DECODER_BUFFER_DESC *buffer = &pBuffers[i];
@@ -3576,9 +3569,8 @@ static HRESULT APIENTRY virtio_wddm_video_video_decoder_submit_buffers(
                 }
                 copy = (UINT)sizeof(DXVA_PicParams_AV1);
                 memset(&object->av1_pic, 0, sizeof(object->av1_pic));
-                hr = virtio_wddm_dxvk_video_read_buffer(
-                    device->base.pDev1, device->base.pCtx1, resource->base.pResource,
-                    buffer->DataOffset, copy, &object->av1_pic);
+                hr = decoder_read_submit_buffer(device, resource, buffer->DataOffset,
+                    copy, &object->av1_pic, mapped ? &mapped[i] : NULL);
                 if (FAILED(hr)) {
                     ERROR("%s: copying %u B of DXVA_PicParams_AV1 (offset %u) failed: "
                           "0x%08lx -> ignored", __FUNCTION__, copy, buffer->DataOffset,
@@ -3895,9 +3887,8 @@ static HRESULT APIENTRY virtio_wddm_video_video_decoder_submit_buffers(
             if (!decoder_reserve((UINT8 **)&object->av1_tiles, &object->av1_tiles_cap,
                                  copy))
                 return E_FAIL;
-            hr = virtio_wddm_dxvk_video_read_buffer(
-                device->base.pDev1, device->base.pCtx1, resource->base.pResource,
-                buffer->DataOffset, copy, object->av1_tiles);
+            hr = decoder_read_submit_buffer(device, resource, buffer->DataOffset,
+                copy, object->av1_tiles, mapped ? &mapped[i] : NULL);
             if (FAILED(hr)) {
                 ERROR("%s: copying %u B of SLICE_CONTROL (offset %u) failed: "
                       "0x%08lx -> ignored", __FUNCTION__, copy, buffer->DataOffset,
@@ -3979,10 +3970,9 @@ static HRESULT APIENTRY virtio_wddm_video_video_decoder_submit_buffers(
                              object->bitstream_size + buffer->DataSize))
             return E_FAIL;
 
-        hr = virtio_wddm_dxvk_video_read_buffer(
-            device->base.pDev1, device->base.pCtx1, resource->base.pResource,
-            buffer->DataOffset, buffer->DataSize,
-            object->bitstream + object->bitstream_size);
+        hr = decoder_read_submit_buffer(device, resource, buffer->DataOffset,
+            buffer->DataSize, object->bitstream + object->bitstream_size,
+            mapped ? &mapped[i] : NULL);
         if (FAILED(hr)) {
             ERROR("%s: copying %u bytes (offset %u) out of BITSTREAM buffer %u "
                   "failed: 0x%08lx -> E_FAIL", __FUNCTION__, buffer->DataSize,
@@ -4009,6 +3999,92 @@ static HRESULT APIENTRY virtio_wddm_video_video_decoder_submit_buffers(
                 __FUNCTION__, segments, appended, object->bitstream_size);
     }
     return S_OK;
+}
+
+/* The normal AV1 DDI submission contains one range of each kind. Leave other
+ * descriptor layouts and invalid ranges to the existing per-buffer checks. */
+static void *decoder_map_av1_submit(
+    VIRTIO_WDDM_Device *device, VIRTIO_WDDM_VideoDecoder *object, UINT count,
+    const D3D11_1DDI_VIDEO_DECODER_BUFFER_DESC *buffers,
+    VIRTIO_WDDM_VideoReadRange ranges[3]) {
+    UINT types = 0;
+    void *staging = NULL;
+
+    if (object->codec != VIRTIO_WDDM_CODEC_AV1 || count != 3)
+        return NULL;
+
+    for (UINT i = 0; i < count; i++) {
+        const D3D11_1DDI_VIDEO_DECODER_BUFFER_DESC *buffer = &buffers[i];
+        VIRTIO_WDDM_Resource *resource = buffer->hResource.pDrvPrivate;
+        UINT size = buffer->DataSize;
+        UINT type;
+
+        if (!resource || !resource->base.pResource || !size)
+            return NULL;
+        switch (buffer->BufferType) {
+        case D3D11_1DDI_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS:
+            if (size < sizeof(DXVA_PicParams_AV1))
+                return NULL;
+            size = sizeof(DXVA_PicParams_AV1);
+            type = 1u;
+            break;
+        case D3D11_1DDI_VIDEO_DECODER_BUFFER_SLICE_CONTROL:
+            if (size > 16u * 1024u || size % sizeof(DXVA_Tile_AV1))
+                return NULL;
+            type = 2u;
+            break;
+        case D3D11_1DDI_VIDEO_DECODER_BUFFER_BITSTREAM:
+            if (size > VIRTIO_WDDM_MAX_ACCESS_UNIT_BYTES ||
+                object->bitstream_size > VIRTIO_WDDM_MAX_ACCESS_UNIT_BYTES - size)
+                return NULL;
+            type = 4u;
+            break;
+        default:
+            return NULL;
+        }
+        if (types & type)
+            return NULL;
+        types |= type;
+        ranges[i] = (VIRTIO_WDDM_VideoReadRange){resource->base.pResource,
+                                               buffer->DataOffset, size, NULL};
+    }
+
+    if (FAILED(virtio_wddm_dxvk_video_map_buffer_ranges(
+            device->base.pDev1, device->base.pCtx1, ranges, count, &staging)))
+        return NULL;
+    return staging;
+}
+
+static HRESULT APIENTRY virtio_wddm_video_video_decoder_submit_buffers(
+    D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecode, UINT count,
+    CONST D3D11_1DDI_VIDEO_DECODER_BUFFER_DESC *pBuffers) {
+    VIRTIO_WDDM_Device *device = hDevice.pDrvPrivate;
+    VIRTIO_WDDM_VideoDecoder *object = hDecode.pDrvPrivate;
+
+    VIRTIO_WDDM_DDI_ENTRY("hDecode=%p count=%u pBuffers=%p priv=%p frame_open=%d",
+                          (void *)hDecode.pDrvPrivate, count, (const void *)pBuffers,
+                          (void *)object, object ? (int)object->frame_open : -1);
+    if (!object || object->magic != VIRTIO_WDDM_VIDEO_MAGIC_DECODE || !device) {
+        ERROR("%s: invalid decoder %p -> E_INVALIDARG", __FUNCTION__, (void *)object);
+        return E_INVALIDARG;
+    }
+    if (!object->frame_open) {
+        ERROR("%s: SubmitDecoderBuffers outside BeginFrame/EndFrame -> E_FAIL",
+              __FUNCTION__);
+        return E_FAIL;
+    }
+    if (!pBuffers || count == 0) {
+        ERROR("%s: no buffers (count=%u) -> E_INVALIDARG", __FUNCTION__, count);
+        return E_INVALIDARG;
+    }
+
+    VIRTIO_WDDM_VideoReadRange ranges[3];
+    void *staging = decoder_map_av1_submit(device, object, count, pBuffers, ranges);
+    HRESULT hr = decoder_submit_buffer_data(device, object, count, pBuffers,
+                                            staging ? ranges : NULL);
+    if (staging)
+        virtio_wddm_dxvk_video_unmap_buffer_ranges(device->base.pCtx1, staging);
+    return hr;
 }
 
 /* ------------------------------------------------------------------------- */

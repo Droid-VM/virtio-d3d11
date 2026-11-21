@@ -183,6 +183,20 @@ HRESULT virtio_wddm_dxvk_video_read_buffer(void *d3d11_device, void *d3d11_conte
                                            void *resource, UINT offset, UINT size,
                                            void *dst);
 
+typedef struct VIRTIO_WDDM_VideoReadRange {
+    void *resource;
+    UINT offset;
+    UINT size;
+    const void *data;
+} VIRTIO_WDDM_VideoReadRange;
+
+/* Copy all ranges before the blocking map. On success data remains valid until
+ * unmap_buffer_ranges is called with the returned staging buffer. */
+HRESULT virtio_wddm_dxvk_video_map_buffer_ranges(
+    void *d3d11_device, void *d3d11_context, VIRTIO_WDDM_VideoReadRange *ranges,
+    UINT count, void **staging_buffer);
+void virtio_wddm_dxvk_video_unmap_buffer_ranges(void *d3d11_context, void *staging);
+
 /* P-BATCH P010: write one decoded frame into the decoder output texture, in the
  * layout the texture declares. `fourcc` is the layout of `data`
  * (VM_FRAME_INFO::FourCC, i.e. V4L2's 'NV12' / 'P010') and must match the

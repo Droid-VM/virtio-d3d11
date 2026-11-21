@@ -576,45 +576,38 @@ extern "C" HRESULT virtio_wddm_dxvk_video_blt(void *video_context, void *process
     }
 }
 
-/* P2-2b: copy a byte range out of the app's bitstream buffer. The DDI hands us
- * the resource and a byte offset, never a pointer, and the buffer is normally
- * D3D11_USAGE_DEFAULT (Map with D3D11_MAP_READ would be rejected), so the range
- * is copied to a throwaway staging buffer first and mapped from there. */
-extern "C" HRESULT virtio_wddm_dxvk_video_read_buffer(void *d3d11_device,
-                                                      void *d3d11_context,
-                                                      void *resource, UINT offset,
-                                                      UINT size, void *dst) {
-    if (!d3d11_device || !d3d11_context || !resource || !dst || size == 0)
-        return E_INVALIDARG;
-    if (offset > 0xFFFFFFFFu - size)
-        return E_INVALIDARG;
-
-    ID3D11Resource *src = as_resource(resource);
+static bool video_read_range_valid(const VIRTIO_WDDM_VideoReadRange &range) {
+    if (!range.resource || !range.size)
+        return false;
+    ID3D11Resource *src = as_resource(range.resource);
     D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
     src->GetType(&dimension);
     if (dimension != D3D11_RESOURCE_DIMENSION_BUFFER)
-        return E_INVALIDARG;
+        return false;
 
-    /* VP9FIX (2026-10-25): the DDI hands over a byte offset/size inside the
-     * client's buffer, never a pointer.  CopySubresourceRegion() below reads
-     * exactly that range, so it has to lie inside the resource: an offset/size
-     * pair past ByteWidth makes the copy read heap memory after the buffer (and
-     * the following memcpy() would then stage those bytes).  The runtime is
-     * supposed to validate this, but a corrupted slice record or a bad
-     * DataOffset must fail here with E_INVALIDARG instead of reaching DXVK. */
-    {
-        D3D11_BUFFER_DESC src_desc = {};
-        static_cast<ID3D11Buffer *>(src)->GetDesc(&src_desc);
-        if (offset > src_desc.ByteWidth || size > src_desc.ByteWidth - offset)
+    D3D11_BUFFER_DESC desc = {};
+    static_cast<ID3D11Buffer *>(src)->GetDesc(&desc);
+    return range.offset <= desc.ByteWidth && range.size <= desc.ByteWidth - range.offset;
+}
+
+extern "C" HRESULT virtio_wddm_dxvk_video_map_buffer_ranges(
+    void *d3d11_device, void *d3d11_context, VIRTIO_WDDM_VideoReadRange *ranges,
+    UINT count, void **staging_buffer) {
+    if (!d3d11_device || !d3d11_context || !ranges || !count || !staging_buffer)
+        return E_INVALIDARG;
+    *staging_buffer = nullptr;
+
+    UINT width = 0;
+    for (UINT i = 0; i < count; i++) {
+        if (!video_read_range_valid(ranges[i]) || width > UINT_MAX - ranges[i].size)
             return E_INVALIDARG;
+        width += ranges[i].size;
     }
 
     D3D11_BUFFER_DESC desc = {};
-    desc.ByteWidth = size;
+    desc.ByteWidth = width;
     desc.Usage = D3D11_USAGE_STAGING;
-    desc.BindFlags = 0;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    desc.MiscFlags = 0;
 
     ID3D11Device *device = static_cast<ID3D11Device *>(d3d11_device);
     ID3D11DeviceContext *context = static_cast<ID3D11DeviceContext *>(d3d11_context);
@@ -624,19 +617,51 @@ extern "C" HRESULT virtio_wddm_dxvk_video_read_buffer(void *d3d11_device,
     if (FAILED(hr) || !staging)
         return FAILED(hr) ? hr : E_FAIL;
 
-    /* For a buffer resource the source box is expressed in bytes: left..right is
-     * the range, top/bottom and front/back are fixed at 0..1. */
-    const D3D11_BOX box = { offset, 0, 0, offset + size, 1, 1 };
-    context->CopySubresourceRegion(staging, 0, 0, 0, 0, src, 0, &box);
+    UINT dst_offset = 0;
+    for (UINT i = 0; i < count; i++) {
+        const auto &range = ranges[i];
+        const D3D11_BOX box = {range.offset, 0, 0, range.offset + range.size, 1, 1};
+        context->CopySubresourceRegion(staging, 0, dst_offset, 0, 0,
+                                       as_resource(range.resource), 0, &box);
+        dst_offset += range.size;
+    }
 
     /* Blocking Map submits and waits for the staging buffer's write. */
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     hr = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
-    if (SUCCEEDED(hr)) {
-        memcpy(dst, mapped.pData, size);
-        context->Unmap(staging, 0);
+    if (FAILED(hr)) {
+        staging->Release();
+        return hr;
     }
-    staging->Release();
+    const auto *data = static_cast<const char *>(mapped.pData);
+    for (UINT i = 0; i < count; i++) {
+        ranges[i].data = data;
+        data += ranges[i].size;
+    }
+    *staging_buffer = staging;
+    return S_OK;
+}
+
+extern "C" void virtio_wddm_dxvk_video_unmap_buffer_ranges(void *d3d11_context, void *staging) {
+    auto *buffer = static_cast<ID3D11Buffer *>(staging);
+    static_cast<ID3D11DeviceContext *>(d3d11_context)->Unmap(buffer, 0);
+    buffer->Release();
+}
+
+extern "C" HRESULT virtio_wddm_dxvk_video_read_buffer(void *d3d11_device,
+                                                      void *d3d11_context,
+                                                      void *resource, UINT offset,
+                                                      UINT size, void *dst) {
+    if (!dst)
+        return E_INVALIDARG;
+    VIRTIO_WDDM_VideoReadRange range = {resource, offset, size, nullptr};
+    void *staging = nullptr;
+    HRESULT hr = virtio_wddm_dxvk_video_map_buffer_ranges(
+        d3d11_device, d3d11_context, &range, 1, &staging);
+    if (SUCCEEDED(hr)) {
+        memcpy(dst, range.data, size);
+        virtio_wddm_dxvk_video_unmap_buffer_ranges(d3d11_context, staging);
+    }
     return hr;
 }
 
