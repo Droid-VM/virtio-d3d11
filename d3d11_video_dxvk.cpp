@@ -628,8 +628,8 @@ extern "C" HRESULT virtio_wddm_dxvk_video_read_buffer(void *d3d11_device,
      * the range, top/bottom and front/back are fixed at 0..1. */
     const D3D11_BOX box = { offset, 0, 0, offset + size, 1, 1 };
     context->CopySubresourceRegion(staging, 0, 0, 0, 0, src, 0, &box);
-    context->Flush();
 
+    /* Blocking Map submits and waits for the staging buffer's write. */
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     hr = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
     if (SUCCEEDED(hr)) {
