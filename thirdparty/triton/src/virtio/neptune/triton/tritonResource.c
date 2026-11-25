@@ -990,8 +990,21 @@ tritonShaderResourceViewReadAfterWriteHazard(D3D10DDI_HDEVICE hDev, D3D10DDI_HSH
     UINT64 ticket=0;
     PTRITON_RESOURCE r = (PTRITON_RESOURCE)(hRes.pDrvPrivate);
     PTRITON_DEVICE pD=(PTRITON_DEVICE)hDev.pDrvPrivate;
-    (void)hSRV;
-    if(SUCCEEDED(tritonSyncTexture(pD,r,0,TRUE,FALSE,&ticket))) tritonReadUnpin(r,&ticket);
+    PTRITON_SRVIEW view = (PTRITON_SRVIEW)hSRV.pDrvPrivate;
+    UINT sub = 0;
+    BOOL whole = TRUE;
+    if (r && r->Format == DXGI_FORMAT_NV12 && view && view->pResource == r && view->pSRV) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC desc;
+        ID3D11ShaderResourceView_GetDesc(view->pSRV, &desc);
+        if (desc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY &&
+            desc.Texture2DArray.ArraySize == 1 && desc.Texture2DArray.MipLevels == 1 &&
+            desc.Texture2DArray.FirstArraySlice < r->ArraySize &&
+            desc.Texture2DArray.MostDetailedMip < r->MipLevels) {
+            sub = desc.Texture2DArray.FirstArraySlice * r->MipLevels + desc.Texture2DArray.MostDetailedMip;
+            whole = FALSE;
+        }
+    }
+    if(SUCCEEDED(tritonSyncTexture(pD,r,sub,whole,FALSE,&ticket))) tritonReadUnpin(r,&ticket);
 }
 
 /* Per-stage constant-buffer setters. D3D11_0 takes only handles
