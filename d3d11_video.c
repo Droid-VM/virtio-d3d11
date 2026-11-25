@@ -7951,17 +7951,10 @@ static HRESULT pipeline_sync(VIRTIO_WDDM_VideoDecoder *object, ID3D11Resource *t
         BOOL do_fill = FALSE;
         HRESULT hr;
 
-        /* §7 P3 (round 27): an AV1 read never waits for a picture.  The host keeps
-         * ~18 coded pictures inside itself, so early in a stream (and after a seek)
-         * the surface the renderer asks for simply has no picture yet; waiting for
-         * it just stalls the renderer on a decode that is already in flight.  The
-         * one shared drain is still what does the work -- it uploads whatever is
-         * READY for this subresource and returns immediately otherwise.  The read
-         * then proceeds with the surface's current content (the "skip this frame
-         * and keep enqueueing" rule of the task book).  H.264/HEVC keep the bounded
-         * wait: there the picture is always just one frame behind the read. */
+        /* A zero-delay AV1 producer can finish the requested picture without
+         * another EndFrame. Wait for its upload before reading this slice. */
         hr = pipeline_drain_one(object, texture, subresource, whole, t_wait0, deadline,
-                                &drained, pipe->av1_async ? TRUE : FALSE);
+                                &drained, pipe->av1_async && pipe->av1_host_delay != 0);
         if (FAILED(hr)) {
             pipe->sync_wait_timeouts++;
             return hr;
