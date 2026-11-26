@@ -190,12 +190,12 @@ typedef struct VIRTIO_WDDM_VideoReadRange {
     const void *data;
 } VIRTIO_WDDM_VideoReadRange;
 
-/* Copy all ranges before the blocking map. On success data remains valid until
- * unmap_buffer_ranges is called with the returned staging buffer. */
+/* Expose synchronized input ranges. On success their data remains valid until
+ * unmap_buffer_ranges is called with the returned mapping. */
 HRESULT virtio_wddm_dxvk_video_map_buffer_ranges(
     void *d3d11_device, void *d3d11_context, VIRTIO_WDDM_VideoReadRange *ranges,
-    UINT count, void **staging_buffer);
-void virtio_wddm_dxvk_video_unmap_buffer_ranges(void *d3d11_context, void *staging);
+    UINT count, void **mapping);
+void virtio_wddm_dxvk_video_unmap_buffer_ranges(void *d3d11_context, void *mapping);
 
 typedef struct VIRTIO_WDDM_VideoUploadPool {
     void *textures[3];

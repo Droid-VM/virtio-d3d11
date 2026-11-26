@@ -22,6 +22,8 @@
  * every earlier blit. No busy-wait is introduced by this file. */
 
 #include <cstdint>
+#include <memory>
+#include <new>
 
 #include <d3d11_1.h>
 #include <dxgi.h>
@@ -576,7 +578,18 @@ extern "C" HRESULT virtio_wddm_dxvk_video_blt(void *video_context, void *process
     }
 }
 
-static bool video_read_range_valid(const VIRTIO_WDDM_VideoReadRange &range) {
+struct VideoReadMapping {
+    ID3D11Buffer *direct[3] = {};
+    UINT directCount = 0;
+    ID3D11Buffer *staging = nullptr;
+
+    void unmapDirect(ID3D11DeviceContext *context) {
+        while (directCount)
+            context->Unmap(direct[--directCount], 0);
+    }
+};
+
+static bool video_read_range_valid(const VIRTIO_WDDM_VideoReadRange &range, bool &direct) {
     if (!range.resource || !range.size)
         return false;
     ID3D11Resource *src = as_resource(range.resource);
@@ -587,6 +600,8 @@ static bool video_read_range_valid(const VIRTIO_WDDM_VideoReadRange &range) {
 
     D3D11_BUFFER_DESC desc = {};
     static_cast<ID3D11Buffer *>(src)->GetDesc(&desc);
+    direct = desc.Usage == D3D11_USAGE_DYNAMIC && desc.BindFlags == D3D11_BIND_DECODER &&
+             desc.CPUAccessFlags == D3D11_CPU_ACCESS_WRITE;
     return range.offset <= desc.ByteWidth && range.size <= desc.ByteWidth - range.offset;
 }
 
@@ -597,10 +612,16 @@ extern "C" HRESULT virtio_wddm_dxvk_video_map_buffer_ranges(
         return E_INVALIDARG;
     *staging_buffer = nullptr;
 
+    auto mapping = std::unique_ptr<VideoReadMapping>(new (std::nothrow) VideoReadMapping);
+    if (!mapping)
+        return E_OUTOFMEMORY;
+    bool allDirect = count <= ARRAYSIZE(mapping->direct);
     UINT width = 0;
     for (UINT i = 0; i < count; i++) {
-        if (!video_read_range_valid(ranges[i]) || width > UINT_MAX - ranges[i].size)
+        bool direct = false;
+        if (!video_read_range_valid(ranges[i], direct) || width > UINT_MAX - ranges[i].size)
             return E_INVALIDARG;
+        allDirect &= direct;
         width += ranges[i].size;
     }
 
@@ -611,6 +632,35 @@ extern "C" HRESULT virtio_wddm_dxvk_video_map_buffer_ranges(
 
     ID3D11Device *device = static_cast<ID3D11Device *>(d3d11_device);
     ID3D11DeviceContext *context = static_cast<ID3D11DeviceContext *>(d3d11_context);
+
+    // These resources belong to our internal DXVK device. Its READ map of a
+    // host-visible buffer synchronizes pending writes and returns the current
+    // discard slice. The runtime holds the input resources throughout submit.
+    if (allDirect) {
+        for (UINT i = 0; i < count; ++i) {
+            auto *buffer = static_cast<ID3D11Buffer *>(as_resource(ranges[i].resource));
+            // A submission may name two ranges of the same resource.
+            UINT first = 0;
+            while (first < i && ranges[first].resource != ranges[i].resource)
+                ++first;
+            if (first < i) {
+                ranges[i].data = static_cast<const char *>(ranges[first].data)
+                               - ranges[first].offset + ranges[i].offset;
+                continue;
+            }
+            D3D11_MAPPED_SUBRESOURCE src = {};
+            if (FAILED(context->Map(buffer, 0, D3D11_MAP_READ, 0, &src))) {
+                mapping->unmapDirect(context);
+                break;
+            }
+            mapping->direct[mapping->directCount++] = buffer;
+            ranges[i].data = static_cast<const char *>(src.pData) + ranges[i].offset;
+        }
+        if (mapping->directCount) {
+            *staging_buffer = mapping.release();
+            return S_OK;
+        }
+    }
 
     ID3D11Buffer *staging = nullptr;
     HRESULT hr = device->CreateBuffer(&desc, nullptr, &staging);
@@ -638,14 +688,19 @@ extern "C" HRESULT virtio_wddm_dxvk_video_map_buffer_ranges(
         ranges[i].data = data;
         data += ranges[i].size;
     }
-    *staging_buffer = staging;
+    mapping->staging = staging;
+    *staging_buffer = mapping.release();
     return S_OK;
 }
 
 extern "C" void virtio_wddm_dxvk_video_unmap_buffer_ranges(void *d3d11_context, void *staging) {
-    auto *buffer = static_cast<ID3D11Buffer *>(staging);
-    static_cast<ID3D11DeviceContext *>(d3d11_context)->Unmap(buffer, 0);
-    buffer->Release();
+    std::unique_ptr<VideoReadMapping> mapping(static_cast<VideoReadMapping *>(staging));
+    auto *context = static_cast<ID3D11DeviceContext *>(d3d11_context);
+    mapping->unmapDirect(context);
+    if (mapping->staging) {
+        context->Unmap(mapping->staging, 0);
+        mapping->staging->Release();
+    }
 }
 
 extern "C" HRESULT virtio_wddm_dxvk_video_read_buffer(void *d3d11_device,

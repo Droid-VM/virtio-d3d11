@@ -3682,9 +3682,8 @@ static HRESULT decoder_submit_buffer_data(
                 }
                 copy = (UINT)sizeof(DXVA_PicParams_HEVC);
                 memset(&object->hevc_pic, 0, sizeof(object->hevc_pic));
-                hr = virtio_wddm_dxvk_video_read_buffer(
-                    device->base.pDev1, device->base.pCtx1, resource->base.pResource,
-                    buffer->DataOffset, copy, &object->hevc_pic);
+                hr = decoder_read_submit_buffer(device, resource, buffer->DataOffset,
+                    copy, &object->hevc_pic, mapped ? &mapped[i] : NULL);
                 if (FAILED(hr)) {
                     ERROR("%s: copying %u B of DXVA_PicParams_HEVC (offset %u) failed: "
                           "0x%08lx -> ignored", __FUNCTION__, copy, buffer->DataOffset,
@@ -3760,9 +3759,8 @@ static HRESULT decoder_submit_buffer_data(
             }
             copy = (UINT)sizeof(DXVA_PicParams_H264);
             memset(&object->pic, 0, sizeof(object->pic));
-            hr = virtio_wddm_dxvk_video_read_buffer(
-                device->base.pDev1, device->base.pCtx1, resource->base.pResource,
-                buffer->DataOffset, copy, &object->pic);
+            hr = decoder_read_submit_buffer(device, resource, buffer->DataOffset,
+                    copy, &object->pic, mapped ? &mapped[i] : NULL);
             if (FAILED(hr)) {
                 ERROR("%s: copying %u B of PICTURE_PARAMETERS (offset %u) failed: "
                       "0x%08lx -> ignored", __FUNCTION__, copy, buffer->DataOffset,
@@ -4057,6 +4055,57 @@ static void *decoder_map_av1_submit(
     return staging;
 }
 
+/* H.264 and HEVC only consume bytes from picture parameters and bitstream.
+ * Map those together even when slice controls or matrices appear between them. */
+static void *decoder_map_h26x_submit(
+    VIRTIO_WDDM_Device *device, VIRTIO_WDDM_VideoDecoder *object, UINT count,
+    const D3D11_1DDI_VIDEO_DECODER_BUFFER_DESC *buffers,
+    VIRTIO_WDDM_VideoReadRange mapped[4]) {
+    if (count < 2 || count > 4 ||
+        (object->codec != VIRTIO_WDDM_CODEC_H264 && object->codec != VIRTIO_WDDM_CODEC_HEVC))
+        return NULL;
+
+    VIRTIO_WDDM_VideoReadRange pair[2] = {0};
+    UINT indices[2];
+    for (UINT i = 0; i < count; ++i) {
+        const D3D11_1DDI_VIDEO_DECODER_BUFFER_DESC *buffer = &buffers[i];
+        UINT size = buffer->DataSize;
+        UINT slot;
+        switch (buffer->BufferType) {
+        case D3D11_1DDI_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS:
+            slot = 0;
+            size = object->codec == VIRTIO_WDDM_CODEC_HEVC
+                ? sizeof(DXVA_PicParams_HEVC) : sizeof(DXVA_PicParams_H264);
+            if (buffer->DataSize < size)
+                return NULL;
+            break;
+        case D3D11_1DDI_VIDEO_DECODER_BUFFER_BITSTREAM:
+            slot = 1;
+            if (!size || size > VIRTIO_WDDM_MAX_ACCESS_UNIT_BYTES ||
+                object->bitstream_size > VIRTIO_WDDM_MAX_ACCESS_UNIT_BYTES - size)
+                return NULL;
+            break;
+        default:
+            continue;
+        }
+        VIRTIO_WDDM_Resource *resource = buffer->hResource.pDrvPrivate;
+        if (pair[slot].resource || !resource || !resource->base.pResource)
+            return NULL;
+        indices[slot] = i;
+        pair[slot] = (VIRTIO_WDDM_VideoReadRange){resource->base.pResource,
+                                                 buffer->DataOffset, size, NULL};
+    }
+
+    void *staging = NULL;
+    if (!pair[0].resource || !pair[1].resource ||
+        FAILED(virtio_wddm_dxvk_video_map_buffer_ranges(
+            device->base.pDev1, device->base.pCtx1, pair, 2, &staging)))
+        return NULL;
+    mapped[indices[0]] = pair[0];
+    mapped[indices[1]] = pair[1];
+    return staging;
+}
+
 static HRESULT APIENTRY virtio_wddm_video_video_decoder_submit_buffers(
     D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecode, UINT count,
     CONST D3D11_1DDI_VIDEO_DECODER_BUFFER_DESC *pBuffers) {
@@ -4080,8 +4129,10 @@ static HRESULT APIENTRY virtio_wddm_video_video_decoder_submit_buffers(
         return E_INVALIDARG;
     }
 
-    VIRTIO_WDDM_VideoReadRange ranges[3];
-    void *staging = decoder_map_av1_submit(device, object, count, pBuffers, ranges);
+    VIRTIO_WDDM_VideoReadRange ranges[4] = {0};
+    void *staging = object->codec == VIRTIO_WDDM_CODEC_AV1
+        ? decoder_map_av1_submit(device, object, count, pBuffers, ranges)
+        : decoder_map_h26x_submit(device, object, count, pBuffers, ranges);
     HRESULT hr = decoder_submit_buffer_data(device, object, count, pBuffers,
                                             staging ? ranges : NULL);
     if (staging)
@@ -7044,6 +7095,16 @@ static BOOL pipeline_submit(VIRTIO_WDDM_VideoDecoder *object, const UINT8 *data,
     VERBOSE("%s: job %llu queued: %u B, %ux%u -> tex=%p subresource=%u (gen %llu)",
             __FUNCTION__, (unsigned long long)seq, size, send_w, send_h,
             (void *)job->texture, job->subresource, (unsigned long long)job->generation);
+    if (seq == 1 && produces_picture && pipe->av1_async && !pipe->av1_host_delay &&
+        !pipe->tag_mode && !pipe->av1_send_only) {
+        /* Publish the initial surface before the application starts its clock. */
+        dhr = pipeline_drain_one(object, target->texture, target->subresource, FALSE,
+                                 t_submit, deadline, &drained, FALSE);
+        if (FAILED(dhr)) {
+            object->pending_error = dhr;
+            return FALSE;
+        }
+    }
     return TRUE;
 
 admission_timeout:
@@ -8845,7 +8906,8 @@ static BOOL pipeline_create(VIRTIO_WDDM_VideoDecoder *object) {
 
     if (!object)
         return FALSE;
-    env_requested = pipeline_env_flag("VIRTIO_WDDM_PIPELINE", TRUE);
+    env_requested = object->codec == VIRTIO_WDDM_CODEC_AV1 &&
+        pipeline_env_flag("VIRTIO_WDDM_PIPELINE", TRUE);
     enabled = env_requested && VIRTIO_WDDM_PIPELINE;
     if (object->life_requested &&
         (!enabled || object->codec != VIRTIO_WDDM_CODEC_AV1 ||
@@ -8937,7 +8999,7 @@ static BOOL pipeline_create(VIRTIO_WDDM_VideoDecoder *object) {
 #endif
     /* §7 P3 (round 28): the host's output delay in input buffers (CCodec reports
      * 17 for this 1080p AV1 stream; measured as "outputs start at input 18"). */
-    pipe->av1_host_delay = pipeline_env_uint("VIRTIO_WDDM_AV1_OUTPUT_DELAY", 17u, 0u, 64u);
+    pipe->av1_host_delay = pipeline_env_uint("VIRTIO_WDDM_AV1_OUTPUT_DELAY", 0u, 0u, 64u);
     pipe->max_inflight = pipeline_env_uint("VIRTIO_WDDM_PIPELINE_MAX_INFLIGHT",
                                            pipe->av1_async ? pipe->av1_lag : 4u, 1u,
                                            jobs);
