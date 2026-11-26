@@ -426,6 +426,7 @@ typedef struct VIRTIO_WDDM_VideoDecoder {
     UINT64 decode_failures;
     UINT64 synth_injections; /* frames whose SPS/PPS came from PICTURE_PARAMETERS */
 
+    VIRTIO_WDDM_VideoUploadPool upload_pool;
     UINT8 *nv12; /* decoded frame as vm_get_frame returns it (stride layout) */
     UINT nv12_cap;
 
@@ -2077,6 +2078,7 @@ static VOID APIENTRY virtio_wddm_video_destroy_video_decoder(
         HeapFree(GetProcessHeap(), 0, object->synth);
     if (object->send)
         HeapFree(GetProcessHeap(), 0, object->send);
+    virtio_wddm_dxvk_video_release_upload_pool(&object->upload_pool);
     if (object->nv12)
         HeapFree(GetProcessHeap(), 0, object->nv12);
     if (object->conv)
@@ -7385,7 +7387,7 @@ static HRESULT pipeline_upload_picture(VIRTIO_WDDM_VideoDecoder *object,
         return E_ABORT;
     }
     t0 = decoder_qpc_now();
-    hr = virtio_wddm_dxvk_video_upload_frame(upload_context, job->texture,
+    hr = virtio_wddm_dxvk_video_upload_frame(NULL, upload_context, job->texture,
                                              job->subresource, upload_src,
                                              job->info.Width, upload_h,
                                              upload_stride, upload_fourcc);
@@ -7430,7 +7432,7 @@ static HRESULT pipeline_upload_fill(VIRTIO_WDDM_VideoDecoder *object,
               fill.info.Width, fill.info.Height);
         return E_FAIL;
     }
-    hr = virtio_wddm_dxvk_video_upload_frame(context, texture,
+    hr = virtio_wddm_dxvk_video_upload_frame(NULL, context, texture,
                                              subresource, fill.src, fill.info.Width,
                                              fill.info.Height, fill.info.Stride,
                                              VIRTIO_WDDM_FOURCC_NV12);
@@ -11718,7 +11720,10 @@ static VOID APIENTRY virtio_wddm_video_video_decoder_end_frame(
              info.Width, info.Height, upload_stride, upload_fourcc,
              (const void *)upload_src, view_mip, view_slice, target_array, mips);
     }
-    hr = virtio_wddm_dxvk_video_upload_frame(device->base.pCtx1,
+    VIRTIO_WDDM_VideoUploadPool *upload_pool = NULL;
+    if (!pipeline_used && (object->codec == VIRTIO_WDDM_CODEC_H264 || object->codec == VIRTIO_WDDM_CODEC_HEVC))
+        upload_pool = &object->upload_pool;
+    hr = virtio_wddm_dxvk_video_upload_frame(upload_pool, device->base.pCtx1,
                                             target_texture, subresource,
                                             upload_src, info.Width, info.Height,
                                             upload_stride, upload_fourcc);

@@ -717,7 +717,62 @@ extern "C" HRESULT virtio_wddm_dxvk_video_format_supported(void *d3d11_device, U
  * array slices and DecoderBeginFrame picks a different slice per frame, so
  * hard-coding 0 wrote every frame into slice 0 and left the slice the renderer
  * actually sampled at zero -> Y=0, U=V=0 -> flat green (measured: 0,135,0). */
-extern "C" HRESULT virtio_wddm_dxvk_video_upload_frame(void *d3d11_context, void *resource,
+extern "C" void virtio_wddm_dxvk_video_release_upload_pool(VIRTIO_WDDM_VideoUploadPool *pool) {
+    for (void *&entry : pool->textures) {
+        if (entry)
+            static_cast<ID3D11Texture2D *>(entry)->Release();
+        entry = nullptr;
+    }
+    pool->next = 0;
+}
+
+// The decoder owns the ring. A blocking WRITE map waits for a previous copy
+// from the same slot before its contents may be overwritten.
+static bool upload_nv12_from_pool(VIRTIO_WDDM_VideoUploadPool *pool, ID3D11DeviceContext *context,
+                                 ID3D11Texture2D *dst, UINT subresource, const D3D11_BOX &box,
+                                 const void *data, UINT stride) {
+    auto *src = static_cast<ID3D11Texture2D *>(pool->textures[pool->next]);
+    D3D11_TEXTURE2D_DESC desc = {};
+    if (src) {
+        src->GetDesc(&desc);
+        if (desc.Width != box.right || desc.Height != box.bottom) {
+            virtio_wddm_dxvk_video_release_upload_pool(pool);
+            src = nullptr;
+        }
+    }
+    if (!src) {
+        desc.Width = box.right;
+        desc.Height = box.bottom;
+        desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
+        desc.Format = DXGI_FORMAT_NV12;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ID3D11Device *device = nullptr;
+        dst->GetDevice(&device);
+        HRESULT hr = device->CreateTexture2D(&desc, nullptr, &src);
+        device->Release();
+        if (FAILED(hr))
+            return false;
+        pool->textures[pool->next] = src;
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(context->Map(src, 0, D3D11_MAP_WRITE, 0, &mapped)))
+        return false;
+    const auto *input = static_cast<const BYTE *>(data);
+    auto *output = static_cast<BYTE *>(mapped.pData);
+    const size_t rows = size_t(box.bottom) + box.bottom / 2;
+    if (mapped.RowPitch == stride && stride == box.right)
+        memcpy(output, input, rows * stride);
+    else
+        for (size_t y = 0; y < rows; ++y)
+            memcpy(output + y * mapped.RowPitch, input + y * stride, box.right);
+    context->Unmap(src, 0);
+    context->CopySubresourceRegion(dst, subresource, 0, 0, 0, src, 0, &box);
+    pool->next = (pool->next + 1) % ARRAYSIZE(pool->textures);
+    return true;
+}
+
+extern "C" HRESULT virtio_wddm_dxvk_video_upload_frame(VIRTIO_WDDM_VideoUploadPool *pool, void *d3d11_context, void *resource,
                                                        UINT subresource, const void *data,
                                                        UINT width, UINT height, UINT stride,
                                                        UINT fourcc) {
@@ -757,6 +812,9 @@ extern "C" HRESULT virtio_wddm_dxvk_video_upload_frame(void *d3d11_context, void
         return E_INVALIDARG;
 
     const D3D11_BOX box = { 0, 0, 0, width, height, 1 };
+    if (pool && !p010 && upload_nv12_from_pool(pool, static_cast<ID3D11DeviceContext *>(d3d11_context),
+                                            texture, subresource, box, data, stride))
+        return S_OK;
     VTRACE("dx11um upload: calling UpdateSubresource (box %ux%u sub=%u src=%p)",
            width, height, subresource, data);
     static_cast<ID3D11DeviceContext *>(d3d11_context)->UpdateSubresource(

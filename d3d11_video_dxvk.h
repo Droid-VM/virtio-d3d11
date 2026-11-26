@@ -197,6 +197,13 @@ HRESULT virtio_wddm_dxvk_video_map_buffer_ranges(
     UINT count, void **staging_buffer);
 void virtio_wddm_dxvk_video_unmap_buffer_ranges(void *d3d11_context, void *staging);
 
+typedef struct VIRTIO_WDDM_VideoUploadPool {
+    void *textures[3];
+    UINT next;
+} VIRTIO_WDDM_VideoUploadPool;
+
+void virtio_wddm_dxvk_video_release_upload_pool(VIRTIO_WDDM_VideoUploadPool *pool);
+
 /* P-BATCH P010: write one decoded frame into the decoder output texture, in the
  * layout the texture declares. `fourcc` is the layout of `data`
  * (VM_FRAME_INFO::FourCC, i.e. V4L2's 'NV12' / 'P010') and must match the
@@ -225,7 +232,7 @@ void virtio_wddm_dxvk_video_unmap_buffer_ranges(void *d3d11_context, void *stagi
  * DecoderBeginFrame; writing slice 0 regardless leaves every other slice zeroed,
  * and a zeroed NV12 surface converts to a flat green (Y=0, U=V=0 -> RGB
  * 0,135,0). Passing the view's own subresource is therefore required. */
-HRESULT virtio_wddm_dxvk_video_upload_frame(void *d3d11_context, void *resource,
+HRESULT virtio_wddm_dxvk_video_upload_frame(VIRTIO_WDDM_VideoUploadPool *pool, void *d3d11_context, void *resource,
                                             UINT subresource, const void *data,
                                             UINT width, UINT height, UINT stride,
                                             UINT fourcc);
