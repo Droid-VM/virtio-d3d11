@@ -1,4 +1,4 @@
 [submodule "thirdparty/dxvk"]
 	path = thirdparty/dxvk
-	url = https://github.com/anonymix007/dxvk
-	branch = umd
+	url = https://github.com/Droid-VM/dxvk.git
+	branch = wip/winvpu
