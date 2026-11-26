@@ -55,6 +55,19 @@ typedef HRESULT (*TRITON_TEXTURE_SYNC_HOOK)(void *resource, UINT subresource, BO
 
 static TRITON_TEXTURE_SYNC_HOOK g_texture_sync_hook;
 
+extern void print_log_raw(const char *line);
+static void traceVideoRead(PTRITON_RESOURCE r, const char *name, BOOL whole, UINT sub)
+{
+    static volatile LONG count;
+    char line[200];
+    if (!r || r->Format != DXGI_FORMAT_NV12 || r->ArraySize <= 1 ||
+        InterlockedIncrement(&count) > 100)
+        return;
+    snprintf(line, sizeof(line), "video read %s tex=%p whole=%d sub=%u\n",
+             name, (void *)r->pResource, (int)whole, sub);
+    print_log_raw(line);
+}
+
 void tritonSetTextureSyncHook(TRITON_TEXTURE_SYNC_HOOK hook)
 {
     g_texture_sync_hook = hook;
@@ -903,6 +916,7 @@ tritonResourceCopy(D3D10DDI_HDEVICE hDevice,
     PTRITON_RESOURCE s  = (PTRITON_RESOURCE)(hSrc.pDrvPrivate);
     if (!pD || !d || !s || !d->pResource || !s->pResource) return;
     /* §5.4: the source of a whole-resource copy is read, every subresource. */
+    traceVideoRead(s, __func__, TRUE, 0);
     if(FAILED(tritonSyncTexture(pD,s,0,TRUE,FALSE,&ticket))) return;
     ID3D11DeviceContext1_CopyResource(pD->pCtx1, d->pResource, s->pResource);
     tritonReadUnpin(s,&ticket);
@@ -981,6 +995,7 @@ tritonResourceReadAfterWriteHazard(D3D10DDI_HDEVICE hDev, D3D10DDI_HRESOURCE hRe
     UINT64 ticket=0;
     PTRITON_RESOURCE r = (PTRITON_RESOURCE)(hRes.pDrvPrivate);
     PTRITON_DEVICE pD=(PTRITON_DEVICE)hDev.pDrvPrivate;
+    traceVideoRead(r, __func__, TRUE, 0);
     if(SUCCEEDED(tritonSyncTexture(pD,r,0,TRUE,FALSE,&ticket))) tritonReadUnpin(r,&ticket);
 }
 
@@ -1004,6 +1019,7 @@ tritonShaderResourceViewReadAfterWriteHazard(D3D10DDI_HDEVICE hDev, D3D10DDI_HSH
             whole = FALSE;
         }
     }
+    traceVideoRead(r, __func__, whole, sub);
     if(SUCCEEDED(tritonSyncTexture(pD,r,sub,whole,FALSE,&ticket))) tritonReadUnpin(r,&ticket);
 }
 
